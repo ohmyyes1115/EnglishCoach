@@ -1,0 +1,2776 @@
+<!DOCTYPE html>
+<html lang="zh-TW" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>DriveShadow 車用盲操英文跟讀系統</title>
+
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- JSZip for Client-Side ZIP Extraction & Test ZIP Generation -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <!-- Font Awesome Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+  <!-- Google Fonts -->
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&family=JetBrains+Mono:wght@500;700;800&display=swap" rel="stylesheet" />
+
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', '-apple-system', 'BlinkMacSystemFont', 'PingFang TC', 'Microsoft JhengHei', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace']
+          },
+          colors: {
+            cockpit: {
+              bg: '#060911',
+              card: '#0F1624',
+              border: '#1E293B',
+              accent: '#38BDF8',
+              emerald: '#10B981',
+              amber: '#F59E0B',
+              rose: '#F43F5E'
+            }
+          }
+        }
+      }
+    };
+  </script>
+
+  <style>
+    * {
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
+    body {
+      background-color: #060911;
+      color: #F8FAFC;
+      overflow-x: hidden;
+    }
+    /* Custom Scrollbars */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #0F1624;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 9999px;
+    }
+    /* Giant HUD Toast Animation */
+    @keyframes hudPop {
+      0% { opacity: 0; transform: scale(0.82); }
+      15% { opacity: 1; transform: scale(1.03); }
+      25% { transform: scale(1); }
+      80% { opacity: 1; transform: scale(1); }
+      100% { opacity: 0; transform: scale(0.95); }
+    }
+    .hud-animate {
+      animation: hudPop 1.15s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+    /* Active Remote Button Flash */
+    .btn-flash {
+      transform: scale(0.95) !important;
+      box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.65) !important;
+      background-color: #1E293B !important;
+    }
+    /* Smooth progress bar transition */
+    .progress-fill {
+      transition: width 0.1s linear;
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col justify-between bg-cockpit-bg text-slate-100 select-none">
+
+  <!-- SINGLE PERSISTENT AUDIO ELEMENT (Crucial for iOS 12+ Safari & Car Bluetooth Auto-Play) -->
+  <audio id="masterAudio" playsinline preload="auto" class="hidden"></audio>
+
+  <!-- GIANT HUD OVERLAY FOR BLIND DRIVING FEEDBACK -->
+  <div id="hudOverlay" class="fixed inset-0 pointer-events-none flex items-center justify-center z-50 hidden">
+    <div id="hudBox" class="bg-slate-900/95 border-2 border-sky-400/80 shadow-[0_0_50px_rgba(56,189,248,0.35)] rounded-3xl px-8 py-6 flex flex-col items-center justify-center text-center backdrop-blur-md min-w-[260px] max-w-[88vw]">
+      <div id="hudIcon" class="text-5xl mb-2 text-sky-400">↺</div>
+      <div id="hudTitle" class="text-2xl sm:text-3xl font-black tracking-wide text-white">本句開頭</div>
+      <div id="hudSub" class="text-base sm:text-lg font-mono font-bold text-amber-400 mt-1">第 1 / 2 次重複</div>
+    </div>
+  </div>
+
+  <!-- TOP NAVIGATION & PACK SELECTOR BAR -->
+  <header class="w-full bg-cockpit-card/90 border-b border-slate-800/90 px-3 py-2.5 sm:px-5 sticky top-0 z-30 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto flex flex-wrap items-center justify-between gap-2">
+      
+      <!-- Left: App Brand & Pack Selector -->
+      <div class="flex items-center gap-2 flex-1 min-w-[220px]">
+        <div class="w-9 h-9 rounded-xl bg-sky-500/20 border border-sky-400/40 flex items-center justify-center text-sky-400 shrink-0">
+          <i class="fa-solid fa-car-rear text-lg"></i>
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-1.5">
+            <select id="packSelect" aria-label="選擇教材包" class="w-full bg-slate-900 hover:bg-slate-800 text-white font-bold text-sm sm:text-base rounded-xl px-3 py-1.5 border border-slate-700 focus:outline-none focus:border-sky-400 truncate">
+              <option value="">載入素材庫中...</option>
+            </select>
+            <button id="btnDeletePack" title="刪除目前素材包" class="p-2 text-slate-400 hover:text-rose-400 bg-slate-900 hover:bg-slate-800 border border-slate-700 rounded-xl transition shrink-0">
+              <i class="fa-regular fa-trash-can text-sm"></i>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: Action Buttons (Sentence Drawer, Remote Keybind, ZIP Import, WakeLock) -->
+      <div class="flex items-center gap-1.5 sm:gap-2">
+        <!-- Wake Lock Status Badge -->
+        <button id="btnWakeLock" title="螢幕恆亮鎖定狀態" class="px-2.5 py-1.5 rounded-xl text-xs font-bold border border-slate-700 bg-slate-900 text-slate-400 flex items-center gap-1.5 transition">
+          <i class="fa-solid fa-sun"></i>
+          <span id="wakeLockText" class="hidden md:inline">恆亮待命</span>
+        </button>
+
+        <!-- Sentence List Drawer Trigger -->
+        <button id="btnOpenList" class="px-3 py-1.5 rounded-xl text-xs sm:text-sm font-bold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1.5 transition">
+          <i class="fa-solid fa-list-ol text-sky-400"></i>
+          <span>句子清單</span>
+        </button>
+
+        <!-- Bluetooth Remote Key Mapper Trigger -->
+        <button id="btnOpenKeymap" class="px-3 py-1.5 rounded-xl text-xs sm:text-sm font-bold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1.5 transition">
+          <i class="fa-regular fa-keyboard text-amber-400"></i>
+          <span class="hidden sm:inline">翻頁器設定</span>
+          <span class="sm:hidden">按鍵</span>
+        </button>
+
+        <!-- Diagnostics Log Trigger (Helps inspect status on iPhone when console is hidden) -->
+        <button id="btnOpenDiag" title="系統狀態與診斷日誌" class="px-2.5 py-1.5 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 flex items-center gap-1 transition">
+          <i class="fa-solid fa-shield-heart text-emerald-400"></i>
+          <span id="storageModeBadge" class="hidden sm:inline">檢測中</span>
+        </button>
+
+        <!-- Import ZIP Trigger -->
+        <button id="btnOpenImport" class="px-3.5 py-1.5 rounded-xl text-xs sm:text-sm font-extrabold bg-sky-500 hover:bg-sky-400 text-slate-950 shadow-lg shadow-sky-500/20 flex items-center gap-1.5 transition">
+          <i class="fa-solid fa-file-zipper"></i>
+          <span>匯入素材</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- MAIN COCKPIT DISPLAY AREA (Glanceable Giant Subtitles & Repeat Status) -->
+  <main class="flex-1 flex flex-col justify-between max-w-5xl w-full mx-auto px-3 sm:px-6 py-3 sm:py-5 gap-3">
+    
+    <!-- Top Status Ribbon: Sentence Counter, Repeat Dots, Speed, Shadowing Gap -->
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+      <!-- Sentence Index Pill -->
+      <div class="bg-cockpit-card border border-slate-800 rounded-2xl px-3.5 py-2.5 flex items-center justify-between">
+        <span class="text-xs font-bold text-slate-400 uppercase tracking-wider">目前句數</span>
+        <div class="font-mono font-extrabold text-lg sm:text-xl text-white">
+          <span id="statCurrentIdx" class="text-sky-400">01</span>
+          <span class="text-slate-500">/</span>
+          <span id="statTotalIdx">20</span>
+        </div>
+      </div>
+
+      <!-- Repeat Counter Pill -->
+      <div class="bg-cockpit-card border border-slate-800 rounded-2xl px-3.5 py-2.5 flex items-center justify-between">
+        <span class="text-xs font-bold text-slate-400 uppercase tracking-wider">本句重複</span>
+        <div class="flex items-center gap-2">
+          <div id="repeatDotsContainer" class="flex items-center gap-1.5">
+            <!-- Dynamically rendered dots -->
+          </div>
+          <span id="statRepeatText" class="font-mono font-extrabold text-lg sm:text-xl text-emerald-400">1/2</span>
+        </div>
+      </div>
+
+      <!-- Playback Speed Pill (Clickable) -->
+      <button id="btnTopSpeed" class="bg-cockpit-card hover:bg-slate-800/80 border border-slate-800 rounded-2xl px-3.5 py-2.5 flex items-center justify-between transition text-left">
+        <span class="text-xs font-bold text-slate-400 uppercase tracking-wider">播放語速</span>
+        <div class="flex items-center gap-1.5">
+          <i class="fa-solid fa-gauge-high text-amber-400 text-sm"></i>
+          <span id="statSpeedText" class="font-mono font-extrabold text-lg sm:text-xl text-amber-400">1.00x</span>
+        </div>
+      </button>
+
+      <!-- Playback State / Gap Status -->
+      <div class="bg-cockpit-card border border-slate-800 rounded-2xl px-3.5 py-2.5 flex items-center justify-between">
+        <span class="text-xs font-bold text-slate-400 uppercase tracking-wider">狀態</span>
+        <div id="statEngineState" class="flex items-center gap-1.5 font-bold text-sm sm:text-base text-slate-300">
+          <span class="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
+          <span>待命準備</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- CENTER GIANT SUBTITLE STAGE (Non-overlapping Flex Header Layout for Mobile iPhone 12) -->
+    <div id="subtitleStage" class="relative flex-1 bg-gradient-to-b from-slate-900/90 to-cockpit-card border-2 border-slate-800/90 rounded-3xl p-4 sm:p-7 flex flex-col justify-between text-center shadow-2xl min-h-[240px] sm:min-h-[290px] overflow-hidden gap-3">
+      
+      <!-- Dedicated Top Flex Toolbar (Never overlaps English sentence on narrow mobile viewports) -->
+      <div class="w-full flex flex-wrap items-center justify-between gap-2 pb-2.5 border-b border-slate-800/80 text-xs font-mono text-slate-400 shrink-0">
+        <div class="flex items-center gap-1.5 flex-wrap">
+          <span id="badgeAudioSource" class="px-2.5 py-1 rounded-full bg-slate-800 border border-slate-700 text-sky-300 font-sans font-semibold">WAV 獨立音檔</span>
+          <span id="badgeClipDuration" class="px-2 py-1 rounded-full bg-slate-800/70 text-slate-300">3.2s</span>
+          <button id="btnDemoVoiceMode" class="px-2.5 py-1 rounded-full bg-emerald-950/90 border border-emerald-500/50 text-emerald-300 font-sans font-bold transition hover:bg-emerald-900/80">
+            🔊 範例人聲：TTS+墊音
+          </button>
+        </div>
+        <div class="flex items-center gap-1.5 ml-auto">
+          <button id="btnToggleSubMode" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-sans font-semibold transition">
+            <i class="fa-regular fa-eye mr-1"></i>字幕：英+中
+          </button>
+        </div>
+      </div>
+
+      <!-- Main English & Chinese Sentence Area -->
+      <div class="my-auto py-3 sm:py-5 w-full max-w-4xl mx-auto flex flex-col items-center justify-center gap-3.5">
+        <p id="displayEnglish" class="font-extrabold tracking-tight text-white leading-snug sm:leading-tight transition-all duration-150 text-2xl sm:text-4xl md:text-5xl px-1 break-words">
+          Could you walk me through the timeline for this project?
+        </p>
+
+        <!-- Chinese Subtitle / Note -->
+        <p id="displayChinese" class="text-base sm:text-xl md:text-2xl font-semibold text-sky-300/90 leading-relaxed max-w-3xl px-1">
+          你能帶我順一遍這個專案的時程表嗎？
+        </p>
+      </div>
+
+      <!-- Shadowing Countdown / Audio Scrub Bar at Bottom of Card -->
+      <div class="w-full mt-auto pt-1 shrink-0">
+        <div class="flex items-center justify-between text-xs font-mono text-slate-400 mb-1.5">
+          <span id="timeCurrent">00:00.0</span>
+          <span id="gapHintBanner" class="text-amber-400 font-sans font-bold hidden">
+            <i class="fa-solid fa-microphone-lines animate-pulse mr-1"></i>跟讀留白時間...
+          </span>
+          <span id="timeDuration">00:03.2</span>
+        </div>
+        <div class="w-full h-2.5 bg-slate-800 rounded-full overflow-hidden p-0.5 border border-slate-700/60">
+          <div id="audioProgressBar" class="h-full bg-gradient-to-r from-sky-400 to-emerald-400 rounded-full progress-fill w-0"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- QUICK PLAYBACK STRATEGY BAR (Target Repeats & Shadowing Gap) -->
+    <div class="bg-cockpit-card border border-slate-800 rounded-2xl px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs sm:text-sm">
+      <div class="flex items-center gap-2 flex-wrap">
+        <span class="text-slate-400 font-bold"><i class="fa-solid fa-repeat text-emerald-400 mr-1"></i>每句重複：</span>
+        <div class="inline-flex rounded-xl bg-slate-900 p-1 border border-slate-800">
+          <button data-repeat="1" class="repeat-opt px-2.5 py-1 rounded-lg font-bold text-slate-400 hover:text-white transition">1次</button>
+          <button data-repeat="2" class="repeat-opt px-2.5 py-1 rounded-lg font-bold bg-emerald-500 text-slate-950 transition">2次 (推薦)</button>
+          <button data-repeat="3" class="repeat-opt px-2.5 py-1 rounded-lg font-bold text-slate-400 hover:text-white transition">3次</button>
+          <button data-repeat="5" class="repeat-opt px-2.5 py-1 rounded-lg font-bold text-slate-400 hover:text-white transition">5次</button>
+          <button data-repeat="999" class="repeat-opt px-2.5 py-1 rounded-lg font-bold text-slate-400 hover:text-white transition">無限單句</button>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-2 flex-wrap">
+        <span class="text-slate-400 font-bold"><i class="fa-solid fa-hourglass-half text-sky-400 mr-1"></i>句間跟讀留白：</span>
+        <div class="inline-flex rounded-xl bg-slate-900 p-1 border border-slate-800">
+          <button data-gap="0" class="gap-opt px-2.5 py-1 rounded-lg font-bold text-slate-400 hover:text-white transition">0秒</button>
+          <button data-gap="0.8" class="gap-opt px-2.5 py-1 rounded-lg font-bold bg-sky-500 text-slate-950 transition">0.8秒</button>
+          <button data-gap="1.5" class="gap-opt px-2.5 py-1 rounded-lg font-bold text-slate-400 hover:text-white transition">1.5秒</button>
+          <button data-gap="auto" class="gap-opt px-2.5 py-1 rounded-lg font-bold text-slate-400 hover:text-white transition">等長跟讀</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- CAR-READY GIANT TACTILE CONTROL DECK (Mirrors Physical 4-Key / 3-Key Bluetooth Page Turner) -->
+    <section aria-label="車用盲操主控台" class="grid grid-cols-5 gap-2 sm:gap-3 pt-1 pb-2">
+      
+      <!-- Key 1: Previous Sentence -->
+      <button id="btnCtrlPrev" class="ctrl-btn group relative bg-slate-900 hover:bg-slate-800 active:scale-95 border-2 border-slate-700/90 hover:border-sky-400 rounded-2xl p-3 sm:p-4 flex flex-col items-center justify-center gap-1.5 transition shadow-lg">
+        <span id="badgeKeyPrev" class="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">← / PgUp</span>
+        <i class="fa-solid fa-backward-step text-2xl sm:text-3xl text-slate-200 group-hover:text-sky-400"></i>
+        <span class="text-xs sm:text-sm font-extrabold text-slate-200">上一句</span>
+      </button>
+
+      <!-- Key 2: Restart Current Sentence (0.00s + Reset Repeat Counter to 1/2) -->
+      <button id="btnCtrlRestart" class="ctrl-btn group relative bg-slate-900 hover:bg-slate-800 active:scale-95 border-2 border-emerald-500/60 hover:border-emerald-400 rounded-2xl p-3 sm:p-4 flex flex-col items-center justify-center gap-1.5 transition shadow-lg">
+        <span id="badgeKeyRestart" class="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-950/90 text-emerald-300 border border-emerald-700/60">↑ / R</span>
+        <i class="fa-solid fa-rotate-left text-2xl sm:text-3xl text-emerald-400"></i>
+        <span class="text-xs sm:text-sm font-extrabold text-emerald-300">這句開頭</span>
+      </button>
+
+      <!-- Key 3: Play / Pause (Short Press: Play/Pause, Long Press: Speed) -->
+      <button id="btnCtrlPlay" class="ctrl-btn group relative bg-sky-500 hover:bg-sky-400 active:scale-95 border-2 border-sky-300 rounded-2xl p-3 sm:p-4 flex flex-col items-center justify-center gap-1.5 transition shadow-xl shadow-sky-500/20 text-slate-950">
+        <span id="badgeKeyPlay" class="text-[11px] font-mono font-bold px-2 py-0.5 rounded bg-slate-950/25 text-slate-950">Space (長按調速)</span>
+        <i id="iconPlayPause" class="fa-solid fa-play text-2xl sm:text-3xl"></i>
+        <span id="labelPlayPause" class="text-xs sm:text-sm font-black">開始播放</span>
+      </button>
+
+      <!-- Key 4: Next Sentence -->
+      <button id="btnCtrlNext" class="ctrl-btn group relative bg-slate-900 hover:bg-slate-800 active:scale-95 border-2 border-slate-700/90 hover:border-sky-400 rounded-2xl p-3 sm:p-4 flex flex-col items-center justify-center gap-1.5 transition shadow-lg">
+        <span id="badgeKeyNext" class="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">→ / PgDn</span>
+        <i class="fa-solid fa-forward-step text-2xl sm:text-3xl text-slate-200 group-hover:text-sky-400"></i>
+        <span class="text-xs sm:text-sm font-extrabold text-slate-200">下一句</span>
+      </button>
+
+      <!-- Key 5: Cycle Speed -->
+      <button id="btnCtrlSpeed" class="ctrl-btn group relative bg-slate-900 hover:bg-slate-800 active:scale-95 border-2 border-amber-500/50 hover:border-amber-400 rounded-2xl p-3 sm:p-4 flex flex-col items-center justify-center gap-1.5 transition shadow-lg">
+        <span id="badgeKeySpeed" class="text-[11px] font-mono px-2 py-0.5 rounded bg-amber-950/80 text-amber-300 border border-amber-700/60">↓ / S</span>
+        <i class="fa-solid fa-bolt text-2xl sm:text-3xl text-amber-400"></i>
+        <span id="labelSpeedBtn" class="text-xs sm:text-sm font-extrabold text-amber-300">1.00x 語速</span>
+      </button>
+
+    </section>
+  </main>
+
+  <!-- ===================================================================== -->
+  <!-- MODAL 1: UPGRADED SMART AUDIO SLICER & IMPORT WORKBENCH               -->
+  <!-- ===================================================================== -->
+  <div id="modalImport" class="fixed inset-0 bg-black/85 backdrop-blur-sm z-40 hidden flex items-center justify-center p-2 sm:p-4 overflow-y-auto">
+    <div class="bg-cockpit-card border border-slate-700 rounded-3xl max-w-4xl w-full p-4 sm:p-6 shadow-2xl my-auto max-h-[95vh] flex flex-col">
+      
+      <!-- Modal Header -->
+      <div class="flex items-center justify-between border-b border-slate-800 pb-3 mb-3">
+        <div class="flex items-center gap-2.5">
+          <div class="w-9 h-9 rounded-xl bg-sky-500/20 border border-sky-400/40 flex items-center justify-center text-sky-400">
+            <i class="fa-solid fa-scissors"></i>
+          </div>
+          <div>
+            <h2 class="text-base sm:text-xl font-black text-white">匯入素材與智慧切音工作台 (IndexedDB)</h2>
+            <p class="text-xs text-slate-400">支援 GPT Live 長音檔即時預覽切分、純文字行數自動對齊、單段試聽與合併/分割微調</p>
+          </div>
+        </div>
+        <button id="btnCloseImport" class="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center shrink-0">
+          <i class="fa-solid fa-xmark text-lg"></i>
+        </button>
+      </div>
+
+      <!-- Source Mode Tabs (Tab A: GPT Live Long Audio + Paste Text | Tab B: ZIP / Multi-Files) -->
+      <div class="grid grid-cols-2 gap-2 bg-slate-950 p-1.5 rounded-2xl border border-slate-800 mb-3 shrink-0">
+        <button id="tabBtnGptWorkbench" class="py-2 px-3 rounded-xl text-xs sm:text-sm font-extrabold bg-sky-500 text-slate-950 shadow transition flex items-center justify-center gap-1.5">
+          <i class="fa-solid fa-wand-magic-sparkles"></i>
+          <span>分頁 A：長音檔智慧切分＋貼上純文字 (推薦)</span>
+        </button>
+        <button id="tabBtnZipImport" class="py-2 px-3 rounded-xl text-xs sm:text-sm font-bold text-slate-400 hover:text-white transition flex items-center justify-center gap-1.5">
+          <i class="fa-solid fa-file-zipper"></i>
+          <span>分頁 B：匯入 ZIP 懶人包 / 多檔音訊</span>
+        </button>
+      </div>
+
+      <!-- Modal Scrollable Body -->
+      <div class="overflow-y-auto pr-1 space-y-3.5 flex-1">
+        
+        <!-- Common Step: Course Pack Name -->
+        <div class="flex flex-col sm:flex-row sm:items-center gap-2 bg-slate-900/70 border border-slate-800 rounded-2xl px-3.5 py-2.5">
+          <label class="text-xs font-extrabold text-slate-300 uppercase tracking-wider shrink-0">課程包名稱：</label>
+          <input id="inputPackName" type="text" placeholder="例如：GPT Live 通勤跟讀 30 句 (Day 01)" class="flex-1 bg-slate-950 border border-slate-700 focus:border-sky-400 rounded-xl px-3 py-1.5 text-sm text-white font-semibold focus:outline-none" />
+          <label class="flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer shrink-0">
+            <input id="chkKeepNumberPrefix" type="checkbox" checked class="accent-sky-400 rounded" />
+            <span>保留句首題號 (如 <code class="text-sky-300">1. Hi there.</code>)</span>
+          </label>
+        </div>
+
+        <!-- =============================================================== -->
+        <!-- TAB A PANEL: SINGLE LONG AUDIO + PASTE SUBTITLES WORKBENCH      -->
+        <!-- =============================================================== -->
+        <div id="panelTabGpt" class="space-y-3.5">
+          
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">
+            
+            <!-- Left Column: Audio File Upload & Waveform Envelope Preview -->
+            <div class="bg-slate-900/90 border border-slate-800 rounded-2xl p-3.5 flex flex-col justify-between space-y-3">
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-xs font-extrabold text-sky-400 uppercase tracking-wider">
+                  <i class="fa-solid fa-microphone-lines mr-1"></i>1. 載入單一長音檔 (如 GPT Live 錄音)
+                </span>
+                <button id="btnLoadSimulatedGptAudio" class="px-2.5 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/50 text-emerald-300 text-xs font-bold transition">
+                  <i class="fa-solid fa-bolt mr-1"></i>載入模擬 GPT 10 句長音檔 (含底噪)
+                </button>
+              </div>
+
+              <!-- Upload Long Audio Button -->
+              <div class="border-2 border-dashed border-slate-700 hover:border-sky-400 rounded-xl p-3 text-center bg-slate-950/60 transition">
+                <input id="inputSingleLongAudio" type="file" accept=".mp3,.wav,.m4a,.aac,.ogg,.webm,audio/*" class="hidden" />
+                <label for="inputSingleLongAudio" class="cursor-pointer flex items-center justify-center gap-3">
+                  <div class="w-10 h-10 rounded-xl bg-sky-500/15 border border-sky-400/30 flex items-center justify-center text-sky-400 text-lg shrink-0">
+                    <i class="fa-solid fa-file-audio"></i>
+                  </div>
+                  <div class="text-left min-w-0 flex-1">
+                    <div id="longAudioFileName" class="text-xs sm:text-sm font-bold text-white truncate">點擊選取手機/電腦中的長音檔 (.mp3 / .m4a / .wav)</div>
+                    <div id="longAudioMetaInfo" class="text-[11px] text-slate-400">選取後將自動計算音量包絡線，支援 10 毫秒即時預覽切點</div>
+                  </div>
+                </label>
+              </div>
+
+              <!-- Visual RMS Envelope & Threshold Line Canvas -->
+              <div class="space-y-1">
+                <div class="flex items-center justify-between text-[11px] font-mono text-slate-400">
+                  <span>音量波形與切點預覽 (綠塊=切出句子 / 紅線=dB門檻)</span>
+                  <span id="envelopeDurationLabel">00:00.0</span>
+                </div>
+                <div class="relative w-full h-20 bg-slate-950 border border-slate-800 rounded-xl overflow-hidden">
+                  <canvas id="vadWaveformCanvas" class="w-full h-full block"></canvas>
+                </div>
+              </div>
+            </div>
+
+            <!-- Right Column: Paste or Upload Plain Text Subtitles -->
+            <div class="bg-slate-900/90 border border-slate-800 rounded-2xl p-3.5 flex flex-col justify-between space-y-2">
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-xs font-extrabold text-emerald-400 uppercase tracking-wider">
+                  <i class="fa-solid fa-align-left mr-1"></i>2. 貼上純文字字幕 (一行一句，免時間軸)
+                </span>
+                <label class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 text-xs font-bold cursor-pointer transition">
+                  <i class="fa-solid fa-upload mr-1"></i>上傳 .txt/.srt
+                  <input id="inputSubTextFile" type="file" accept=".txt,.srt,.lrc,.json" class="hidden" />
+                </label>
+              </div>
+
+              <textarea id="textareaSubtitles" rows="6" placeholder="直接貼上文字，一行一句（不需要時間軸！），例如：&#10;1. Hi there.&#10;2. How are you?&#10;3. Could you walk me through the timeline? || 你能帶我順一遍時程嗎？" class="w-full flex-1 bg-slate-950 border border-slate-700 focus:border-emerald-400 rounded-xl p-2.5 text-xs sm:text-sm font-mono text-slate-100 leading-relaxed focus:outline-none resize-none"></textarea>
+
+              <div class="flex items-center justify-between text-[11px] text-slate-400">
+                <span>💡 支援自動過濾空行；若同行含 <code class="text-emerald-300">||</code> 或 <code class="text-emerald-300">Tab</code> 會自動分離出中文翻譯</span>
+                <span id="parsedLineCountBadge" class="font-mono font-bold text-emerald-400">目前行數：0 行</span>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- REAL-TIME VAD SLIDERS (Instant <10ms Recalculation) -->
+          <div class="bg-slate-900/95 border border-slate-800 rounded-2xl p-3.5 space-y-3">
+            <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 pb-2">
+              <div class="text-xs font-extrabold text-amber-400 uppercase tracking-wider flex items-center gap-1.5">
+                <i class="fa-solid fa-sliders"></i>
+                <span>3. 即時靜音切刀參數微調（拉動滑桿立即更新切出段數）</span>
+              </div>
+              <button id="btnAutoMatchLineCount" class="px-3 py-1 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/50 text-amber-300 text-xs font-extrabold transition">
+                <i class="fa-solid fa-crosshairs mr-1"></i>智慧自動尋找符合字幕行數的 dB 門檻
+              </button>
+            </div>
+
+            <!-- 4 Sliders Grid -->
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+              
+              <!-- Slider 1: Silence Threshold (dB) -->
+              <div class="bg-slate-950/90 border border-slate-800 rounded-xl p-2.5">
+                <div class="flex items-center justify-between mb-1">
+                  <span class="font-bold text-slate-300">靜音門檻 (dB)</span>
+                  <span id="valSliderDb" class="font-mono font-extrabold text-amber-400 text-sm">-28 dB</span>
+                </div>
+                <input id="sliderVadDb" type="range" min="-55" max="-10" step="0.5" value="-28" class="w-full accent-amber-400 cursor-pointer" />
+                <div class="flex justify-between text-[10px] text-slate-500 mt-0.5">
+                  <span>-55 (極安靜)</span>
+                  <span>往右克服底噪 ➔</span>
+                  <span>-10</span>
+                </div>
+              </div>
+
+              <!-- Slider 2: Min Silence Pause Duration (ms) -->
+              <div class="bg-slate-950/90 border border-slate-800 rounded-xl p-2.5">
+                <div class="flex items-center justify-between mb-1">
+                  <span class="font-bold text-slate-300">最短句間停頓</span>
+                  <span id="valSliderPauseMs" class="font-mono font-extrabold text-sky-400 text-sm">300 ms</span>
+                </div>
+                <input id="sliderVadPauseMs" type="range" min="100" max="1500" step="20" value="300" class="w-full accent-sky-400 cursor-pointer" />
+                <div class="flex justify-between text-[10px] text-slate-500 mt-0.5">
+                  <span>100ms (緊湊)</span>
+                  <span>◄ 調小抓短換氣</span>
+                  <span>1500ms</span>
+                </div>
+              </div>
+
+              <!-- Slider 3: Min Speech Sentence Duration (ms) -->
+              <div class="bg-slate-950/90 border border-slate-800 rounded-xl p-2.5">
+                <div class="flex items-center justify-between mb-1">
+                  <span class="font-bold text-slate-300">最短單句長度</span>
+                  <span id="valSliderMinClipMs" class="font-mono font-extrabold text-emerald-400 text-sm">400 ms</span>
+                </div>
+                <input id="sliderVadMinClipMs" type="range" min="200" max="2000" step="40" value="400" class="w-full accent-emerald-400 cursor-pointer" />
+                <div class="flex justify-between text-[10px] text-slate-500 mt-0.5">
+                  <span>200ms (短句)</span>
+                  <span>過濾短促雜音</span>
+                  <span>2000ms</span>
+                </div>
+              </div>
+
+              <!-- Slider 4: Boundary Padding (ms) -->
+              <div class="bg-slate-950/90 border border-slate-800 rounded-xl p-2.5">
+                <div class="flex items-center justify-between mb-1">
+                  <span class="font-bold text-slate-300">前後保留緩衝</span>
+                  <span id="valSliderPadMs" class="font-mono font-extrabold text-purple-400 text-sm">140 ms</span>
+                </div>
+                <input id="sliderVadPadMs" type="range" min="40" max="400" step="20" value="140" class="w-full accent-purple-400 cursor-pointer" />
+                <div class="flex justify-between text-[10px] text-slate-500 mt-0.5">
+                  <span>40ms</span>
+                  <span>防止字尾被切掉</span>
+                  <span>400ms</span>
+                </div>
+              </div>
+
+            </div>
+
+            <!-- REAL-TIME ALIGNMENT DASHBOARD (Green Light Indicator) -->
+            <div id="alignmentBanner" class="rounded-2xl px-4 py-3 border flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-slate-950 border-slate-800">
+              <div class="flex items-center gap-3">
+                <div id="alignStatusIcon" class="text-2xl">⏳</div>
+                <div>
+                  <div id="alignStatusHeadline" class="text-xs sm:text-sm font-black text-white">
+                    請先載入長音檔（或點擊上方「載入模擬 GPT 10 句長音檔」）
+                  </div>
+                  <div id="alignStatusAdvice" class="text-[11px] sm:text-xs text-slate-400 mt-0.5">
+                    系統會自動比對「字幕行數」與「切出音檔段數」，並提供單段試聽、一鍵合併與切開功能。
+                  </div>
+                </div>
+              </div>
+              <div class="flex items-center gap-3 font-mono text-xs sm:text-sm font-extrabold shrink-0 bg-slate-900 px-3 py-1.5 rounded-xl border border-slate-800">
+                <span>字幕：<strong id="metricSubCount" class="text-emerald-400">0</strong> 行</span>
+                <span class="text-slate-600">|</span>
+                <span>切出：<strong id="metricSegCount" class="text-sky-400">0</strong> 段</span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- =============================================================== -->
+        <!-- TAB B PANEL: ZIP BUNDLE / MULTI-FILE IMPORT                     -->
+        <!-- =============================================================== -->
+        <div id="panelTabZip" class="hidden space-y-3.5">
+          <!-- Quick Test ZIP Generator Banner -->
+          <div class="bg-slate-900/90 border border-sky-500/30 rounded-2xl p-3.5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+            <div class="text-xs sm:text-sm text-slate-300">
+              <span class="font-bold text-sky-400"><i class="fa-solid fa-box-open mr-1"></i>下載標準測試懶人包 Pack_01.zip</span>
+              <p class="text-slate-400 text-xs mt-0.5">內含 20 個獨立音檔 (01.wav~20.wav) + 1 個合併長音檔 + 單檔多句字幕 + 20 個單句字幕檔</p>
+            </div>
+            <button id="btnDownloadSampleZip" class="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-sky-400/50 text-sky-300 font-bold text-xs flex items-center gap-1.5 shrink-0 transition">
+              <i class="fa-solid fa-download"></i>
+              <span>下載測試 Pack_01.zip</span>
+            </button>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+            <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-3 space-y-1.5">
+              <div class="font-extrabold text-sky-400 mb-1">ZIP 內音檔模式</div>
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input type="radio" name="audioImportMode" value="multi_audio" checked class="accent-sky-400" />
+                <span>多個獨立音檔 (<code class="text-sky-300">01.mp3 ~ 20.mp3</code>)</span>
+              </label>
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input type="radio" name="audioImportMode" value="single_audio_vad" class="accent-sky-400" />
+                <span>ZIP 內含單一長音檔 ➔ 自動轉入切音工作台</span>
+              </label>
+            </div>
+            <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-3 space-y-1.5">
+              <div class="font-extrabold text-emerald-400 mb-1">ZIP 內字幕模式</div>
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input type="radio" name="subImportMode" value="single_sub" checked class="accent-emerald-400" />
+                <span>一個字幕檔多句 (<code class="text-emerald-300">sentences.txt / .srt</code>)</span>
+              </label>
+              <label class="flex items-center gap-2 cursor-pointer">
+                <input type="radio" name="subImportMode" value="multi_sub" class="accent-emerald-400" />
+                <span>一個字幕檔一句 (<code class="text-emerald-300">01.txt ~ 20.txt</code>)</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- File Dropzone (.zip or multiple loose files) -->
+          <div class="border-2 border-dashed border-slate-700 hover:border-sky-400 rounded-2xl p-4 text-center bg-slate-900/50 transition">
+            <input id="inputZipFiles" type="file" multiple accept=".zip,.mp3,.wav,.m4a,.ogg,.aac,.txt,.srt,.lrc,.json" class="hidden" />
+            <label for="inputZipFiles" class="cursor-pointer flex flex-col items-center justify-center gap-1.5 py-2">
+              <div class="w-11 h-11 rounded-2xl bg-sky-500/15 border border-sky-400/30 flex items-center justify-center text-sky-400 text-xl">
+                <i class="fa-solid fa-cloud-arrow-up"></i>
+              </div>
+              <div class="text-sm font-bold text-white">
+                點擊選擇 <span class="text-sky-400">Pack_01.zip</span> 壓縮包，或同時選取多個音檔＋字幕檔
+              </div>
+              <div id="importStatusText" class="text-xs text-slate-400">
+                支援 .zip 自動解壓縮｜音檔 (.mp3, .wav, .m4a)｜字幕 (.txt, .srt, .json)
+              </div>
+            </label>
+          </div>
+        </div>
+
+        <!-- =============================================================== -->
+        <!-- INTERACTIVE SEGMENT PREVIEW & 1-CLICK MERGE/SPLIT/DELETE LIST   -->
+        <!-- =============================================================== -->
+        <div id="importPreviewContainer" class="hidden bg-slate-950 border border-slate-800 rounded-2xl p-3.5 space-y-2.5">
+          <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2">
+            <div>
+              <span id="previewSummaryTitle" class="text-xs sm:text-sm font-extrabold text-emerald-400">切分對齊預覽清單</span>
+              <p class="text-[11px] text-slate-400">可點擊「▶ 試聽」檢查切點；若兩句黏在一起點「✂️ 從中切開」，若斷成兩截點「🔗 與下段合併」，開頭雜音點「🗑️ 刪除」</p>
+            </div>
+          </div>
+          <div id="previewTableBody" class="max-h-64 overflow-y-auto divide-y divide-slate-800/80 text-xs pr-1">
+            <!-- Dynamically populated interactive rows -->
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Modal Footer -->
+      <div class="border-t border-slate-800 pt-3 mt-3 flex flex-wrap items-center justify-between gap-2 shrink-0">
+        <button id="btnResetDemoPacks" class="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold transition">
+          <i class="fa-solid fa-rotate mr-1"></i>重置內建 20 句範例
+        </button>
+        <div class="flex items-center gap-2">
+          <button id="btnCancelImport" class="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs sm:text-sm font-bold transition">
+            取消
+          </button>
+          <button id="btnConfirmSavePack" disabled class="px-5 py-2 rounded-xl bg-sky-500 hover:bg-sky-400 disabled:opacity-40 disabled:pointer-events-none text-slate-950 font-black text-xs sm:text-sm shadow-lg shadow-sky-500/20 transition">
+            <i class="fa-solid fa-floppy-disk mr-1"></i>確認裁切並儲存至課程庫
+          </button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ===================================================================== -->
+  <!-- MODAL 2: BLUETOOTH MECHANICAL PAGE TURNER KEY MAPPER                  -->
+  <!-- ===================================================================== -->
+  <div id="modalKeymap" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-40 hidden flex items-center justify-center p-3 sm:p-5">
+    <div class="bg-cockpit-card border border-slate-700 rounded-3xl max-w-xl w-full p-5 sm:p-6 shadow-2xl">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-3 mb-4">
+        <div class="flex items-center gap-2.5">
+          <div class="w-9 h-9 rounded-xl bg-amber-500/20 border border-amber-400/40 flex items-center justify-center text-amber-400">
+            <i class="fa-regular fa-keyboard text-lg"></i>
+          </div>
+          <div>
+            <h2 class="text-lg font-black text-white">藍牙機械軸翻頁器 按鍵綁定</h2>
+            <p class="text-xs text-slate-400">支援 3 鍵 / 4 鍵翻頁器（如翰林閱 Free2 / Free3）自定義按鍵</p>
+          </div>
+        </div>
+        <button id="btnCloseKeymap" class="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center">
+          <i class="fa-solid fa-xmark text-lg"></i>
+        </button>
+      </div>
+
+      <div class="bg-slate-900/90 border border-slate-800 rounded-2xl p-3 text-xs text-slate-300 mb-3 leading-relaxed space-y-2">
+        <div>
+          <span class="text-amber-400 font-bold"><i class="fa-solid fa-lightbulb mr-1"></i>車用盲操秘訣：</span>
+          點擊右側「點擊錄製按鍵」後，直接按下翻頁器上的實體鍵即可完成綁定並自動保存。
+        </div>
+        <label class="flex items-center justify-between pt-2 border-t border-slate-800 cursor-pointer">
+          <span class="font-bold text-sky-300">啟用「長按播放鍵 0.5 秒自動切換語速」（3鍵/4鍵翻頁器必備）</span>
+          <input id="chkLongPressSpeed" type="checkbox" checked class="w-4 h-4 accent-sky-400 rounded" />
+        </label>
+      </div>
+
+      <div id="keymapListContainer" class="space-y-2.5 mb-5">
+        <!-- Dynamically populated keybinding rows -->
+      </div>
+
+      <div class="flex items-center justify-between border-t border-slate-800 pt-3.5">
+        <button id="btnResetKeymap" class="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold transition">
+          恢復預設按鍵
+        </button>
+        <button id="btnDoneKeymap" class="px-5 py-2 rounded-xl bg-sky-500 hover:bg-sky-400 text-slate-950 font-black text-sm transition">
+          完成設定
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================================================================== -->
+  <!-- MODAL 3: SENTENCE LIST DRAWER (Quick Jump to Any of the 20 Sentences) -->
+  <!-- ===================================================================== -->
+  <div id="modalSentenceList" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-40 hidden flex items-center justify-center p-3 sm:p-5">
+    <div class="bg-cockpit-card border border-slate-700 rounded-3xl max-w-2xl w-full p-5 sm:p-6 shadow-2xl max-h-[88vh] flex flex-col">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-3 mb-3">
+        <div>
+          <h2 id="drawerPackTitle" class="text-lg font-black text-white">句子清單 (20 句)</h2>
+          <p class="text-xs text-slate-400">點擊任意句子即可直接跳轉並從第 1/2 次開始播放</p>
+        </div>
+        <button id="btnCloseList" class="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center">
+          <i class="fa-solid fa-xmark text-lg"></i>
+        </button>
+      </div>
+      <div id="sentenceDrawerBody" class="overflow-y-auto space-y-2 pr-1 flex-1">
+        <!-- Populated dynamically -->
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================================================================== -->
+  <!-- MODAL 4: DIAGNOSTICS & STORAGE STATUS VIEWER                          -->
+  <!-- ===================================================================== -->
+  <div id="modalDiag" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-40 hidden flex items-center justify-center p-3 sm:p-5">
+    <div class="bg-cockpit-card border border-slate-700 rounded-3xl max-w-lg w-full p-5 shadow-2xl max-h-[85vh] flex flex-col">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-3 mb-3">
+        <div class="flex items-center gap-2">
+          <i class="fa-solid fa-shield-heart text-emerald-400 text-lg"></i>
+          <h2 class="text-base sm:text-lg font-black text-white">系統環境與儲存診斷資訊</h2>
+        </div>
+        <button id="btnCloseDiag" class="w-8 h-8 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+      <div id="diagStatusSummary" class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 text-xs text-slate-300 space-y-1.5 mb-3 leading-relaxed">
+      </div>
+      <div class="text-xs font-bold text-slate-400 mb-1.5">執行期事件日誌：</div>
+      <div id="diagLogList" class="flex-1 overflow-y-auto bg-slate-950 border border-slate-800 rounded-2xl p-3 font-mono text-[11px] text-slate-300 space-y-1.5 min-h-[120px]">
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================================================================== -->
+  <!-- APPLICATION JAVASCRIPT ENGINE (iOS Sandbox Safe & Syntax Verified)    -->
+  <!-- ===================================================================== -->
+  <script>
+    /*************************************************************************
+     * 0. GLOBAL SANDBOX ERROR GUARD & IN-APP DIAGNOSTICS LOGGER
+     *    Prevents iOS Safari / Gemini iframe sandbox exceptions from crashing UI
+     *************************************************************************/
+    const diagLogs = [];
+    function logDiag(level, msg) {
+      const time = new Date().toLocaleTimeString('zh-TW', { hour12: false });
+      diagLogs.unshift({ time, level, msg: String(msg) });
+      if (diagLogs.length > 50) diagLogs.pop();
+      const logContainer = document.getElementById('diagLogList');
+      if (logContainer) {
+        logContainer.innerHTML = diagLogs.map(item => {
+          const color = item.level === 'WARN' ? 'text-amber-400' : (item.level === 'ERR' ? 'text-rose-400' : 'text-emerald-400');
+          return `<div><span class="text-slate-500">[${item.time}]</span> <strong class="${color}">[${item.level}]</strong> ${escapeHtml(item.msg)}</div>`;
+        }).join('');
+      }
+    }
+
+    window.addEventListener('error', (event) => {
+      logDiag('ERR', `${event.message || 'Runtime Error'} (${event.lineno || 0})`);
+      event.preventDefault();
+    });
+
+    window.addEventListener('unhandledrejection', (event) => {
+      const reason = event.reason ? (event.reason.message || String(event.reason)) : 'Promise rejected';
+      logDiag('WARN', `非同步攔截: ${reason}`);
+      event.preventDefault();
+    });
+
+    function escapeHtml(str) {
+      return String(str || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    /*************************************************************************
+     * 1. BUILT-IN 20 BUSINESS & DRIVING SHADOWING SENTENCES (Default Pack)
+     *************************************************************************/
+    const DEFAULT_20_SENTENCES = [
+      { en: "1. Could you walk me through the timeline for this project?", zh: "你能帶我順一遍這個專案的時程表嗎？" },
+      { en: "2. Let's make sure we're on the same page before moving forward.", zh: "在繼續推進之前，我們先確保彼此共識一致。" },
+      { en: "3. I'll loop you in as soon as we get feedback from the client.", zh: "一旦我們收到客戶的反饋，我會立刻把你加進討論。" },
+      { en: "4. We might need to push back the deadline by a couple of days.", zh: "我們可能需要把截止日期往後順延幾天。" },
+      { en: "5. What's the main bottleneck holding up the deployment right now?", zh: "目前卡住部署進度的主要瓶頸是什麼？" },
+      { en: "6. Let's touch base tomorrow morning to review the final numbers.", zh: "我們明早簡短對一下，檢視最終的數據。" },
+      { en: "7. I really appreciate you going the extra mile on this urgent task.", zh: "非常感謝你在這項緊急任務上多費心出力。" },
+      { en: "8. Could we circle back to that topic after we finish the main agenda?", zh: "我們可以在跑完主要議程後，再回頭討論那個話題嗎？" },
+      { en: "9. From my perspective, prioritizing user stability is our best bet.", zh: "以我的觀點來看，優先確保系統穩定度是最好的選擇。" },
+      { en: "10. Please keep me posted if anything changes on your end.", zh: "如果你那邊有任何變動，請隨時讓我知道。" },
+      { en: "11. We don't have the bandwidth to take on another project this quarter.", zh: "我們這季已經沒有多餘的人力與時間再接新專案了。" },
+      { en: "12. Let's break this down into smaller, manageable action items.", zh: "我們把這件事拆解成更小、更容易執行的行動項目吧。" },
+      { en: "13. Does that align with what you had in mind for the new release?", zh: "這符合你對新版本發布的原本構想嗎？" },
+      { en: "14. I'd like to get your take on how we should handle this issue.", zh: "我想聽聽你對於我們該如何處理這個問題的看法。" },
+      { en: "15. Let's not reinvent the wheel if we already have a working template.", zh: "如果我們已經有可用的範本，就別重新造輪子了。" },
+      { en: "16. Could you give me a rough ballpark figure for the budget?", zh: "你能給我一個預算的大略預估數字嗎？" },
+      { en: "17. We need to wrap this up in five minutes so we don't run over time.", zh: "我們需要在五分鐘內收尾，才不會超時。" },
+      { en: "18. I'll take the lead on drafting the proposal by Friday afternoon.", zh: "我會負責主導在週五下午前把提案草稿寫出來。" },
+      { en: "19. That sounds like a solid plan, let's get the ball rolling.", zh: "聽起來是個很穩健的計畫，我們這就開始動手吧。" },
+      { en: "20. Thanks for flagging this early before it turned into a major issue.", zh: "謝謝你在這件事變成大問題之前就及早提出來。" }
+    ];
+
+    /*************************************************************************
+     * 2. SYNTHETIC WAV GENERATOR & AUDIO BUFFER SLICER
+     *************************************************************************/
+    function createSpeechCadenceWavBlob(text, durationSec = null) {
+      const sampleRate = 22050;
+      const words = String(text || '').trim().split(/\s+/);
+      const calcDuration = durationSec || Math.max(2.2, Math.min(4.8, words.length * 0.32));
+      const numSamples = Math.floor(sampleRate * calcDuration);
+      const buffer = new ArrayBuffer(44 + numSamples * 2);
+      const view = new DataView(buffer);
+
+      const writeString = (offset, str) => {
+        for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+      };
+      writeString(0, 'RIFF');
+      view.setUint32(4, 36 + numSamples * 2, true);
+      writeString(8, 'WAVE');
+      writeString(12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * 2, true);
+      view.setUint16(32, 2, true);
+      view.setUint16(34, 16, true);
+      writeString(36, 'data');
+      view.setUint32(40, numSamples * 2, true);
+
+      const wordDur = (calcDuration - 0.3) / Math.max(1, words.length);
+      for (let i = 0; i < numSamples; i++) {
+        const t = i / sampleRate;
+        let sample = 0;
+        if (t > 0.1 && t < calcDuration - 0.15) {
+          const wordIdx = Math.floor((t - 0.1) / wordDur);
+          const localT = (t - 0.1) - wordIdx * wordDur;
+          const activeDur = wordDur * 0.78;
+          if (localT < activeDur && wordIdx < words.length) {
+            const env = Math.sin((localT / activeDur) * Math.PI);
+            const baseFreq = 240 + ((wordIdx * 37 + text.length * 13) % 140);
+            sample = (Math.sin(2 * Math.PI * baseFreq * t) * 0.10 +
+                      Math.sin(2 * Math.PI * (baseFreq * 1.5) * t) * 0.05) * env;
+          }
+        }
+        const pcmValue = Math.max(-1, Math.min(1, sample));
+        view.setInt16(44 + i * 2, pcmValue * 32767, true);
+      }
+      return new Blob([buffer], { type: 'audio/wav' });
+    }
+
+    function audioBufferSliceToWavBlob(audioBuffer, startSec, endSec) {
+      const sampleRate = audioBuffer.sampleRate;
+      const startSample = Math.max(0, Math.floor(startSec * sampleRate));
+      const endSample = Math.min(audioBuffer.length, Math.ceil(endSec * sampleRate));
+      const frameCount = Math.max(1, endSample - startSample);
+      const channelData = audioBuffer.getChannelData(0);
+
+      const ratio = sampleRate > 24000 ? 2 : 1;
+      const outSampleRate = Math.floor(sampleRate / ratio);
+      const outFrames = Math.max(1, Math.floor(frameCount / ratio));
+
+      const buffer = new ArrayBuffer(44 + outFrames * 2);
+      const view = new DataView(buffer);
+      const writeString = (offset, str) => {
+        for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+      };
+      writeString(0, 'RIFF');
+      view.setUint32(4, 36 + outFrames * 2, true);
+      writeString(8, 'WAVE');
+      writeString(12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true);
+      view.setUint32(24, outSampleRate, true);
+      view.setUint32(28, outSampleRate * 2, true);
+      view.setUint16(32, 2, true);
+      view.setUint16(34, 16, true);
+      writeString(36, 'data');
+      view.setUint32(40, outFrames * 2, true);
+
+      for (let i = 0; i < outFrames; i++) {
+        const srcIdx = startSample + i * ratio;
+        const s = Math.max(-1, Math.min(1, channelData[srcIdx] || 0));
+        view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      }
+      return new Blob([buffer], { type: 'audio/wav' });
+    }
+
+    /*************************************************************************
+     * 3. BULLETPROOF SAFE STORAGE ENGINE (IndexedDB + Automatic Memory Fallback)
+     *    Never throws SecurityError inside iOS Safari sandboxed iframes!
+     *************************************************************************/
+    const DB_NAME = 'CarShadowingDB';
+    const DB_VERSION = 1;
+    const STORE_PACKS = 'packs';
+    const memoryPacksMap = new Map();
+    let isUsingMemoryFallback = false;
+
+    function updateStorageBadgeUI() {
+      const badge = document.getElementById('storageModeBadge');
+      const summary = document.getElementById('diagStatusSummary');
+      if (badge) {
+        badge.textContent = isUsingMemoryFallback ? '沙盒暫存' : '本機資料庫';
+      }
+      if (summary) {
+        summary.innerHTML = isUsingMemoryFallback
+          ? `<div class="text-amber-300 font-bold">⚡ 目前運行於「沙盒預覽暫存模式 (In-Memory)」</div>
+             <div>原因：目前網頁處於 Gemini App / Safari 內嵌預覽沙盒 (iframe) 中，iOS 安全機制限制了 IndexedDB 永久存取，系統已自動切換為記憶體模式確保所有功能正常運作。</div>
+             <div class="text-sky-300">💡 若要永久保存匯入的音檔，請將此程式碼部署至 GitHub Pages 或 Netlify 固定網址並在 Safari 加入主畫面。</div>`
+          : `<div class="text-emerald-400 font-bold">💾 目前運行於「IndexedDB 本機永久儲存模式」</div>
+             <div>所有匯入與切分的音檔皆已安全儲存在瀏覽器本機資料庫中，關閉分頁或離線重開皆不會遺失。</div>`;
+      }
+    }
+
+    function openDatabase() {
+      return new Promise((resolve, reject) => {
+        if (isUsingMemoryFallback) {
+          reject(new Error('Using memory fallback'));
+          return;
+        }
+        try {
+          if (!('indexedDB' in window) || !window.indexedDB) {
+            throw new Error('indexedDB not supported in this context');
+          }
+          const req = window.indexedDB.open(DB_NAME, DB_VERSION);
+          req.onupgradeneeded = (e) => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains(STORE_PACKS)) {
+              db.createObjectStore(STORE_PACKS, { keyPath: 'id' });
+            }
+          };
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error || new Error('IndexedDB open error'));
+        } catch (err) {
+          reject(err);
+        }
+      });
+    }
+
+    async function savePackToDB(pack) {
+      memoryPacksMap.set(pack.id, pack);
+      try {
+        const db = await openDatabase();
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction(STORE_PACKS, 'readwrite');
+          tx.objectStore(STORE_PACKS).put(pack);
+          tx.oncomplete = () => {
+            try { db.close(); } catch (e) {}
+            resolve(pack);
+          };
+          tx.onerror = () => {
+            try { db.close(); } catch (e) {}
+            reject(tx.error);
+          };
+        });
+        updateStorageBadgeUI();
+        return pack;
+      } catch (err) {
+        if (!isUsingMemoryFallback) {
+          isUsingMemoryFallback = true;
+          logDiag('WARN', `IndexedDB 受沙盒限制，已自動啟用記憶體暫存模式 (${err.message || 'SecurityError'})`);
+          updateStorageBadgeUI();
+        }
+        return pack;
+      }
+    }
+
+    async function getAllPacksFromDB() {
+      try {
+        const db = await openDatabase();
+        const list = await new Promise((resolve, reject) => {
+          const tx = db.transaction(STORE_PACKS, 'readonly');
+          const req = tx.objectStore(STORE_PACKS).getAll();
+          req.onsuccess = () => {
+            const res = req.result || [];
+            res.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+            try { db.close(); } catch (e) {}
+            resolve(res);
+          };
+          req.onerror = () => {
+            try { db.close(); } catch (e) {}
+            reject(req.error);
+          };
+        });
+        list.forEach(p => memoryPacksMap.set(p.id, p));
+        updateStorageBadgeUI();
+        return list;
+      } catch (err) {
+        if (!isUsingMemoryFallback) {
+          isUsingMemoryFallback = true;
+          logDiag('WARN', `偵測到 iOS/Iframe 沙盒環境，已無縫切換至記憶體模式`);
+          updateStorageBadgeUI();
+        }
+        const memList = Array.from(memoryPacksMap.values());
+        memList.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        return memList;
+      }
+    }
+
+    async function deletePackFromDB(packId) {
+      memoryPacksMap.delete(packId);
+      if (isUsingMemoryFallback) return;
+      try {
+        const db = await openDatabase();
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction(STORE_PACKS, 'readwrite');
+          tx.objectStore(STORE_PACKS).delete(packId);
+          tx.oncomplete = () => {
+            try { db.close(); } catch (e) {}
+            resolve();
+          };
+          tx.onerror = () => {
+            try { db.close(); } catch (e) {}
+            reject(tx.error);
+          };
+        });
+      } catch (err) {
+        logDiag('WARN', `刪除課程包時使用記憶體同步: ${err.message || ''}`);
+      }
+    }
+
+    /*************************************************************************
+     * 4. APPLICATION STATE & SAFE KEYMAP PERSISTENCE
+     *************************************************************************/
+    const SPEED_STEPS = [1.0, 0.85, 0.75, 1.15];
+    const DEFAULT_KEYMAP = {
+      prev:    { label: '上一句',       codes: ['ArrowLeft', 'PageUp', 'MediaTrackPrevious'] },
+      restart: { label: '回到這句開頭', codes: ['ArrowUp', 'KeyR', 'Backspace'] },
+      play:    { label: '播放 / 暫停 (長按調速)', codes: ['Space', 'Enter', 'MediaPlayPause'] },
+      next:    { label: '下一句',       codes: ['ArrowRight', 'PageDown', 'MediaTrackNext'] },
+      speed:   { label: '切換語速',     codes: ['ArrowDown', 'KeyS'] }
+    };
+
+    const state = {
+      packs: [],
+      currentPack: null,
+      currentIndex: 0,
+      currentRepeat: 1,
+      targetRepeats: 2,
+      gapMode: 0.8,
+      speedIndex: 0,
+      isPlaying: false,
+      isInGapPause: false,
+      gapTimer: null,
+      activeBlobUrl: null,
+      subDisplayMode: 'both',
+      demoVoiceMode: 'tts_and_pad',
+      longPressSpeedEnabled: true,
+      keymap: loadKeymap(),
+      listeningAction: null,
+      pendingImportPack: null,
+      wakeLockSentinel: null,
+      workbench: {
+        activeTab: 'gpt',
+        audioBuffer: null,
+        rmsDbEnvelope: null,
+        windowSec: 0.02,
+        segments: [],
+        subtitles: [],
+        previewAudioCtx: null,
+        previewSourceNode: null
+      }
+    };
+
+    function loadKeymap() {
+      try {
+        const saved = window.localStorage.getItem('carShadowKeymap_v1');
+        if (saved) return JSON.parse(saved);
+      } catch (e) {}
+      return JSON.parse(JSON.stringify(DEFAULT_KEYMAP));
+    }
+
+    function saveKeymap() {
+      try {
+        window.localStorage.setItem('carShadowKeymap_v1', JSON.stringify(state.keymap));
+      } catch (e) {}
+      updateKeyBadgesOnDeck();
+    }
+
+    /*************************************************************************
+     * 5. GIANT HUD TOAST, WAKE LOCK & VISUAL FEEDBACK
+     *************************************************************************/
+    let hudTimeout = null;
+    function showGiantHud(icon, title, sub = '', borderColor = 'border-sky-400/80') {
+      const overlay = document.getElementById('hudOverlay');
+      const box = document.getElementById('hudBox');
+      if (!overlay || !box) return;
+      document.getElementById('hudIcon').innerHTML = icon;
+      document.getElementById('hudTitle').textContent = title;
+      document.getElementById('hudSub').textContent = sub;
+
+      box.className = `bg-slate-900/95 border-2 ${borderColor} shadow-[0_0_50px_rgba(56,189,248,0.35)] rounded-3xl px-8 py-6 flex flex-col items-center justify-center text-center backdrop-blur-md min-w-[260px] max-w-[88vw] hud-animate`;
+      overlay.classList.remove('hidden');
+
+      box.style.animation = 'none';
+      void box.offsetWidth;
+      box.style.animation = null;
+
+      if (hudTimeout) clearTimeout(hudTimeout);
+      hudTimeout = setTimeout(() => {
+        overlay.classList.add('hidden');
+      }, 1100);
+    }
+
+    function flashDeckButton(btnId) {
+      const btn = document.getElementById(btnId);
+      if (!btn) return;
+      btn.classList.add('btn-flash');
+      setTimeout(() => btn.classList.remove('btn-flash'), 180);
+    }
+
+    async function requestWakeLock() {
+      const btn = document.getElementById('btnWakeLock');
+      const txt = document.getElementById('wakeLockText');
+      try {
+        if ('wakeLock' in navigator && navigator.wakeLock) {
+          state.wakeLockSentinel = await navigator.wakeLock.request('screen');
+          if (btn) btn.className = 'px-2.5 py-1.5 rounded-xl text-xs font-bold border border-emerald-500/50 bg-emerald-950/60 text-emerald-300 flex items-center gap-1.5 transition';
+          if (txt) txt.textContent = '恆亮已鎖定';
+        }
+      } catch (e) {
+        if (txt) txt.textContent = '恆亮待命';
+      }
+    }
+
+    /*************************************************************************
+     * 6. CORE AUDIO ENGINE (Single Persistent <audio> + iOS Safari Synchronous Unlock)
+     *************************************************************************/
+    const masterAudio = document.getElementById('masterAudio');
+    let sharedAudioCtx = null;
+
+    function unlockiOSAudioAndSpeechSynchronously() {
+      try {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (AudioCtx) {
+          if (!sharedAudioCtx) sharedAudioCtx = new AudioCtx();
+          if (sharedAudioCtx.state === 'suspended') sharedAudioCtx.resume();
+        }
+        if ('speechSynthesis' in window && window.speechSynthesis) {
+          const warmUp = new SpeechSynthesisUtterance('');
+          warmUp.volume = 0;
+          window.speechSynthesis.speak(warmUp);
+        }
+      } catch (e) {}
+    }
+
+    function clearPendingTimers() {
+      if (state.gapTimer) {
+        clearTimeout(state.gapTimer);
+        state.gapTimer = null;
+      }
+      state.isInGapPause = false;
+      const gapBanner = document.getElementById('gapHintBanner');
+      if (gapBanner) gapBanner.classList.add('hidden');
+      try {
+        if ('speechSynthesis' in window && window.speechSynthesis) {
+          window.speechSynthesis.cancel();
+        }
+      } catch (e) {}
+    }
+
+    function loadCurrentSentenceIntoAudio(autoPlay = false) {
+      clearPendingTimers();
+      if (!state.currentPack || !state.currentPack.items.length) return;
+
+      const item = state.currentPack.items[state.currentIndex];
+      if (!item) return;
+
+      if (state.activeBlobUrl) {
+        try { URL.revokeObjectURL(state.activeBlobUrl); } catch (e) {}
+        state.activeBlobUrl = null;
+      }
+
+      if (item.audioBlob) {
+        state.activeBlobUrl = URL.createObjectURL(item.audioBlob);
+        masterAudio.src = state.activeBlobUrl;
+        masterAudio.playbackRate = SPEED_STEPS[state.speedIndex];
+        try { masterAudio.currentTime = 0; } catch (e) {}
+      }
+
+      renderMainStage();
+      updateMediaSessionMetadata();
+
+      if (autoPlay) {
+        playCurrentAudioFromStart();
+      } else {
+        setEngineVisualState('ready', '待命準備');
+      }
+    }
+
+    function playCurrentAudioFromStart() {
+      clearPendingTimers();
+      if (!state.currentPack || !state.currentPack.items.length) return;
+      const item = state.currentPack.items[state.currentIndex];
+
+      const isDemo = Boolean(state.currentPack.isDemoTTS);
+      try { masterAudio.currentTime = 0; } catch (e) {}
+      masterAudio.playbackRate = SPEED_STEPS[state.speedIndex];
+      masterAudio.muted = isDemo && state.demoVoiceMode === 'tts_only';
+
+      if (isDemo && state.demoVoiceMode !== 'pad_only') {
+        speakDemoSentence(item.en, SPEED_STEPS[state.speedIndex]);
+      }
+
+      const playPromise = masterAudio.play();
+      if (playPromise !== undefined) {
+        playPromise.then(() => {
+          state.isPlaying = true;
+          updatePlayPauseUI();
+          setEngineVisualState('playing', `播放中 (${state.currentRepeat}/${formatRepeatTarget()})`);
+        }).catch((err) => {
+          logDiag('WARN', `瀏覽器等待手勢點擊播放: ${err.message || ''}`);
+          state.isPlaying = false;
+          updatePlayPauseUI();
+          setEngineVisualState('paused', '點擊播放啟動');
+        });
+      }
+    }
+
+    function speakDemoSentence(text, rate) {
+      try {
+        if (!('speechSynthesis' in window) || !window.speechSynthesis) return;
+        window.speechSynthesis.cancel();
+        const cleanSpeechText = String(text || '').replace(/^\d+[\.\)、\-\s]+/, '').trim();
+        const utter = new SpeechSynthesisUtterance(cleanSpeechText || text);
+        utter.lang = 'en-US';
+        utter.rate = rate;
+        window.speechSynthesis.speak(utter);
+      } catch (e) {}
+    }
+
+    masterAudio.addEventListener('timeupdate', () => {
+      const cur = masterAudio.currentTime || 0;
+      const dur = masterAudio.duration || 0;
+      document.getElementById('timeCurrent').textContent = formatTime(cur);
+      if (dur > 0 && isFinite(dur)) {
+        document.getElementById('timeDuration').textContent = formatTime(dur);
+        document.getElementById('badgeClipDuration').textContent = `${dur.toFixed(1)}s`;
+        const pct = Math.min(100, (cur / dur) * 100);
+        document.getElementById('audioProgressBar').style.width = `${pct}%`;
+      }
+    });
+
+    masterAudio.addEventListener('loadedmetadata', () => {
+      const dur = masterAudio.duration || 0;
+      if (dur > 0 && isFinite(dur)) {
+        document.getElementById('timeDuration').textContent = formatTime(dur);
+        document.getElementById('badgeClipDuration').textContent = `${dur.toFixed(1)}s`;
+      }
+    });
+
+    masterAudio.addEventListener('ended', () => {
+      if (!state.isPlaying) return;
+      document.getElementById('audioProgressBar').style.width = '100%';
+
+      const clipDur = (masterAudio.duration && isFinite(masterAudio.duration)) ? masterAudio.duration : 2.5;
+      let waitMs = 0;
+      if (state.gapMode === 'auto') {
+        waitMs = Math.round(clipDur * 1000);
+      } else {
+        waitMs = Number(state.gapMode) * 1000;
+      }
+
+      const willRepeatSameSentence = state.currentRepeat < state.targetRepeats;
+
+      if (waitMs > 0) {
+        state.isInGapPause = true;
+        document.getElementById('gapHintBanner').classList.remove('hidden');
+        setEngineVisualState('gap', `跟讀留白 (${(waitMs / 1000).toFixed(1)}s)`);
+      }
+
+      state.gapTimer = setTimeout(() => {
+        state.isInGapPause = false;
+        document.getElementById('gapHintBanner').classList.add('hidden');
+        if (!state.isPlaying) return;
+
+        if (willRepeatSameSentence) {
+          state.currentRepeat += 1;
+          renderRepeatIndicators();
+          playCurrentAudioFromStart();
+        } else {
+          const total = state.currentPack.items.length;
+          state.currentIndex = (state.currentIndex + 1) % total;
+          state.currentRepeat = 1;
+          loadCurrentSentenceIntoAudio(true);
+        }
+      }, waitMs);
+    });
+
+    /*************************************************************************
+     * 7. THE 5 REMOTE CONTROL ACTIONS
+     *************************************************************************/
+    function actionRestartCurrentSentence() {
+      if (!state.currentPack || !state.currentPack.items.length) return;
+      unlockiOSAudioAndSpeechSynchronously();
+      flashDeckButton('btnCtrlRestart');
+      state.currentRepeat = 1;
+      state.isPlaying = true;
+      renderRepeatIndicators();
+      playCurrentAudioFromStart();
+      showGiantHud(
+        '<i class="fa-solid fa-rotate-left text-emerald-400"></i>',
+        '回到本句開頭',
+        `第 ${ formatIdx(state.currentIndex + 1) } 句 ｜ 重複 1 / ${ formatRepeatTarget() }`,
+        'border-emerald-400/90'
+      );
+    }
+
+    function actionPrevSentence() {
+      if (!state.currentPack || !state.currentPack.items.length) return;
+      unlockiOSAudioAndSpeechSynchronously();
+      flashDeckButton('btnCtrlPrev');
+      const total = state.currentPack.items.length;
+      state.currentIndex = (state.currentIndex - 1 + total) % total;
+      state.currentRepeat = 1;
+      state.isPlaying = true;
+      loadCurrentSentenceIntoAudio(true);
+      showGiantHud(
+        '<i class="fa-solid fa-backward-step text-sky-400"></i>',
+        `上一句 (#${ formatIdx(state.currentIndex + 1) })`,
+        `第 1 / ${ formatRepeatTarget() } 次重複`,
+        'border-sky-400/90'
+      );
+    }
+
+    function actionNextSentence() {
+      if (!state.currentPack || !state.currentPack.items.length) return;
+      unlockiOSAudioAndSpeechSynchronously();
+      flashDeckButton('btnCtrlNext');
+      const total = state.currentPack.items.length;
+      state.currentIndex = (state.currentIndex + 1) % total;
+      state.currentRepeat = 1;
+      state.isPlaying = true;
+      loadCurrentSentenceIntoAudio(true);
+      showGiantHud(
+        '<i class="fa-solid fa-forward-step text-sky-400"></i>',
+        `下一句 (#${ formatIdx(state.currentIndex + 1) })`,
+        `第 1 / ${ formatRepeatTarget() } 次重複`,
+        'border-sky-400/90'
+      );
+    }
+
+    function actionTogglePlayPause() {
+      if (!state.currentPack || !state.currentPack.items.length) return;
+      unlockiOSAudioAndSpeechSynchronously();
+      flashDeckButton('btnCtrlPlay');
+
+      if (state.isPlaying) {
+        state.isPlaying = false;
+        clearPendingTimers();
+        masterAudio.pause();
+        updatePlayPauseUI();
+        setEngineVisualState('paused', '已暫停');
+        showGiantHud(
+          '<i class="fa-solid fa-pause text-amber-400"></i>',
+          '暫停播放',
+          `停在第 ${ formatIdx(state.currentIndex + 1) } 句 (${state.currentRepeat}/${formatRepeatTarget()})`,
+          'border-amber-400/90'
+        );
+      } else {
+        state.isPlaying = true;
+        updatePlayPauseUI();
+        if (masterAudio.currentTime > 0 && masterAudio.currentTime < (masterAudio.duration || 0) - 0.15 && !state.currentPack.isDemoTTS) {
+          masterAudio.play().catch(() => {});
+          setEngineVisualState('playing', `播放中 (${state.currentRepeat}/${formatRepeatTarget()})`);
+        } else {
+          playCurrentAudioFromStart();
+        }
+        showGiantHud(
+          '<i class="fa-solid fa-play text-sky-400"></i>',
+          '繼續播放',
+          `第 ${ formatIdx(state.currentIndex + 1) } 句 ｜ 語速 ${SPEED_STEPS[state.speedIndex].toFixed(2)}x`,
+          'border-sky-400/90'
+        );
+      }
+    }
+
+    function actionCycleSpeed() {
+      flashDeckButton('btnCtrlSpeed');
+      state.speedIndex = (state.speedIndex + 1) % SPEED_STEPS.length;
+      const newSpeed = SPEED_STEPS[state.speedIndex];
+      masterAudio.playbackRate = newSpeed;
+
+      const label = `${newSpeed.toFixed(2).replace(/\.00$/, '.0')}x`;
+      document.getElementById('statSpeedText').textContent = label;
+      document.getElementById('labelSpeedBtn').textContent = `${label} 語速`;
+
+      showGiantHud(
+        '<i class="fa-solid fa-gauge-high text-amber-400"></i>',
+        `語速 ${label}`,
+        newSpeed < 1 ? '慢速清晰跟讀模式' : (newSpeed > 1 ? '進階倍速挑戰' : '標準原速模式'),
+        'border-amber-400/90'
+      );
+    }
+
+    /*************************************************************************
+     * 8. UI RENDERING & MEDIA SESSION UPDATES
+     *************************************************************************/
+    function formatIdx(num) {
+      return String(num).padStart(2, '0');
+    }
+
+    function formatRepeatTarget() {
+      return state.targetRepeats > 50 ? '∞' : state.targetRepeats;
+    }
+
+    function formatTime(sec) {
+      if (!sec || !isFinite(sec)) return '00:00.0';
+      const m = Math.floor(sec / 60);
+      const s = (sec % 60).toFixed(1).padStart(4, '0');
+      return `${String(m).padStart(2, '0')}:${s}`;
+    }
+
+    function renderMainStage() {
+      if (!state.currentPack || !state.currentPack.items.length) return;
+      const total = state.currentPack.items.length;
+      const item = state.currentPack.items[state.currentIndex];
+
+      document.getElementById('statCurrentIdx').textContent = formatIdx(state.currentIndex + 1);
+      document.getElementById('statTotalIdx').textContent = formatIdx(total);
+      document.getElementById('badgeAudioSource').textContent = state.currentPack.isDemoTTS
+        ? '內建範例音檔 + TTS'
+        : (state.currentPack.audioModeLabel || '本機離線音檔');
+
+      const demoVoiceBtn = document.getElementById('btnDemoVoiceMode');
+      if (demoVoiceBtn) {
+        demoVoiceBtn.classList.toggle('hidden', !state.currentPack.isDemoTTS);
+      }
+
+      const enEl = document.getElementById('displayEnglish');
+      const zhEl = document.getElementById('displayChinese');
+
+      const len = (item.en || '').length;
+      if (len > 85) {
+        enEl.className = 'font-extrabold tracking-tight text-white leading-snug transition-all duration-150 text-xl sm:text-3xl md:text-4xl px-1 break-words';
+      } else if (len > 50) {
+        enEl.className = 'font-extrabold tracking-tight text-white leading-snug transition-all duration-150 text-2xl sm:text-4xl md:text-5xl px-1 break-words';
+      } else {
+        enEl.className = 'font-extrabold tracking-tight text-white leading-tight transition-all duration-150 text-2xl sm:text-5xl md:text-6xl px-1 break-words';
+      }
+
+      if (state.subDisplayMode === 'blind') {
+        enEl.textContent = '🙈 盲聽跟讀模式 (點擊右上角可顯示字幕)';
+        enEl.classList.add('text-slate-500');
+        zhEl.textContent = item.zh ? '（已隱藏中英文字幕，專注聽力）' : '';
+      } else {
+        enEl.textContent = item.en || '(無英文字幕)';
+        enEl.classList.remove('text-slate-500');
+        if (state.subDisplayMode === 'both') {
+          zhEl.textContent = item.zh || '';
+          zhEl.classList.remove('hidden');
+        } else {
+          zhEl.classList.add('hidden');
+        }
+      }
+
+      renderRepeatIndicators();
+    }
+
+    function renderRepeatIndicators() {
+      const container = document.getElementById('repeatDotsContainer');
+      container.innerHTML = '';
+      const count = state.targetRepeats > 5 ? 3 : state.targetRepeats;
+      for (let i = 1; i <= count; i++) {
+        const dot = document.createElement('span');
+        const active = i <= state.currentRepeat;
+        dot.className = `w-3 h-3 rounded-full transition-all ${
+          active ? 'bg-emerald-400 shadow-[0_0_8px_rgba(16,185,129,0.8)] scale-110' : 'bg-slate-700'
+        }`;
+        container.appendChild(dot);
+      }
+      document.getElementById('statRepeatText').textContent = `${state.currentRepeat}/${formatRepeatTarget()}`;
+    }
+
+    function updatePlayPauseUI() {
+      const icon = document.getElementById('iconPlayPause');
+      const label = document.getElementById('labelPlayPause');
+      const btn = document.getElementById('btnCtrlPlay');
+      if (state.isPlaying) {
+        icon.className = 'fa-solid fa-pause text-2xl sm:text-3xl';
+        label.textContent = '暫停播放';
+        btn.className = 'ctrl-btn group relative bg-amber-400 hover:bg-amber-300 active:scale-95 border-2 border-amber-200 rounded-2xl p-3 sm:p-4 flex flex-col items-center justify-center gap-1.5 transition shadow-xl shadow-amber-500/20 text-slate-950';
+      } else {
+        icon.className = 'fa-solid fa-play text-2xl sm:text-3xl';
+        label.textContent = '開始播放';
+        btn.className = 'ctrl-btn group relative bg-sky-500 hover:bg-sky-400 active:scale-95 border-2 border-sky-300 rounded-2xl p-3 sm:p-4 flex flex-col items-center justify-center gap-1.5 transition shadow-xl shadow-sky-500/20 text-slate-950';
+      }
+    }
+
+    function setEngineVisualState(type, text) {
+      const el = document.getElementById('statEngineState');
+      let color = 'bg-slate-500';
+      let textColor = 'text-slate-300';
+      if (type === 'playing') { color = 'bg-emerald-400 animate-ping'; textColor = 'text-emerald-400'; }
+      else if (type === 'gap') { color = 'bg-amber-400 animate-pulse'; textColor = 'text-amber-400'; }
+      else if (type === 'paused') { color = 'bg-rose-400'; textColor = 'text-rose-300'; }
+
+      el.className = `flex items-center gap-2 font-bold text-xs sm:text-sm ${textColor}`;
+      el.innerHTML = `<span class="w-2.5 h-2.5 rounded-full ${color}"></span><span>${text}</span>`;
+    }
+
+    function updateMediaSessionMetadata() {
+      try {
+        if (!('mediaSession' in navigator) || !navigator.mediaSession || !state.currentPack) return;
+        const item = state.currentPack.items[state.currentIndex];
+        if (!item) return;
+
+        if (typeof MediaMetadata !== 'undefined') {
+          navigator.mediaSession.metadata = new MediaMetadata({
+            title: `(${state.currentIndex + 1}/${state.currentPack.items.length}) ${item.en}`,
+            artist: item.zh || state.currentPack.name,
+            album: 'DriveShadow 車用英文跟讀'
+          });
+        }
+
+        navigator.mediaSession.setActionHandler('previoustrack', () => actionPrevSentence());
+        navigator.mediaSession.setActionHandler('nexttrack', () => actionNextSentence());
+        navigator.mediaSession.setActionHandler('play', () => { if (!state.isPlaying) actionTogglePlayPause(); });
+        navigator.mediaSession.setActionHandler('pause', () => { if (state.isPlaying) actionTogglePlayPause(); });
+      } catch (e) {}
+    }
+
+    /*************************************************************************
+     * 9. BLUETOOTH PAGE TURNER (BLE HID) KEYBOARD INTERCEPTOR + LONG PRESS
+     *************************************************************************/
+    let playKeyHoldTimer = null;
+    let playKeyLongPressed = false;
+    let activePlayKeyCode = null;
+
+    function findActionByKeyEvent(e) {
+      const code = e.code;
+      const key = e.key;
+      for (const [action, cfg] of Object.entries(state.keymap)) {
+        if (cfg.codes.includes(code) || cfg.codes.includes(key)) {
+          return action;
+        }
+      }
+      return null;
+    }
+
+    window.addEventListener('keydown', (e) => {
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
+
+      if (state.listeningAction) {
+        e.preventDefault();
+        e.stopPropagation();
+        const capturedCode = e.code || e.key;
+        state.keymap[state.listeningAction].codes = [capturedCode];
+        state.listeningAction = null;
+        saveKeymap();
+        renderKeymapModalRows();
+        return;
+      }
+
+      const action = findActionByKeyEvent(e);
+      if (!action) return;
+
+      e.preventDefault();
+      if (e.repeat) return;
+
+      if (action === 'play') {
+        activePlayKeyCode = e.code || e.key;
+        playKeyLongPressed = false;
+        if (state.longPressSpeedEnabled) {
+          playKeyHoldTimer = setTimeout(() => {
+            playKeyLongPressed = true;
+            actionCycleSpeed();
+          }, 500);
+        }
+        return;
+      }
+
+      if (action === 'prev') actionPrevSentence();
+      else if (action === 'restart') actionRestartCurrentSentence();
+      else if (action === 'next') actionNextSentence();
+      else if (action === 'speed') actionCycleSpeed();
+    });
+
+    window.addEventListener('keyup', (e) => {
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
+      const code = e.code || e.key;
+      if (activePlayKeyCode && code === activePlayKeyCode) {
+        e.preventDefault();
+        if (playKeyHoldTimer) {
+          clearTimeout(playKeyHoldTimer);
+          playKeyHoldTimer = null;
+        }
+        if (!playKeyLongPressed) {
+          actionTogglePlayPause();
+        }
+        activePlayKeyCode = null;
+        playKeyLongPressed = false;
+      }
+    });
+
+    function updateKeyBadgesOnDeck() {
+      const fmt = (codes) => (codes && codes.length ? codes[0].replace('Arrow', '').replace('Key', '') : '未綁定');
+      document.getElementById('badgeKeyPrev').textContent = fmt(state.keymap.prev.codes);
+      document.getElementById('badgeKeyRestart').textContent = fmt(state.keymap.restart.codes);
+      document.getElementById('badgeKeyPlay').textContent = `${fmt(state.keymap.play.codes)} (長按調速)`;
+      document.getElementById('badgeKeyNext').textContent = fmt(state.keymap.next.codes);
+      document.getElementById('badgeKeySpeed').textContent = fmt(state.keymap.speed.codes);
+    }
+
+    function renderKeymapModalRows() {
+      const container = document.getElementById('keymapListContainer');
+      container.innerHTML = '';
+
+      const actionMeta = [
+        { key: 'prev',    icon: 'fa-backward-step text-sky-400', title: '回到前一句 (上一句)' },
+        { key: 'restart', icon: 'fa-rotate-left text-emerald-400', title: '回到這句開頭 (0.0秒重播)' },
+        { key: 'play',    icon: 'fa-play text-sky-300', title: '播放 / 暫停 (長按 0.5 秒切換語速)' },
+        { key: 'next',    icon: 'fa-forward-step text-sky-400', title: '前進下一句' },
+        { key: 'speed',   icon: 'fa-bolt text-amber-400', title: '獨立調速度鍵 (選配)' }
+      ];
+
+      actionMeta.forEach(({ key, icon, title }) => {
+        const cfg = state.keymap[key];
+        const isListening = state.listeningAction === key;
+        const row = document.createElement('div');
+        row.className = 'flex items-center justify-between bg-slate-900 border border-slate-800 rounded-2xl px-3.5 py-2.5 gap-2';
+        row.innerHTML = `
+          <div class="flex items-center gap-2.5 min-w-0">
+            <i class="fa-solid ${icon} w-5 text-center"></i>
+            <div>
+              <div class="text-xs sm:text-sm font-bold text-white">${title}</div>
+              <div class="text-[11px] font-mono text-slate-400">目前綁定：<span class="text-sky-300">${cfg.codes.join(' / ')}</span></div>
+            </div>
+          </div>
+          <button data-bind="${key}" class="px-3 py-1.5 rounded-xl text-xs font-extrabold transition shrink-0 ${
+            isListening
+              ? 'bg-amber-400 text-slate-950 animate-pulse'
+              : 'bg-slate-800 hover:bg-slate-700 text-sky-300 border border-slate-700'
+          }">
+            ${isListening ? '請按翻頁器按鍵...' : '點擊錄製按鍵'}
+          </button>
+        `;
+        row.querySelector('button').addEventListener('click', () => {
+          state.listeningAction = state.listeningAction === key ? null : key;
+          renderKeymapModalRows();
+        });
+        container.appendChild(row);
+      });
+    }
+
+    /*************************************************************************
+     * 10. UPGRADED SMART AUDIO SLICER WORKBENCH (Real-time <10ms Envelope VAD)
+     *     + ZIP & MULTI-FORMAT IMPORT ENGINE
+     *************************************************************************/
+    const naturalSort = (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+
+    function splitEnZhLine(line) {
+      if (line.includes('||')) {
+        const [en, zh] = line.split('||').map(s => s.trim());
+        return { en, zh };
+      }
+      if (line.includes('\t')) {
+        const [en, zh] = line.split('\t').map(s => s.trim());
+        return { en, zh };
+      }
+      return { en: line.trim(), zh: '' };
+    }
+
+    function parseSingleSubtitleFileContent(rawText, filename = '') {
+      const text = String(rawText || '').replace(/^\uFEFF/, '').trim();
+      if (!text) return [];
+      const keepNumber = document.getElementById('chkKeepNumberPrefix')?.checked ?? true;
+
+      const normalizeEnLine = (str) => {
+        const s = String(str || '').trim();
+        return keepNumber ? s : s.replace(/^\d+[\.\)、\-\s]+/, '').trim();
+      };
+
+      // 1. JSON format
+      if (filename.endsWith('.json') || (text.startsWith('[') && text.endsWith(']'))) {
+        try {
+          const arr = JSON.parse(text);
+          return arr.map((item) => {
+            if (typeof item === 'string') return splitEnZhLine(normalizeEnLine(item));
+            return {
+              en: normalizeEnLine(item.en || item.text || item.sentence || ''),
+              zh: item.zh || item.translation || item.cn || '',
+              startTime: item.start ?? item.startTime ?? null,
+              endTime: item.end ?? item.endTime ?? null
+            };
+          }).filter(x => x.en);
+        } catch (e) {}
+      }
+
+      // 2. SRT / VTT format with timestamps
+      if (text.includes('-->')) {
+        const blocks = text.replace(/\r\n/g, '\n').split(/\n\s*\n/);
+        const results = [];
+        const timeRegex = /(\d{1,2}:)?(\d{2}):(\d{2})[.,](\d{3})\s*-->\s*(\d{1,2}:)?(\d{2}):(\d{2})[.,](\d{3})/;
+        for (const block of blocks) {
+          const lines = block.split('\n').map(l => l.trim()).filter(Boolean);
+          const timeLineIdx = lines.findIndex(l => timeRegex.test(l));
+          if (timeLineIdx !== -1) {
+            const m = lines[timeLineIdx].match(timeRegex);
+            const startSec = (parseInt(m[1] || '0') * 3600) + parseInt(m[2]) * 60 + parseInt(m[3]) + parseInt(m[4]) / 1000;
+            const endSec = (parseInt(m[5] || '0') * 3600) + parseInt(m[6]) * 60 + parseInt(m[7]) + parseInt(m[8]) / 1000;
+            const contentLines = lines.slice(timeLineIdx + 1);
+            if (contentLines.length > 0) {
+              const parsed = contentLines.length >= 2
+                ? { en: normalizeEnLine(contentLines[0]), zh: contentLines.slice(1).join(' ') }
+                : splitEnZhLine(normalizeEnLine(contentLines[0]));
+              results.push({ ...parsed, startTime: startSec, endTime: endSec });
+            }
+          }
+        }
+        if (results.length > 0) return results;
+      }
+
+      // 3. LRC format ([00:02.30]Sentence here)
+      const lrcRegex = /^\[(\d{2}):(\d{2}(?:\.\d{1,3})?)\](.*)$/;
+      const rawLines = text.replace(/\r\n/g, '\n').split('\n').map(l => l.trim()).filter(Boolean);
+      if (rawLines.some(l => lrcRegex.test(l))) {
+        const lrcItems = [];
+        for (const line of rawLines) {
+          const m = line.match(lrcRegex);
+          if (m && m[3].trim()) {
+            const startSec = parseInt(m[1]) * 60 + parseFloat(m[2]);
+            const parsed = splitEnZhLine(normalizeEnLine(m[3].trim()));
+            lrcItems.push({ ...parsed, startTime: startSec, endTime: null });
+          }
+        }
+        for (let i = 0; i < lrcItems.length; i++) {
+          if (i + 1 < lrcItems.length) lrcItems[i].endTime = lrcItems[i + 1].startTime;
+        }
+        if (lrcItems.length > 0) return lrcItems;
+      }
+
+      // 4. Plain TXT (One sentence per line, e.g. "1. Hi there." or "1. Hi there. || 你好")
+      return rawLines
+        .map(line => splitEnZhLine(normalizeEnLine(line)))
+        .filter(x => x.en);
+    }
+
+    function parseOneSentenceTxtFile(rawText) {
+      const keepNumber = document.getElementById('chkKeepNumberPrefix')?.checked ?? true;
+      const lines = String(rawText || '').replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').split('\n').map(l => l.trim()).filter(Boolean);
+      if (!lines.length) return { en: '', zh: '' };
+      const first = keepNumber ? lines[0] : lines[0].replace(/^\d+[\.\)、\-\s]+/, '').trim();
+      if (lines.length === 1) return splitEnZhLine(first);
+      return { en: first, zh: lines.slice(1).join(' ') };
+    }
+
+    async function loadAudioBlobIntoWorkbench(audioBlob, displayFileName = '長音檔.wav') {
+      const nameEl = document.getElementById('longAudioFileName');
+      const metaEl = document.getElementById('longAudioMetaInfo');
+      nameEl.textContent = `⏳ 正在解碼音訊並分析能量波形：${displayFileName}...`;
+      nameEl.className = 'text-xs sm:text-sm font-bold text-amber-400 animate-pulse truncate';
+
+      try {
+        const arrayBuffer = await audioBlob.arrayBuffer();
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        const decodeCtx = new AudioCtx();
+        const audioBuffer = await decodeCtx.decodeAudioData(arrayBuffer);
+        try { decodeCtx.close(); } catch (e) {}
+
+        const channelData = audioBuffer.getChannelData(0);
+        const sampleRate = audioBuffer.sampleRate;
+        const windowSec = 0.02;
+        const windowSamples = Math.max(1, Math.floor(sampleRate * windowSec));
+        const totalWindows = Math.floor(channelData.length / windowSamples);
+        const rmsDbEnvelope = new Float32Array(totalWindows);
+
+        for (let w = 0; w < totalWindows; w++) {
+          let sumSq = 0;
+          const offset = w * windowSamples;
+          for (let i = 0; i < windowSamples; i++) {
+            const s = channelData[offset + i];
+            sumSq += s * s;
+          }
+          const rms = Math.sqrt(sumSq / windowSamples);
+          const db = rms > 0.000001 ? 20 * Math.log10(rms) : -100;
+          rmsDbEnvelope[w] = db;
+        }
+
+        state.workbench.audioBuffer = audioBuffer;
+        state.workbench.rmsDbEnvelope = rmsDbEnvelope;
+        state.workbench.windowSec = windowSec;
+
+        nameEl.textContent = `✅ 已載入：${displayFileName}`;
+        nameEl.className = 'text-xs sm:text-sm font-bold text-emerald-400 truncate';
+        metaEl.textContent = `總長度：${audioBuffer.duration.toFixed(1)} 秒 ｜ 取樣率：${sampleRate} Hz ｜ 拖動下方滑桿可即時預覽切點`;
+        document.getElementById('envelopeDurationLabel').textContent = formatTime(audioBuffer.duration);
+
+        recalculateWorkbenchSegmentsFromSliders();
+      } catch (err) {
+        logDiag('ERR', `音檔解碼失敗: ${err.message || ''}`);
+        nameEl.textContent = `❌ 音檔解碼失敗：${err.message || '請確認音訊格式'}`;
+        nameEl.className = 'text-xs sm:text-sm font-bold text-rose-400 truncate';
+      }
+    }
+
+    function computeSegmentsFromEnvelope(thresholdDb, minPauseMs, minClipMs, padMs) {
+      const env = state.workbench.rmsDbEnvelope;
+      const audioBuffer = state.workbench.audioBuffer;
+      if (!env || !audioBuffer) return [];
+
+      const winSec = state.workbench.windowSec;
+      const minSilenceWins = Math.max(1, Math.round((minPauseMs / 1000) / winSec));
+      const minSpeechWins = Math.max(1, Math.round((minClipMs / 1000) / winSec));
+      const padSec = padMs / 1000;
+      const totalDur = audioBuffer.duration;
+
+      const rawSegments = [];
+      let inSpeech = false;
+      let speechStartWin = 0;
+      let silenceCount = 0;
+
+      for (let w = 0; w < env.length; w++) {
+        if (env[w] >= thresholdDb) {
+          if (!inSpeech) {
+            inSpeech = true;
+            speechStartWin = w;
+          }
+          silenceCount = 0;
+        } else if (inSpeech) {
+          silenceCount++;
+          if (silenceCount >= minSilenceWins) {
+            const speechEndWin = w - silenceCount + 1;
+            if (speechEndWin - speechStartWin >= minSpeechWins) {
+              rawSegments.push({
+                startSec: Math.max(0, speechStartWin * winSec - padSec),
+                endSec: Math.min(totalDur, speechEndWin * winSec + padSec)
+              });
+            }
+            inSpeech = false;
+            silenceCount = 0;
+          }
+        }
+      }
+
+      if (inSpeech) {
+        const speechEndWin = env.length;
+        if (speechEndWin - speechStartWin >= minSpeechWins) {
+          rawSegments.push({
+            startSec: Math.max(0, speechStartWin * winSec - padSec),
+            endSec: totalDur
+          });
+        }
+      }
+
+      for (let i = 0; i < rawSegments.length - 1; i++) {
+        if (rawSegments[i].endSec > rawSegments[i + 1].startSec) {
+          const mid = (rawSegments[i].endSec + rawSegments[i + 1].startSec) / 2;
+          rawSegments[i].endSec = mid;
+          rawSegments[i + 1].startSec = mid;
+        }
+      }
+
+      return rawSegments;
+    }
+
+    function recalculateWorkbenchSegmentsFromSliders() {
+      const thresholdDb = parseFloat(document.getElementById('sliderVadDb').value);
+      const minPauseMs = parseInt(document.getElementById('sliderVadPauseMs').value, 10);
+      const minClipMs = parseInt(document.getElementById('sliderVadMinClipMs').value, 10);
+      const padMs = parseInt(document.getElementById('sliderVadPadMs').value, 10);
+
+      document.getElementById('valSliderDb').textContent = `${thresholdDb.toFixed(1)} dB`;
+      document.getElementById('valSliderPauseMs').textContent = `${minPauseMs} ms`;
+      document.getElementById('valSliderMinClipMs').textContent = `${minClipMs} ms`;
+      document.getElementById('valSliderPadMs').textContent = `${padMs} ms`;
+
+      const rawSubText = document.getElementById('textareaSubtitles').value;
+      state.workbench.subtitles = parseSingleSubtitleFileContent(rawSubText, 'paste.txt');
+      document.getElementById('parsedLineCountBadge').textContent = `目前行數：${state.workbench.subtitles.length} 行`;
+
+      if (state.workbench.rmsDbEnvelope) {
+        state.workbench.segments = computeSegmentsFromEnvelope(thresholdDb, minPauseMs, minClipMs, padMs);
+      }
+
+      renderWorkbenchCanvasAndAlignment();
+      renderInteractiveSegmentPreviewList();
+    }
+
+    function autoFindMatchingDbThreshold() {
+      if (!state.workbench.rmsDbEnvelope) {
+        showGiantHud('⚠️', '請先載入長音檔', '載入音檔後即可自動對齊字幕行數', 'border-amber-400/90');
+        return;
+      }
+      const targetCount = state.workbench.subtitles.length;
+      if (targetCount <= 0) {
+        showGiantHud('⚠️', '請先貼上字幕文字', '需要知道目標有幾行字幕才能自動對齊', 'border-amber-400/90');
+        return;
+      }
+
+      const minPauseMs = parseInt(document.getElementById('sliderVadPauseMs').value, 10);
+      const minClipMs = parseInt(document.getElementById('sliderVadMinClipMs').value, 10);
+      const padMs = parseInt(document.getElementById('sliderVadPadMs').value, 10);
+
+      let bestDb = parseFloat(document.getElementById('sliderVadDb').value);
+      let bestDiff = 9999;
+
+      for (let db = -52; db <= -12; db += 0.5) {
+        const segs = computeSegmentsFromEnvelope(db, minPauseMs, minClipMs, padMs);
+        const diff = Math.abs(segs.length - targetCount);
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          bestDb = db;
+        }
+        if (diff === 0) {
+          bestDb = db;
+          break;
+        }
+      }
+
+      document.getElementById('sliderVadDb').value = bestDb;
+      recalculateWorkbenchSegmentsFromSliders();
+    }
+
+    function renderWorkbenchCanvasAndAlignment() {
+      const canvas = document.getElementById('vadWaveformCanvas');
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.max(300, rect.width || 400);
+      canvas.height = Math.max(64, rect.height || 80);
+
+      const W = canvas.width;
+      const H = canvas.height;
+      ctx.clearRect(0, 0, W, H);
+
+      const env = state.workbench.rmsDbEnvelope;
+      const audioBuf = state.workbench.audioBuffer;
+      const segs = state.workbench.segments;
+      const thresholdDb = parseFloat(document.getElementById('sliderVadDb').value);
+
+      const dbToY = (db) => {
+        const clamped = Math.max(-60, Math.min(0, db));
+        return H - 4 - ((clamped + 60) / 60) * (H - 8);
+      };
+
+      if (env && audioBuf && audioBuf.duration > 0) {
+        ctx.fillStyle = 'rgba(16, 185, 129, 0.22)';
+        ctx.strokeStyle = 'rgba(52, 211, 153, 0.65)';
+        ctx.lineWidth = 1;
+        for (const seg of segs) {
+          const x1 = (seg.startSec / audioBuf.duration) * W;
+          const x2 = (seg.endSec / audioBuf.duration) * W;
+          ctx.fillRect(x1, 0, Math.max(2, x2 - x1), H);
+          ctx.strokeRect(x1, 0, Math.max(2, x2 - x1), H);
+        }
+
+        ctx.fillStyle = '#38BDF8';
+        const step = Math.max(1, Math.floor(env.length / W));
+        for (let x = 0; x < W; x++) {
+          const idx = Math.min(env.length - 1, Math.floor((x / W) * env.length));
+          let maxDb = -100;
+          for (let j = 0; j < step && (idx + j) < env.length; j++) {
+            if (env[idx + j] > maxDb) maxDb = env[idx + j];
+          }
+          const y = dbToY(maxDb);
+          ctx.fillRect(x, y, 1, H - y);
+        }
+
+        const thY = dbToY(thresholdDb);
+        ctx.strokeStyle = '#F43F5E';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(0, thY);
+        ctx.lineTo(W, thY);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      const subCount = state.workbench.subtitles.length;
+      const segCount = segs.length;
+      document.getElementById('metricSubCount').textContent = subCount;
+      document.getElementById('metricSegCount').textContent = segCount;
+
+      const banner = document.getElementById('alignmentBanner');
+      const icon = document.getElementById('alignStatusIcon');
+      const headline = document.getElementById('alignStatusHeadline');
+      const advice = document.getElementById('alignStatusAdvice');
+
+      if (!audioBuf && subCount === 0) {
+        banner.className = 'rounded-2xl px-4 py-3 border flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-slate-950 border-slate-800';
+        icon.textContent = '⏳';
+        headline.textContent = '請載入長音檔並貼上字幕（或點擊上方「載入模擬 GPT 10 句長音檔」體驗）';
+        advice.textContent = '不需時間軸！只要切出段數與字幕行數相等，即可 100% 精準對齊每一句。';
+      } else if (subCount > 0 && segCount === subCount) {
+        banner.className = 'rounded-2xl px-4 py-3 border-2 flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-emerald-950/50 border-emerald-400/80 shadow-[0_0_25px_rgba(16,185,129,0.2)]';
+        icon.textContent = '✅';
+        headline.textContent = `完美對齊！音檔切出 ${segCount} 段 ＝ 字幕 ${subCount} 行`;
+        advice.textContent = '你可以點擊下方清單的「▶ 試聽」抽查幾句，確認無誤後點擊右下角「確認裁切並儲存至課程庫」。';
+      } else if (audioBuf && segCount < subCount) {
+        const diff = subCount - segCount;
+        banner.className = 'rounded-2xl px-4 py-3 border flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-amber-950/40 border-amber-500/70';
+        icon.textContent = '⚠️';
+        headline.textContent = `切出段數較少（目前 ${segCount} 段，比字幕少 ${diff} 段 — 有句子黏在一起了）`;
+        advice.textContent = '👉 解法：請將「靜音門檻 (dB)」往右調高（例如調到 -24 dB）、或調小「最短句間停頓」，也可直接在下方清單對黏住的句子點「✂️ 從中切開」！';
+      } else if (audioBuf && segCount > subCount && subCount > 0) {
+        const diff = segCount - subCount;
+        banner.className = 'rounded-2xl px-4 py-3 border flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-rose-950/40 border-rose-500/70';
+        icon.textContent = '⚠️';
+        headline.textContent = `切出段數較多（目前 ${segCount} 段，比字幕多 ${diff} 段 — 有句子被斷開或含雜音）`;
+        advice.textContent = '👉 解法：請調低「靜音門檻 (dB)」或拉長「最短停頓」，或直接在下方清單點「🔗 合併下段」或「🗑️ 刪除雜音」！';
+      } else {
+        banner.className = 'rounded-2xl px-4 py-3 border flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-slate-900 border-sky-500/50';
+        icon.textContent = 'ℹ️';
+        headline.textContent = `目前已切出 ${segCount} 段音訊（尚未貼上字幕行，或純音檔匯入）`;
+        advice.textContent = '在右側貼上「1. Hi there.」格式的多行純文字，即可自動一對一綁定字幕。';
+      }
+    }
+
+    function renderInteractiveSegmentPreviewList() {
+      const container = document.getElementById('importPreviewContainer');
+      const title = document.getElementById('previewSummaryTitle');
+      const tbody = document.getElementById('previewTableBody');
+      const saveBtn = document.getElementById('btnConfirmSavePack');
+
+      const segs = state.workbench.segments;
+      const subs = state.workbench.subtitles;
+      const totalRows = Math.max(segs.length, subs.length);
+
+      if (totalRows === 0) {
+        container.classList.add('hidden');
+        saveBtn.disabled = true;
+        return;
+      }
+
+      container.classList.remove('hidden');
+      saveBtn.disabled = false;
+      title.textContent = `切分對齊預覽與微調清單（音檔 ${segs.length} 段 ｜ 字幕 ${subs.length} 行）`;
+      tbody.innerHTML = '';
+
+      for (let i = 0; i < totalRows; i++) {
+        const seg = segs[i];
+        const sub = subs[i];
+        const dur = seg ? (seg.endSec - seg.startSec) : 0;
+
+        let durBadgeClass = 'bg-slate-800 text-sky-300 border-slate-700';
+        let durHint = '';
+        if (seg && dur > 7.5) {
+          durBadgeClass = 'bg-amber-950/90 text-amber-300 border-amber-500/60';
+          durHint = ' (偏長，可能兩句黏住)';
+        } else if (seg && dur < 0.65) {
+          durBadgeClass = 'bg-rose-950/90 text-rose-300 border-rose-500/60';
+          durHint = ' (極短，可能是雜音)';
+        }
+
+        const row = document.createElement('div');
+        row.className = 'py-2.5 px-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 hover:bg-slate-900/90 rounded-xl transition';
+
+        const timeLabel = seg
+          ? `${seg.startSec.toFixed(1)}s - ${seg.endSec.toFixed(1)}s (${dur.toFixed(1)}s${durHint})`
+          : '⚠️ 無對應音檔段 (將自動產生合成墊音)';
+
+        const subEn = sub ? escapeHtml(sub.en) : '<span class="text-rose-400 italic">⚠️ 多出的音檔段落（無對應字幕，可合併或刪除）</span>';
+        const subZh = sub && sub.zh ? `<div class="text-slate-400 text-[11px] truncate">${escapeHtml(sub.zh)}</div>` : '';
+
+        row.innerHTML = `
+          <div class="flex items-start gap-2.5 min-w-0 flex-1">
+            <span class="font-mono font-extrabold text-xs px-2 py-1 rounded-lg bg-slate-900 border border-slate-700 text-sky-400 shrink-0">#${formatIdx(i + 1)}</span>
+            <div class="min-w-0 flex-1">
+              <div class="flex items-center gap-2 flex-wrap mb-0.5">
+                <span class="font-mono text-[11px] px-2 py-0.5 rounded border ${durBadgeClass}">${timeLabel}</span>
+              </div>
+              <div class="text-white font-bold text-xs sm:text-sm break-words">${subEn}</div>
+              ${subZh}
+            </div>
+          </div>
+          <div class="flex items-center gap-1.5 shrink-0 self-end sm:self-center">
+            ${seg ? `
+              <button data-act="play" data-idx="${i}" title="試聽這一段切出來的音訊" class="px-2.5 py-1.5 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/50 text-sky-300 font-bold text-xs transition">
+                <i class="fa-solid fa-play mr-1"></i>試聽
+              </button>
+              <button data-act="split" data-idx="${i}" title="在此段中間最安靜處一分為二（解救兩句黏在一起）" class="px-2.5 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-400/40 text-amber-300 font-bold text-xs transition">
+                <i class="fa-solid fa-scissors mr-1"></i>從中切開
+              </button>
+              ${i < segs.length - 1 ? `
+                <button data-act="merge" data-idx="${i}" title="與下一段 (#${formatIdx(i + 2)}) 合併為同一句" class="px-2.5 py-1.5 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-400/40 text-emerald-300 font-bold text-xs transition">
+                  <i class="fa-solid fa-link mr-1"></i>合併下段
+                </button>
+              ` : ''}
+              <button data-act="delete" data-idx="${i}" title="刪除這一段雜音（後續音檔自動往前遞補對齊字幕）" class="px-2 py-1.5 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 border border-rose-400/40 text-rose-300 font-bold text-xs transition">
+                <i class="fa-regular fa-trash-can"></i>
+              </button>
+            ` : ''}
+          </div>
+        `;
+
+        row.querySelectorAll('button[data-act]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const act = btn.dataset.act;
+            const idx = parseInt(btn.dataset.idx, 10);
+            if (act === 'play') previewPlayWorkbenchSegment(idx);
+            else if (act === 'merge') mergeWorkbenchSegmentWithNext(idx);
+            else if (act === 'split') splitWorkbenchSegmentInTwo(idx);
+            else if (act === 'delete') deleteWorkbenchSegment(idx);
+          });
+        });
+
+        tbody.appendChild(row);
+      }
+    }
+
+    function previewPlayWorkbenchSegment(idx) {
+      const seg = state.workbench.segments[idx];
+      const audioBuffer = state.workbench.audioBuffer;
+      if (!seg || !audioBuffer) return;
+
+      try {
+        if (state.workbench.previewSourceNode) {
+          try { state.workbench.previewSourceNode.stop(); } catch (e) {}
+        }
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (!state.workbench.previewAudioCtx) {
+          state.workbench.previewAudioCtx = new AudioCtx();
+        }
+        if (state.workbench.previewAudioCtx.state === 'suspended') {
+          state.workbench.previewAudioCtx.resume();
+        }
+
+        const source = state.workbench.previewAudioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(state.workbench.previewAudioCtx.destination);
+        source.start(0, seg.startSec, Math.max(0.1, seg.endSec - seg.startSec));
+        state.workbench.previewSourceNode = source;
+      } catch (err) {
+        logDiag('WARN', `預覽試聽失敗: ${err.message || ''}`);
+      }
+    }
+
+    function mergeWorkbenchSegmentWithNext(idx) {
+      const segs = state.workbench.segments;
+      if (idx < 0 || idx >= segs.length - 1) return;
+      segs[idx].endSec = segs[idx + 1].endSec;
+      segs.splice(idx + 1, 1);
+      renderWorkbenchCanvasAndAlignment();
+      renderInteractiveSegmentPreviewList();
+    }
+
+    function splitWorkbenchSegmentInTwo(idx) {
+      const segs = state.workbench.segments;
+      const env = state.workbench.rmsDbEnvelope;
+      const winSec = state.workbench.windowSec;
+      const seg = segs[idx];
+      if (!seg) return;
+
+      const dur = seg.endSec - seg.startSec;
+      if (dur < 0.4) return;
+
+      let splitSec = seg.startSec + dur / 2;
+      if (env) {
+        const searchStartWin = Math.max(0, Math.floor((seg.startSec + dur * 0.25) / winSec));
+        const searchEndWin = Math.min(env.length - 1, Math.ceil((seg.startSec + dur * 0.75) / winSec));
+        let minDb = 999;
+        let bestWin = Math.floor((searchStartWin + searchEndWin) / 2);
+        for (let w = searchStartWin; w <= searchEndWin; w++) {
+          if (env[w] < minDb) {
+            minDb = env[w];
+            bestWin = w;
+          }
+        }
+        splitSec = bestWin * winSec;
+      }
+
+      const firstHalf = { startSec: seg.startSec, endSec: splitSec };
+      const secondHalf = { startSec: splitSec, endSec: seg.endSec };
+      segs.splice(idx, 1, firstHalf, secondHalf);
+      renderWorkbenchCanvasAndAlignment();
+      renderInteractiveSegmentPreviewList();
+    }
+
+    function deleteWorkbenchSegment(idx) {
+      const segs = state.workbench.segments;
+      if (idx < 0 || idx >= segs.length) return;
+      segs.splice(idx, 1);
+      renderWorkbenchCanvasAndAlignment();
+      renderInteractiveSegmentPreviewList();
+    }
+
+    async function loadSimulatedGptLive10SentencesIntoWorkbench() {
+      const sampleSentences = DEFAULT_20_SENTENCES.slice(0, 10);
+      const keepNumber = document.getElementById('chkKeepNumberPrefix')?.checked ?? true;
+      const subText = sampleSentences
+        .map((s, i) => {
+          const cleanEn = s.en.replace(/^\d+[\.\)、\-\s]+/, '');
+          return `${keepNumber ? (i + 1) + '. ' : ''}${cleanEn} || ${s.zh}`;
+        })
+        .join('\n');
+      document.getElementById('textareaSubtitles').value = subText;
+      document.getElementById('inputPackName').value = 'GPT Live 模擬錄音 10 句 (實測切音工作台)';
+
+      const sampleRate = 22050;
+      const clipDur = 1.9;
+      const pauseDur = 0.34;
+      const totalSec = sampleSentences.length * (clipDur + pauseDur) + 0.5;
+      const totalSamples = Math.floor(sampleRate * totalSec);
+
+      const buffer = new ArrayBuffer(44 + totalSamples * 2);
+      const view = new DataView(buffer);
+      const writeString = (offset, str) => {
+        for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+      };
+      writeString(0, 'RIFF');
+      view.setUint32(4, 36 + totalSamples * 2, true);
+      writeString(8, 'WAVE');
+      writeString(12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * 2, true);
+      view.setUint16(32, 2, true);
+      view.setUint16(34, 16, true);
+      writeString(36, 'data');
+      view.setUint32(40, totalSamples * 2, true);
+
+      for (let i = 0; i < totalSamples; i++) {
+        const t = i / sampleRate;
+        let sample = (Math.random() * 2 - 1) * 0.018;
+
+        const cycle = clipDur + pauseDur;
+        const idx = Math.floor((t - 0.25) / cycle);
+        const localT = (t - 0.25) - idx * cycle;
+        if (t >= 0.25 && idx >= 0 && idx < sampleSentences.length && localT >= 0 && localT < clipDur) {
+          const syllableEnv = 0.55 + 0.45 * Math.sin(2 * Math.PI * 4.2 * localT);
+          const edgeEnv = Math.min(1, localT / 0.08, (clipDur - localT) / 0.1);
+          const f0 = 210 + (idx * 29) % 110;
+          const voice = (Math.sin(2 * Math.PI * f0 * t) * 0.28 +
+                         Math.sin(2 * Math.PI * (f0 * 2) * t) * 0.12) * syllableEnv * edgeEnv;
+          sample += voice;
+        }
+        const clamped = Math.max(-1, Math.min(1, sample));
+        view.setInt16(44 + i * 2, clamped * 32767, true);
+      }
+
+      const wavBlob = new Blob([buffer], { type: 'audio/wav' });
+      document.getElementById('sliderVadDb').value = -26;
+      document.getElementById('sliderVadPauseMs').value = 280;
+      await loadAudioBlobIntoWorkbench(wavBlob, 'GPT_Live_10_Sentences_With_Noise.wav');
+    }
+
+    async function generateSampleZipBlob() {
+      const zip = new JSZip();
+      const lines = [];
+      for (let i = 0; i < DEFAULT_20_SENTENCES.length; i++) {
+        const num = String(i + 1).padStart(2, '0');
+        const item = DEFAULT_20_SENTENCES[i];
+        const wavBlob = createSpeechCadenceWavBlob(item.en, 2.4);
+        zip.file(`${num}.wav`, wavBlob);
+        zip.file(`${num}.txt`, `${item.en}\n${item.zh}`);
+        lines.push(`${item.en} || ${item.zh}`);
+      }
+      zip.file('sentences.txt', lines.join('\n'));
+      return await zip.generateAsync({ type: 'blob' });
+    }
+
+    async function handleFilesSelectedForImport(fileList) {
+      const statusEl = document.getElementById('importStatusText');
+      statusEl.textContent = '⏳ 正在解壓縮並分析音檔與字幕...';
+      statusEl.className = 'text-xs text-amber-400 font-bold animate-pulse';
+
+      try {
+        const audioImportMode = document.querySelector('input[name="audioImportMode"]:checked').value;
+        const subImportMode = document.querySelector('input[name="subImportMode"]:checked').value;
+
+        const extractedAudios = [];
+        const extractedSubs = [];
+
+        const audioExtRegex = /\.(mp3|wav|m4a|ogg|aac|webm)$/i;
+        const subExtRegex = /\.(txt|srt|vtt|lrc|json)$/i;
+
+        for (const file of Array.from(fileList)) {
+          if (file.name.toLowerCase().endsWith('.zip')) {
+            const packInput = document.getElementById('inputPackName');
+            if (!packInput.value.trim()) {
+              packInput.value = file.name.replace(/\.zip$/i, '');
+            }
+
+            const zip = await JSZip.loadAsync(file);
+            const entries = [];
+            zip.forEach((relPath, zipEntry) => {
+              if (!zipEntry.dir && !relPath.includes('__MACOSX') && !relPath.split('/').pop().startsWith('.')) {
+                entries.push(zipEntry);
+              }
+            });
+
+            for (const entry of entries) {
+              const baseName = entry.name.split('/').pop();
+              if (audioExtRegex.test(baseName)) {
+                const ext = baseName.split('.').pop().toLowerCase();
+                const mime = ext === 'mp3' ? 'audio/mpeg' : (ext === 'm4a' ? 'audio/mp4' : `audio/${ext}`);
+                const uint8 = await entry.async('uint8array');
+                extractedAudios.push({ name: baseName, blob: new Blob([uint8], { type: mime }) });
+              } else if (subExtRegex.test(baseName)) {
+                const text = await entry.async('string');
+                extractedSubs.push({ name: baseName, text });
+              }
+            }
+          } else if (audioExtRegex.test(file.name)) {
+            extractedAudios.push({ name: file.name, blob: file });
+          } else if (subExtRegex.test(file.name)) {
+            const text = await file.text();
+            extractedSubs.push({ name: file.name, text });
+          }
+        }
+
+        extractedAudios.sort(naturalSort);
+        extractedSubs.sort(naturalSort);
+
+        let parsedSubtitles = [];
+        if (extractedSubs.length > 0) {
+          if (subImportMode === 'multi_sub' && extractedSubs.length > 1) {
+            const singleLineFiles = extractedSubs.filter(f => /^\d+/.test(f.name));
+            const targetFiles = singleLineFiles.length > 0 ? singleLineFiles : extractedSubs;
+            parsedSubtitles = targetFiles.map(f => parseOneSentenceTxtFile(f.text)).filter(x => x.en);
+          } else {
+            const preferredSub = extractedSubs.find(f => /sentences|all|sub|\.srt|\.json/i.test(f.name)) || extractedSubs[0];
+            parsedSubtitles = parseSingleSubtitleFileContent(preferredSub.text, preferredSub.name);
+          }
+        }
+
+        let finalAudioBlobs = [];
+        let audioModeLabel = '獨立音檔';
+
+        if (extractedAudios.length > 0) {
+          if (audioImportMode === 'single_audio_vad' || extractedAudios.length === 1) {
+            const longAudio = extractedAudios.find(a => /long|all|full|merged/i.test(a.name)) || extractedAudios[0];
+            if (parsedSubtitles.length > 0) {
+              document.getElementById('textareaSubtitles').value = parsedSubtitles
+                .map(s => s.zh ? `${s.en} || ${s.zh}` : s.en)
+                .join('\n');
+            }
+            switchImportModalTab('gpt');
+            await loadAudioBlobIntoWorkbench(longAudio.blob, longAudio.name);
+            return;
+          } else {
+            const numberedAudios = extractedAudios.filter(a => !/long|merged/i.test(a.name));
+            const targetAudios = numberedAudios.length > 0 ? numberedAudios : extractedAudios;
+            finalAudioBlobs = targetAudios.map(a => a.blob);
+            audioModeLabel = '多檔獨立音訊';
+          }
+        }
+
+        const totalCount = Math.max(finalAudioBlobs.length, parsedSubtitles.length);
+        if (totalCount === 0) {
+          statusEl.textContent = '⚠️ 未偵測到有效的音檔或字幕檔，請確認檔案格式。';
+          statusEl.className = 'text-xs text-rose-400 font-bold';
+          return;
+        }
+
+        const pairedItems = [];
+        for (let i = 0; i < totalCount; i++) {
+          const sub = parsedSubtitles[i] || { en: `Sentence #${formatIdx(i + 1)}`, zh: '' };
+          const blob = finalAudioBlobs[i] || createSpeechCadenceWavBlob(sub.en);
+          pairedItems.push({
+            index: i,
+            en: sub.en,
+            zh: sub.zh || '',
+            audioBlob: blob
+          });
+        }
+
+        const packName = document.getElementById('inputPackName').value.trim() || `Pack_${new Date().toLocaleDateString('zh-TW')} (${pairedItems.length}句)`;
+        state.pendingImportPack = {
+          id: 'pack_' + Date.now(),
+          name: packName,
+          createdAt: Date.now(),
+          audioModeLabel,
+          isDemoTTS: finalAudioBlobs.length === 0,
+          items: pairedItems
+        };
+
+        renderImportPreview(state.pendingImportPack);
+        statusEl.textContent = `✅ 成功解析 ${pairedItems.length} 個句子（音檔：${finalAudioBlobs.length} 段｜字幕：${parsedSubtitles.length} 句）`;
+        statusEl.className = 'text-xs text-emerald-400 font-bold';
+        document.getElementById('btnConfirmSavePack').disabled = false;
+      } catch (err) {
+        logDiag('ERR', `ZIP 解析失敗: ${err.message || ''}`);
+        statusEl.textContent = `❌ 解析失敗：${err.message || '請確認檔案格式'}`;
+        statusEl.className = 'text-xs text-rose-400 font-bold';
+      }
+    }
+
+    function renderImportPreview(pack) {
+      const container = document.getElementById('importPreviewContainer');
+      const title = document.getElementById('previewSummaryTitle');
+      const tbody = document.getElementById('previewTableBody');
+
+      container.classList.remove('hidden');
+      title.textContent = `ZIP 解析預覽：共 ${pack.items.length} 句（${pack.audioModeLabel}）`;
+      tbody.innerHTML = '';
+
+      pack.items.forEach((item, idx) => {
+        const row = document.createElement('div');
+        row.className = 'py-2 px-2 flex items-center justify-between gap-2 hover:bg-slate-900/80 rounded-lg';
+        const kb = item.audioBlob ? `${Math.round(item.audioBlob.size / 1024)} KB` : 'TTS';
+        row.innerHTML = `
+          <div class="flex items-start gap-2 min-w-0">
+            <span class="font-mono font-bold text-sky-400 shrink-0">#${formatIdx(idx + 1)}</span>
+            <div class="min-w-0">
+              <div class="text-white font-semibold truncate">${escapeHtml(item.en)}</div>
+              <div class="text-slate-400 text-[11px] truncate">${escapeHtml(item.zh)}</div>
+            </div>
+          </div>
+          <span class="font-mono text-[11px] px-2 py-0.5 rounded bg-slate-800 text-emerald-300 shrink-0">${kb}</span>
+        `;
+        tbody.appendChild(row);
+      });
+    }
+
+    function switchImportModalTab(tabName) {
+      state.workbench.activeTab = tabName;
+      const isGpt = tabName === 'gpt';
+      document.getElementById('panelTabGpt').classList.toggle('hidden', !isGpt);
+      document.getElementById('panelTabZip').classList.toggle('hidden', isGpt);
+
+      const btnGpt = document.getElementById('tabBtnGptWorkbench');
+      const btnZip = document.getElementById('tabBtnZipImport');
+      if (isGpt) {
+        btnGpt.className = 'py-2 px-3 rounded-xl text-xs sm:text-sm font-extrabold bg-sky-500 text-slate-950 shadow transition flex items-center justify-center gap-1.5';
+        btnZip.className = 'py-2 px-3 rounded-xl text-xs sm:text-sm font-bold text-slate-400 hover:text-white transition flex items-center justify-center gap-1.5';
+        renderWorkbenchCanvasAndAlignment();
+        renderInteractiveSegmentPreviewList();
+      } else {
+        btnZip.className = 'py-2 px-3 rounded-xl text-xs sm:text-sm font-extrabold bg-sky-500 text-slate-950 shadow transition flex items-center justify-center gap-1.5';
+        btnGpt.className = 'py-2 px-3 rounded-xl text-xs sm:text-sm font-bold text-slate-400 hover:text-white transition flex items-center justify-center gap-1.5';
+      }
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        requestWakeLock();
+      }
+    });
+
+    /*************************************************************************
+     * 11. INITIALIZATION & UI EVENT LISTENERS
+     *************************************************************************/
+    function buildDefaultPackObject() {
+      const items = DEFAULT_20_SENTENCES.map((s, idx) => ({
+        index: idx,
+        en: s.en,
+        zh: s.zh,
+        audioBlob: createSpeechCadenceWavBlob(s.en)
+      }));
+      return {
+        id: 'pack_default_20',
+        name: 'Pack_01 商務與專案高頻 20 句 (內建範例)',
+        createdAt: 1700000000000,
+        audioModeLabel: '內建獨立音檔',
+        isDemoTTS: true,
+        items
+      };
+    }
+
+    async function refreshPackListAndSelect(targetPackId = null) {
+      let packs = [];
+      try {
+        packs = await getAllPacksFromDB();
+      } catch (e) {
+        packs = [];
+      }
+
+      if (!packs || packs.length === 0) {
+        const demoPack = buildDefaultPackObject();
+        await savePackToDB(demoPack);
+        packs = [demoPack];
+      }
+      state.packs = packs;
+
+      const selectEl = document.getElementById('packSelect');
+      selectEl.innerHTML = '';
+      packs.forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = `${p.name} (${p.items.length}句)`;
+        selectEl.appendChild(opt);
+      });
+
+      const chosen = packs.find(p => p.id === targetPackId) || packs[0];
+      selectEl.value = chosen.id;
+      selectPack(chosen.id);
+      logDiag('INFO', `已載入教材庫：${chosen.name} (${chosen.items.length} 句)`);
+    }
+
+    function selectPack(packId) {
+      const found = state.packs.find(p => p.id === packId);
+      if (!found) return;
+      state.isPlaying = false;
+      try { masterAudio.pause(); } catch (e) {}
+      updatePlayPauseUI();
+
+      state.currentPack = found;
+      state.currentIndex = 0;
+      state.currentRepeat = 1;
+      loadCurrentSentenceIntoAudio(false);
+    }
+
+    function renderSentenceDrawer() {
+      if (!state.currentPack) return;
+      document.getElementById('drawerPackTitle').textContent = `${state.currentPack.name} (${state.currentPack.items.length} 句)`;
+      const body = document.getElementById('sentenceDrawerBody');
+      body.innerHTML = '';
+
+      state.currentPack.items.forEach((item, idx) => {
+        const isCurrent = idx === state.currentIndex;
+        const btn = document.createElement('button');
+        btn.className = `w-full text-left p-3 rounded-2xl border transition flex items-start gap-3 ${
+          isCurrent
+            ? 'bg-sky-500/15 border-sky-400 text-white'
+            : 'bg-slate-900/90 hover:bg-slate-800 border-slate-800 text-slate-200'
+        }`;
+        btn.innerHTML = `
+          <span class="font-mono font-extrabold text-sm px-2 py-0.5 rounded-lg ${
+            isCurrent ? 'bg-sky-400 text-slate-950' : 'bg-slate-800 text-sky-400'
+          }">#${formatIdx(idx + 1)}</span>
+          <div class="flex-1 min-w-0">
+            <div class="font-bold text-sm sm:text-base leading-snug">${escapeHtml(item.en)}</div>
+            <div class="text-xs text-slate-400 mt-0.5">${escapeHtml(item.zh)}</div>
+          </div>
+        `;
+        btn.addEventListener('click', () => {
+          unlockiOSAudioAndSpeechSynchronously();
+          state.currentIndex = idx;
+          state.currentRepeat = 1;
+          state.isPlaying = true;
+          document.getElementById('modalSentenceList').classList.add('hidden');
+          loadCurrentSentenceIntoAudio(true);
+        });
+        body.appendChild(btn);
+      });
+    }
+
+    window.addEventListener('DOMContentLoaded', async () => {
+      updateKeyBadgesOnDeck();
+      await refreshPackListAndSelect();
+      requestWakeLock();
+
+      // Top Pack Selector & Delete Button
+      document.getElementById('packSelect').addEventListener('change', (e) => {
+        selectPack(e.target.value);
+      });
+
+      document.getElementById('btnDeletePack').addEventListener('click', async () => {
+        if (!state.currentPack) return;
+        const delId = state.currentPack.id;
+        await deletePackFromDB(delId);
+        await refreshPackListAndSelect();
+        showGiantHud('🗑️', '已移除教材包', '已切換至預設教材', 'border-rose-400/90');
+      });
+
+      // Repeat Count Option Buttons (1, 2, 3, 5, Infinite)
+      document.querySelectorAll('.repeat-opt').forEach(btn => {
+        btn.addEventListener('click', () => {
+          state.targetRepeats = parseInt(btn.dataset.repeat, 10);
+          state.currentRepeat = Math.min(state.currentRepeat, state.targetRepeats);
+          document.querySelectorAll('.repeat-opt').forEach(b => {
+            b.className = 'repeat-opt px-2.5 py-1 rounded-lg font-bold text-slate-400 hover:text-white transition';
+          });
+          btn.className = 'repeat-opt px-2.5 py-1 rounded-lg font-bold bg-emerald-500 text-slate-950 transition';
+          renderRepeatIndicators();
+        });
+      });
+
+      // Gap Duration Option Buttons (0s, 0.8s, 1.5s, auto)
+      document.querySelectorAll('.gap-opt').forEach(btn => {
+        btn.addEventListener('click', () => {
+          state.gapMode = btn.dataset.gap === 'auto' ? 'auto' : parseFloat(btn.dataset.gap);
+          document.querySelectorAll('.gap-opt').forEach(b => {
+            b.className = 'gap-opt px-2.5 py-1 rounded-lg font-bold text-slate-400 hover:text-white transition';
+          });
+          btn.className = 'gap-opt px-2.5 py-1 rounded-lg font-bold bg-sky-500 text-slate-950 transition';
+        });
+      });
+
+      // Main Deck Control Buttons
+      document.getElementById('btnCtrlPrev').addEventListener('click', actionPrevSentence);
+      document.getElementById('btnCtrlRestart').addEventListener('click', actionRestartCurrentSentence);
+      document.getElementById('btnCtrlPlay').addEventListener('click', actionTogglePlayPause);
+      document.getElementById('btnCtrlNext').addEventListener('click', actionNextSentence);
+      document.getElementById('btnCtrlSpeed').addEventListener('click', actionCycleSpeed);
+      document.getElementById('btnTopSpeed').addEventListener('click', actionCycleSpeed);
+      document.getElementById('btnWakeLock').addEventListener('click', requestWakeLock);
+
+      // Subtitle Display Mode Toggle (英+中 -> 純英文 -> 盲聽隱藏)
+      document.getElementById('btnToggleSubMode').addEventListener('click', (e) => {
+        const order = ['both', 'en', 'blind'];
+        const labels = { both: '字幕：英+中', en: '字幕：純英文', blind: '字幕：盲聽隱藏' };
+        const nextIdx = (order.indexOf(state.subDisplayMode) + 1) % order.length;
+        state.subDisplayMode = order[nextIdx];
+        e.currentTarget.innerHTML = `<i class="fa-regular fa-eye mr-1"></i>${labels[state.subDisplayMode]}`;
+        renderMainStage();
+      });
+
+      // Demo Voice Mode Toggle (TTS+墊音 -> 純TTS人聲 -> 純提示音)
+      document.getElementById('btnDemoVoiceMode').addEventListener('click', (e) => {
+        unlockiOSAudioAndSpeechSynchronously();
+        const modes = ['tts_and_pad', 'tts_only', 'pad_only'];
+        const labels = {
+          tts_and_pad: '🔊 範例人聲：TTS+墊音',
+          tts_only: '🗣️ 範例人聲：純TTS人聲',
+          pad_only: '🎵 範例人聲：純提示音'
+        };
+        const nextIdx = (modes.indexOf(state.demoVoiceMode) + 1) % modes.length;
+        state.demoVoiceMode = modes[nextIdx];
+        e.currentTarget.textContent = labels[state.demoVoiceMode];
+        if (state.isPlaying) {
+          playCurrentAudioFromStart();
+        }
+      });
+
+      // Long-Press Play Key for Speed Toggle Checkbox
+      document.getElementById('chkLongPressSpeed').addEventListener('change', (e) => {
+        state.longPressSpeedEnabled = e.target.checked;
+      });
+
+      // Modal 1: Import & Smart Slicer Workbench Events
+      const modalImport = document.getElementById('modalImport');
+      document.getElementById('btnOpenImport').addEventListener('click', () => {
+        modalImport.classList.remove('hidden');
+        setTimeout(() => renderWorkbenchCanvasAndAlignment(), 50);
+      });
+      document.getElementById('btnCloseImport').addEventListener('click', () => modalImport.classList.add('hidden'));
+      document.getElementById('btnCancelImport').addEventListener('click', () => modalImport.classList.add('hidden'));
+
+      document.getElementById('tabBtnGptWorkbench').addEventListener('click', () => switchImportModalTab('gpt'));
+      document.getElementById('tabBtnZipImport').addEventListener('click', () => switchImportModalTab('zip'));
+
+      // Tab A: Single Long Audio File Input
+      document.getElementById('inputSingleLongAudio').addEventListener('change', async (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        const packInput = document.getElementById('inputPackName');
+        if (!packInput.value.trim()) {
+          packInput.value = file.name.replace(/\.[^/.]+$/, '');
+        }
+        await loadAudioBlobIntoWorkbench(file, file.name);
+      });
+
+      // Tab A: Load Simulated GPT Live 10 Sentences Button
+      document.getElementById('btnLoadSimulatedGptAudio').addEventListener('click', async () => {
+        await loadSimulatedGptLive10SentencesIntoWorkbench();
+      });
+
+      // Tab A: Subtitle Textarea & Subtitle File Upload
+      document.getElementById('textareaSubtitles').addEventListener('input', () => {
+        recalculateWorkbenchSegmentsFromSliders();
+      });
+      document.getElementById('chkKeepNumberPrefix').addEventListener('change', () => {
+        recalculateWorkbenchSegmentsFromSliders();
+      });
+      document.getElementById('inputSubTextFile').addEventListener('change', async (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        const text = await file.text();
+        document.getElementById('textareaSubtitles').value = text;
+        recalculateWorkbenchSegmentsFromSliders();
+      });
+
+      // Tab A: 4 Real-Time VAD Sliders (Instant <10ms Recalculation)
+      ['sliderVadDb', 'sliderVadPauseMs', 'sliderVadMinClipMs', 'sliderVadPadMs'].forEach(id => {
+        document.getElementById(id).addEventListener('input', () => {
+          recalculateWorkbenchSegmentsFromSliders();
+        });
+      });
+
+      // Tab A: Auto-Find Matching dB Threshold Button
+      document.getElementById('btnAutoMatchLineCount').addEventListener('click', () => {
+        autoFindMatchingDbThreshold();
+      });
+
+      // Tab B: ZIP / Multi-Files Input
+      document.getElementById('inputZipFiles').addEventListener('change', (e) => {
+        if (e.target.files && e.target.files.length > 0) {
+          handleFilesSelectedForImport(e.target.files);
+        }
+      });
+
+      // Save Button (Supports both Tab A Workbench Slicing & Tab B Pre-sliced ZIP)
+      document.getElementById('btnConfirmSavePack').addEventListener('click', async () => {
+        const customName = document.getElementById('inputPackName').value.trim();
+
+        if (state.workbench.activeTab === 'gpt' && (state.workbench.segments.length > 0 || state.workbench.subtitles.length > 0)) {
+          const segs = state.workbench.segments;
+          const subs = state.workbench.subtitles;
+          const audioBuf = state.workbench.audioBuffer;
+          const count = Math.max(segs.length, subs.length);
+          const items = [];
+
+          for (let i = 0; i < count; i++) {
+            const sub = subs[i] || { en: `Sentence #${formatIdx(i + 1)}`, zh: '' };
+            let wavBlob = null;
+            if (audioBuf && segs[i]) {
+              wavBlob = audioBufferSliceToWavBlob(audioBuf, segs[i].startSec, segs[i].endSec);
+            } else {
+              wavBlob = createSpeechCadenceWavBlob(sub.en);
+            }
+            items.push({
+              index: i,
+              en: sub.en,
+              zh: sub.zh || '',
+              audioBlob: wavBlob
+            });
+          }
+
+          const newPack = {
+            id: 'pack_' + Date.now(),
+            name: customName || `GPT切音課程_${new Date().toLocaleTimeString('zh-TW', { hour12: false })} (${items.length}句)`,
+            createdAt: Date.now(),
+            audioModeLabel: audioBuf ? '長音檔精準切分' : '純文字合成音',
+            isDemoTTS: !audioBuf,
+            items
+          };
+
+          await savePackToDB(newPack);
+          modalImport.classList.add('hidden');
+          await refreshPackListAndSelect(newPack.id);
+          showGiantHud('✅', '切分並儲存成功', `共 ${items.length} 句已寫入課程庫`, 'border-emerald-400/90');
+          return;
+        }
+
+        if (!state.pendingImportPack) return;
+        if (customName) state.pendingImportPack.name = customName;
+
+        await savePackToDB(state.pendingImportPack);
+        const savedId = state.pendingImportPack.id;
+        state.pendingImportPack = null;
+        document.getElementById('btnConfirmSavePack').disabled = true;
+        document.getElementById('importPreviewContainer').classList.add('hidden');
+        modalImport.classList.add('hidden');
+
+        await refreshPackListAndSelect(savedId);
+        showGiantHud('✅', '素材包匯入成功', `已載入 ${state.currentPack.items.length} 句至教材庫`, 'border-emerald-400/90');
+      });
+
+      // Download Sample Pack_01.zip
+      document.getElementById('btnDownloadSampleZip').addEventListener('click', async (e) => {
+        const btn = e.currentTarget;
+        const origHtml = btn.innerHTML;
+        btn.innerHTML = '<i class="fa-solid fa-spinner animate-spin"></i><span>打包中...</span>';
+        const zipBlob = await generateSampleZipBlob();
+        const url = URL.createObjectURL(zipBlob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'Pack_01_Demo_20_Sentences.zip';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 3000);
+        btn.innerHTML = origHtml;
+      });
+
+      document.getElementById('btnResetDemoPacks').addEventListener('click', async () => {
+        const demoPack = buildDefaultPackObject();
+        await savePackToDB(demoPack);
+        modalImport.classList.add('hidden');
+        await refreshPackListAndSelect(demoPack.id);
+        showGiantHud('🚀', '已載入內建 20 句範例', demoPack.name);
+      });
+
+      // Modal 2: Bluetooth Keybinding Mapper
+      const modalKeymap = document.getElementById('modalKeymap');
+      document.getElementById('btnOpenKeymap').addEventListener('click', () => {
+        state.listeningAction = null;
+        renderKeymapModalRows();
+        modalKeymap.classList.remove('hidden');
+      });
+      document.getElementById('btnCloseKeymap').addEventListener('click', () => {
+        state.listeningAction = null;
+        modalKeymap.classList.add('hidden');
+      });
+      document.getElementById('btnDoneKeymap').addEventListener('click', () => {
+        state.listeningAction = null;
+        modalKeymap.classList.add('hidden');
+      });
+      document.getElementById('btnResetKeymap').addEventListener('click', () => {
+        state.keymap = JSON.parse(JSON.stringify(DEFAULT_KEYMAP));
+        state.listeningAction = null;
+        saveKeymap();
+        renderKeymapModalRows();
+      });
+
+      // Modal 3: Sentence List Drawer
+      const modalList = document.getElementById('modalSentenceList');
+      document.getElementById('btnOpenList').addEventListener('click', () => {
+        renderSentenceDrawer();
+        modalList.classList.remove('hidden');
+      });
+      document.getElementById('btnCloseList').addEventListener('click', () => {
+        modalList.classList.add('hidden');
+      });
+
+      // Modal 4: Diagnostics & Storage Status Viewer
+      const modalDiag = document.getElementById('modalDiag');
+      document.getElementById('btnOpenDiag').addEventListener('click', () => {
+        updateStorageBadgeUI();
+        modalDiag.classList.remove('hidden');
+      });
+      document.getElementById('btnCloseDiag').addEventListener('click', () => {
+        modalDiag.classList.add('hidden');
+      });
+    });
+  </script>
+</body>
+</html>
