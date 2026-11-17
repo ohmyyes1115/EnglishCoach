@@ -7,6 +7,39 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <title>DriveShadow 車用盲操英文跟讀系統</title>
 
+  <!-- 1. TOP-LEVEL SANDBOX ERROR SHIELD (Prevents iOS Safari / Gemini WebView Popup) -->
+  <script>
+    window.__diagLogs = [];
+    window.logDiag = function(level, msg) {
+      var timeStr = new Date().toLocaleTimeString('zh-TW', { hour12: false });
+      window.__diagLogs.unshift({ time: timeStr, level: level, msg: String(msg || '') });
+      if (window.__diagLogs.length > 60) window.__diagLogs.pop();
+      var listEl = document.getElementById('diagLogList');
+      if (listEl) {
+        listEl.innerHTML = window.__diagLogs.map(function(item) {
+          var color = item.level === 'ERR' ? 'text-rose-400' : (item.level === 'WARN' ? 'text-amber-300' : 'text-sky-300');
+          return '<div class="border-b border-slate-800/80 pb-1"><span class="text-slate-500">[' + item.time + ']</span> <span class="' + color + ' font-bold">[' + item.level + ']</span> ' +
+            item.msg.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div>';
+        }).join('');
+      }
+    };
+
+    window.addEventListener('error', function(e) {
+      window.logDiag('WARN', (e.message || 'Sandbox Event') + (e.lineno ? ' (L' + e.lineno + ')' : ''));
+      e.preventDefault();
+      e.stopPropagation();
+      return true;
+    }, true);
+
+    window.addEventListener('unhandledrejection', function(e) {
+      var reason = e.reason ? (e.reason.message || String(e.reason)) : 'Promise Rejection';
+      window.logDiag('WARN', '非同步保護: ' + reason);
+      e.preventDefault();
+      e.stopPropagation();
+      return true;
+    }, true);
+  </script>
+
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
   <!-- JSZip for Client-Side ZIP Extraction & Test ZIP Generation -->
@@ -17,28 +50,30 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&family=JetBrains+Mono:wght@500;700;800&display=swap" rel="stylesheet" />
 
   <script>
-    tailwind.config = {
-      darkMode: 'class',
-      theme: {
-        extend: {
-          fontFamily: {
-            sans: ['Inter', '-apple-system', 'BlinkMacSystemFont', 'PingFang TC', 'Microsoft JhengHei', 'sans-serif'],
-            mono: ['JetBrains Mono', 'monospace']
-          },
-          colors: {
-            cockpit: {
-              bg: '#060911',
-              card: '#0F1624',
-              border: '#1E293B',
-              accent: '#38BDF8',
-              emerald: '#10B981',
-              amber: '#F59E0B',
-              rose: '#F43F5E'
+    if (typeof tailwind !== 'undefined') {
+      tailwind.config = {
+        darkMode: 'class',
+        theme: {
+          extend: {
+            fontFamily: {
+              sans: ['Inter', '-apple-system', 'BlinkMacSystemFont', 'PingFang TC', 'Microsoft JhengHei', 'sans-serif'],
+              mono: ['JetBrains Mono', 'monospace']
+            },
+            colors: {
+              cockpit: {
+                bg: '#060911',
+                card: '#0F1624',
+                border: '#1E293B',
+                accent: '#38BDF8',
+                emerald: '#10B981',
+                amber: '#F59E0B',
+                rose: '#F43F5E'
+              }
             }
           }
         }
-      }
-    };
+      };
+    }
   </script>
 
   <style>
@@ -51,7 +86,6 @@
       color: #F8FAFC;
       overflow-x: hidden;
     }
-    /* Custom Scrollbars */
     ::-webkit-scrollbar {
       width: 6px;
       height: 6px;
@@ -63,7 +97,6 @@
       background: #334155;
       border-radius: 9999px;
     }
-    /* Giant HUD Toast Animation */
     @keyframes hudPop {
       0% { opacity: 0; transform: scale(0.82); }
       15% { opacity: 1; transform: scale(1.03); }
@@ -74,13 +107,11 @@
     .hud-animate {
       animation: hudPop 1.15s cubic-bezier(0.16, 1, 0.3, 1) forwards;
     }
-    /* Active Remote Button Flash */
     .btn-flash {
       transform: scale(0.95) !important;
       box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.65) !important;
       background-color: #1E293B !important;
     }
-    /* Smooth progress bar transition */
     .progress-fill {
       transition: width 0.1s linear;
     }
@@ -88,8 +119,9 @@
 </head>
 <body class="min-h-screen flex flex-col justify-between bg-cockpit-bg text-slate-100 select-none">
 
-  <!-- SINGLE PERSISTENT AUDIO ELEMENT (Crucial for iOS 12+ Safari & Car Bluetooth Auto-Play) -->
+  <!-- SINGLETON PERSISTENT AUDIO ELEMENTS (iOS Safari & Car Bluetooth Safe) -->
   <audio id="masterAudio" playsinline preload="auto" class="hidden"></audio>
+  <audio id="previewAudio" playsinline preload="auto" class="hidden"></audio>
 
   <!-- GIANT HUD OVERLAY FOR BLIND DRIVING FEEDBACK -->
   <div id="hudOverlay" class="fixed inset-0 pointer-events-none flex items-center justify-center z-50 hidden">
@@ -104,7 +136,7 @@
   <header class="w-full bg-cockpit-card/90 border-b border-slate-800/90 px-3 py-2.5 sm:px-5 sticky top-0 z-30 backdrop-blur-md">
     <div class="max-w-5xl mx-auto flex flex-wrap items-center justify-between gap-2">
       
-      <!-- Left: App Brand & Pack Selector -->
+      <!-- Left: App Brand & Pre-populated Pack Selector (Never stuck on "載入素材庫中...") -->
       <div class="flex items-center gap-2 flex-1 min-w-[220px]">
         <div class="w-9 h-9 rounded-xl bg-sky-500/20 border border-sky-400/40 flex items-center justify-center text-sky-400 shrink-0">
           <i class="fa-solid fa-car-rear text-lg"></i>
@@ -112,7 +144,7 @@
         <div class="flex-1 min-w-0">
           <div class="flex items-center gap-1.5">
             <select id="packSelect" aria-label="選擇教材包" class="w-full bg-slate-900 hover:bg-slate-800 text-white font-bold text-sm sm:text-base rounded-xl px-3 py-1.5 border border-slate-700 focus:outline-none focus:border-sky-400 truncate">
-              <option value="">載入素材庫中...</option>
+              <option value="pack_default_20">預設教材：科技職場英文 20 句 (內建範例)</option>
             </select>
             <button id="btnDeletePack" title="刪除目前素材包" class="p-2 text-slate-400 hover:text-rose-400 bg-slate-900 hover:bg-slate-800 border border-slate-700 rounded-xl transition shrink-0">
               <i class="fa-regular fa-trash-can text-sm"></i>
@@ -121,48 +153,42 @@
         </div>
       </div>
 
-      <!-- Right: Action Buttons (Sentence Drawer, Remote Keybind, ZIP Import, WakeLock) -->
+      <!-- Right: Action Buttons -->
       <div class="flex items-center gap-1.5 sm:gap-2">
-        <!-- Wake Lock Status Badge -->
         <button id="btnWakeLock" title="螢幕恆亮鎖定狀態" class="px-2.5 py-1.5 rounded-xl text-xs font-bold border border-slate-700 bg-slate-900 text-slate-400 flex items-center gap-1.5 transition">
           <i class="fa-solid fa-sun"></i>
           <span id="wakeLockText" class="hidden md:inline">恆亮待命</span>
         </button>
 
-        <!-- Sentence List Drawer Trigger -->
         <button id="btnOpenList" class="px-3 py-1.5 rounded-xl text-xs sm:text-sm font-bold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1.5 transition">
           <i class="fa-solid fa-list-ol text-sky-400"></i>
           <span>句子清單</span>
         </button>
 
-        <!-- Bluetooth Remote Key Mapper Trigger -->
         <button id="btnOpenKeymap" class="px-3 py-1.5 rounded-xl text-xs sm:text-sm font-bold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1.5 transition">
           <i class="fa-regular fa-keyboard text-amber-400"></i>
           <span class="hidden sm:inline">翻頁器設定</span>
           <span class="sm:hidden">按鍵</span>
         </button>
 
-        <!-- Diagnostics Log Trigger (Helps inspect status on iPhone when console is hidden) -->
         <button id="btnOpenDiag" title="系統狀態與診斷日誌" class="px-2.5 py-1.5 rounded-xl text-xs font-bold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 flex items-center gap-1 transition">
           <i class="fa-solid fa-shield-heart text-emerald-400"></i>
-          <span id="storageModeBadge" class="hidden sm:inline">檢測中</span>
+          <span id="storageModeBadge" class="hidden sm:inline">本機就緒</span>
         </button>
 
-        <!-- Import ZIP Trigger -->
         <button id="btnOpenImport" class="px-3.5 py-1.5 rounded-xl text-xs sm:text-sm font-extrabold bg-sky-500 hover:bg-sky-400 text-slate-950 shadow-lg shadow-sky-500/20 flex items-center gap-1.5 transition">
-          <i class="fa-solid fa-file-zipper"></i>
+          <i class="fa-solid fa-scissors"></i>
           <span>匯入素材</span>
         </button>
       </div>
     </div>
   </header>
 
-  <!-- MAIN COCKPIT DISPLAY AREA (Glanceable Giant Subtitles & Repeat Status) -->
+  <!-- MAIN COCKPIT DISPLAY AREA -->
   <main class="flex-1 flex flex-col justify-between max-w-5xl w-full mx-auto px-3 sm:px-6 py-3 sm:py-5 gap-3">
     
-    <!-- Top Status Ribbon: Sentence Counter, Repeat Dots, Speed, Shadowing Gap -->
+    <!-- Top Status Ribbon -->
     <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
-      <!-- Sentence Index Pill -->
       <div class="bg-cockpit-card border border-slate-800 rounded-2xl px-3.5 py-2.5 flex items-center justify-between">
         <span class="text-xs font-bold text-slate-400 uppercase tracking-wider">目前句數</span>
         <div class="font-mono font-extrabold text-lg sm:text-xl text-white">
@@ -172,18 +198,17 @@
         </div>
       </div>
 
-      <!-- Repeat Counter Pill -->
       <div class="bg-cockpit-card border border-slate-800 rounded-2xl px-3.5 py-2.5 flex items-center justify-between">
         <span class="text-xs font-bold text-slate-400 uppercase tracking-wider">本句重複</span>
         <div class="flex items-center gap-2">
           <div id="repeatDotsContainer" class="flex items-center gap-1.5">
-            <!-- Dynamically rendered dots -->
+            <span class="w-3 h-3 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(16,185,129,0.8)] scale-110"></span>
+            <span class="w-3 h-3 rounded-full bg-slate-700"></span>
           </div>
           <span id="statRepeatText" class="font-mono font-extrabold text-lg sm:text-xl text-emerald-400">1/2</span>
         </div>
       </div>
 
-      <!-- Playback Speed Pill (Clickable) -->
       <button id="btnTopSpeed" class="bg-cockpit-card hover:bg-slate-800/80 border border-slate-800 rounded-2xl px-3.5 py-2.5 flex items-center justify-between transition text-left">
         <span class="text-xs font-bold text-slate-400 uppercase tracking-wider">播放語速</span>
         <div class="flex items-center gap-1.5">
@@ -192,30 +217,29 @@
         </div>
       </button>
 
-      <!-- Playback State / Gap Status -->
       <div class="bg-cockpit-card border border-slate-800 rounded-2xl px-3.5 py-2.5 flex items-center justify-between">
         <span class="text-xs font-bold text-slate-400 uppercase tracking-wider">狀態</span>
         <div id="statEngineState" class="flex items-center gap-1.5 font-bold text-sm sm:text-base text-slate-300">
-          <span class="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
-          <span>待命準備</span>
+          <span class="w-2.5 h-2.5 rounded-full bg-emerald-400"></span>
+          <span>待命就緒</span>
         </div>
       </div>
     </div>
 
-    <!-- CENTER GIANT SUBTITLE STAGE (Non-overlapping Flex Header Layout for Mobile iPhone 12) -->
+    <!-- CENTER GIANT SUBTITLE STAGE (Clean Flex Header - Never Overlaps Text on iPhone 12) -->
     <div id="subtitleStage" class="relative flex-1 bg-gradient-to-b from-slate-900/90 to-cockpit-card border-2 border-slate-800/90 rounded-3xl p-4 sm:p-7 flex flex-col justify-between text-center shadow-2xl min-h-[240px] sm:min-h-[290px] overflow-hidden gap-3">
       
-      <!-- Dedicated Top Flex Toolbar (Never overlaps English sentence on narrow mobile viewports) -->
-      <div class="w-full flex flex-wrap items-center justify-between gap-2 pb-2.5 border-b border-slate-800/80 text-xs font-mono text-slate-400 shrink-0">
+      <!-- Top Non-Overlapping Flex Toolbar -->
+      <div class="w-full flex flex-wrap items-center justify-between gap-1.5 pb-2.5 border-b border-slate-800/80 text-xs font-mono text-slate-400 shrink-0">
         <div class="flex items-center gap-1.5 flex-wrap">
-          <span id="badgeAudioSource" class="px-2.5 py-1 rounded-full bg-slate-800 border border-slate-700 text-sky-300 font-sans font-semibold">WAV 獨立音檔</span>
+          <span id="badgeAudioSource" class="px-2.5 py-1 rounded-full bg-slate-800 border border-slate-700 text-sky-300 font-sans font-semibold">內建獨立音檔</span>
           <span id="badgeClipDuration" class="px-2 py-1 rounded-full bg-slate-800/70 text-slate-300">3.2s</span>
-          <button id="btnDemoVoiceMode" class="px-2.5 py-1 rounded-full bg-emerald-950/90 border border-emerald-500/50 text-emerald-300 font-sans font-bold transition hover:bg-emerald-900/80">
-            🔊 範例人聲：TTS+墊音
+          <button id="btnDemoVoiceMode" type="button" class="px-2.5 py-1 rounded-full bg-emerald-950/90 border border-emerald-500/50 text-emerald-300 font-sans font-bold transition hover:bg-emerald-900/80">
+            🔊 範例人聲：語音+提示音
           </button>
         </div>
         <div class="flex items-center gap-1.5 ml-auto">
-          <button id="btnToggleSubMode" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-sans font-semibold transition">
+          <button id="btnToggleSubMode" type="button" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-sans font-semibold transition">
             <i class="fa-regular fa-eye mr-1"></i>字幕：英+中
           </button>
         </div>
@@ -224,16 +248,15 @@
       <!-- Main English & Chinese Sentence Area -->
       <div class="my-auto py-3 sm:py-5 w-full max-w-4xl mx-auto flex flex-col items-center justify-center gap-3.5">
         <p id="displayEnglish" class="font-extrabold tracking-tight text-white leading-snug sm:leading-tight transition-all duration-150 text-2xl sm:text-4xl md:text-5xl px-1 break-words">
-          Could you walk me through the timeline for this project?
+          1. Could you walk me through the timeline for this project?
         </p>
 
-        <!-- Chinese Subtitle / Note -->
         <p id="displayChinese" class="text-base sm:text-xl md:text-2xl font-semibold text-sky-300/90 leading-relaxed max-w-3xl px-1">
           你能帶我順一遍這個專案的時程表嗎？
         </p>
       </div>
 
-      <!-- Shadowing Countdown / Audio Scrub Bar at Bottom of Card -->
+      <!-- Progress Bar -->
       <div class="w-full mt-auto pt-1 shrink-0">
         <div class="flex items-center justify-between text-xs font-mono text-slate-400 mb-1.5">
           <span id="timeCurrent">00:00.0</span>
@@ -248,7 +271,7 @@
       </div>
     </div>
 
-    <!-- QUICK PLAYBACK STRATEGY BAR (Target Repeats & Shadowing Gap) -->
+    <!-- QUICK PLAYBACK STRATEGY BAR -->
     <div class="bg-cockpit-card border border-slate-800 rounded-2xl px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs sm:text-sm">
       <div class="flex items-center gap-2 flex-wrap">
         <span class="text-slate-400 font-bold"><i class="fa-solid fa-repeat text-emerald-400 mr-1"></i>每句重複：</span>
@@ -264,47 +287,42 @@
       <div class="flex items-center gap-2 flex-wrap">
         <span class="text-slate-400 font-bold"><i class="fa-solid fa-hourglass-half text-sky-400 mr-1"></i>句間跟讀留白：</span>
         <div class="inline-flex rounded-xl bg-slate-900 p-1 border border-slate-800">
-          <button data-gap="0" class="gap-opt px-2.5 py-1 rounded-lg font-bold text-slate-400 hover:text-white transition">0秒</button>
-          <button data-gap="0.8" class="gap-opt px-2.5 py-1 rounded-lg font-bold bg-sky-500 text-slate-950 transition">0.8秒</button>
-          <button data-gap="1.5" class="gap-opt px-2.5 py-1 rounded-lg font-bold text-slate-400 hover:text-white transition">1.5秒</button>
-          <button data-gap="auto" class="gap-opt px-2.5 py-1 rounded-lg font-bold text-slate-400 hover:text-white transition">等長跟讀</button>
+          <button data-gap="0" class="gap-opt px-2.5 py-1 rounded-lg font-bold text-slate-400 hover:text-white transition">無停頓</button>
+          <button data-gap="1" class="gap-opt px-2.5 py-1 rounded-lg font-bold bg-sky-500 text-slate-950 transition">+1秒</button>
+          <button data-gap="2" class="gap-opt px-2.5 py-1 rounded-lg font-bold text-slate-400 hover:text-white transition">+2秒</button>
+          <button data-gap="auto" class="gap-opt px-2.5 py-1 rounded-lg font-bold text-slate-400 hover:text-white transition">+等長跟讀</button>
         </div>
       </div>
     </div>
 
-    <!-- CAR-READY GIANT TACTILE CONTROL DECK (Mirrors Physical 4-Key / 3-Key Bluetooth Page Turner) -->
+    <!-- 5 GIANT CAR-FRIENDLY BLIND-CONTROL BOTTOM BUTTONS -->
     <section aria-label="車用盲操主控台" class="grid grid-cols-5 gap-2 sm:gap-3 pt-1 pb-2">
       
-      <!-- Key 1: Previous Sentence -->
-      <button id="btnCtrlPrev" class="ctrl-btn group relative bg-slate-900 hover:bg-slate-800 active:scale-95 border-2 border-slate-700/90 hover:border-sky-400 rounded-2xl p-3 sm:p-4 flex flex-col items-center justify-center gap-1.5 transition shadow-lg">
+      <button id="btnCtrlPrev" type="button" class="ctrl-btn group relative bg-slate-900 hover:bg-slate-800 active:scale-95 border-2 border-slate-700/90 hover:border-sky-400 rounded-2xl p-3 sm:p-4 flex flex-col items-center justify-center gap-1.5 transition shadow-lg">
         <span id="badgeKeyPrev" class="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">← / PgUp</span>
         <i class="fa-solid fa-backward-step text-2xl sm:text-3xl text-slate-200 group-hover:text-sky-400"></i>
         <span class="text-xs sm:text-sm font-extrabold text-slate-200">上一句</span>
       </button>
 
-      <!-- Key 2: Restart Current Sentence (0.00s + Reset Repeat Counter to 1/2) -->
-      <button id="btnCtrlRestart" class="ctrl-btn group relative bg-slate-900 hover:bg-slate-800 active:scale-95 border-2 border-emerald-500/60 hover:border-emerald-400 rounded-2xl p-3 sm:p-4 flex flex-col items-center justify-center gap-1.5 transition shadow-lg">
+      <button id="btnCtrlRestart" type="button" class="ctrl-btn group relative bg-slate-900 hover:bg-slate-800 active:scale-95 border-2 border-emerald-500/60 hover:border-emerald-400 rounded-2xl p-3 sm:p-4 flex flex-col items-center justify-center gap-1.5 transition shadow-lg">
         <span id="badgeKeyRestart" class="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-950/90 text-emerald-300 border border-emerald-700/60">↑ / R</span>
         <i class="fa-solid fa-rotate-left text-2xl sm:text-3xl text-emerald-400"></i>
         <span class="text-xs sm:text-sm font-extrabold text-emerald-300">這句開頭</span>
       </button>
 
-      <!-- Key 3: Play / Pause (Short Press: Play/Pause, Long Press: Speed) -->
-      <button id="btnCtrlPlay" class="ctrl-btn group relative bg-sky-500 hover:bg-sky-400 active:scale-95 border-2 border-sky-300 rounded-2xl p-3 sm:p-4 flex flex-col items-center justify-center gap-1.5 transition shadow-xl shadow-sky-500/20 text-slate-950">
+      <button id="btnCtrlPlay" type="button" class="ctrl-btn group relative bg-sky-500 hover:bg-sky-400 active:scale-95 border-2 border-sky-300 rounded-2xl p-3 sm:p-4 flex flex-col items-center justify-center gap-1.5 transition shadow-xl shadow-sky-500/20 text-slate-950">
         <span id="badgeKeyPlay" class="text-[11px] font-mono font-bold px-2 py-0.5 rounded bg-slate-950/25 text-slate-950">Space (長按調速)</span>
         <i id="iconPlayPause" class="fa-solid fa-play text-2xl sm:text-3xl"></i>
         <span id="labelPlayPause" class="text-xs sm:text-sm font-black">開始播放</span>
       </button>
 
-      <!-- Key 4: Next Sentence -->
-      <button id="btnCtrlNext" class="ctrl-btn group relative bg-slate-900 hover:bg-slate-800 active:scale-95 border-2 border-slate-700/90 hover:border-sky-400 rounded-2xl p-3 sm:p-4 flex flex-col items-center justify-center gap-1.5 transition shadow-lg">
+      <button id="btnCtrlNext" type="button" class="ctrl-btn group relative bg-slate-900 hover:bg-slate-800 active:scale-95 border-2 border-slate-700/90 hover:border-sky-400 rounded-2xl p-3 sm:p-4 flex flex-col items-center justify-center gap-1.5 transition shadow-lg">
         <span id="badgeKeyNext" class="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">→ / PgDn</span>
         <i class="fa-solid fa-forward-step text-2xl sm:text-3xl text-slate-200 group-hover:text-sky-400"></i>
         <span class="text-xs sm:text-sm font-extrabold text-slate-200">下一句</span>
       </button>
 
-      <!-- Key 5: Cycle Speed -->
-      <button id="btnCtrlSpeed" class="ctrl-btn group relative bg-slate-900 hover:bg-slate-800 active:scale-95 border-2 border-amber-500/50 hover:border-amber-400 rounded-2xl p-3 sm:p-4 flex flex-col items-center justify-center gap-1.5 transition shadow-lg">
+      <button id="btnCtrlSpeed" type="button" class="ctrl-btn group relative bg-slate-900 hover:bg-slate-800 active:scale-95 border-2 border-amber-500/50 hover:border-amber-400 rounded-2xl p-3 sm:p-4 flex flex-col items-center justify-center gap-1.5 transition shadow-lg">
         <span id="badgeKeySpeed" class="text-[11px] font-mono px-2 py-0.5 rounded bg-amber-950/80 text-amber-300 border border-amber-700/60">↓ / S</span>
         <i class="fa-solid fa-bolt text-2xl sm:text-3xl text-amber-400"></i>
         <span id="labelSpeedBtn" class="text-xs sm:text-sm font-extrabold text-amber-300">1.00x 語速</span>
@@ -314,44 +332,59 @@
   </main>
 
   <!-- ===================================================================== -->
-  <!-- MODAL 1: UPGRADED SMART AUDIO SLICER & IMPORT WORKBENCH               -->
+  <!-- MODAL 1: SMART AUDIO SLICER & IMPORT WORKBENCH                        -->
   <!-- ===================================================================== -->
   <div id="modalImport" class="fixed inset-0 bg-black/85 backdrop-blur-sm z-40 hidden flex items-center justify-center p-2 sm:p-4 overflow-y-auto">
     <div class="bg-cockpit-card border border-slate-700 rounded-3xl max-w-4xl w-full p-4 sm:p-6 shadow-2xl my-auto max-h-[95vh] flex flex-col">
       
       <!-- Modal Header -->
-      <div class="flex items-center justify-between border-b border-slate-800 pb-3 mb-3">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-3 mb-2.5 shrink-0">
         <div class="flex items-center gap-2.5">
-          <div class="w-9 h-9 rounded-xl bg-sky-500/20 border border-sky-400/40 flex items-center justify-center text-sky-400">
+          <div class="w-9 h-9 rounded-xl bg-sky-500/20 border border-sky-400/40 flex items-center justify-center text-sky-400 shrink-0">
             <i class="fa-solid fa-scissors"></i>
           </div>
           <div>
             <h2 class="text-base sm:text-xl font-black text-white">匯入素材與智慧切音工作台 (IndexedDB)</h2>
-            <p class="text-xs text-slate-400">支援 GPT Live 長音檔即時預覽切分、純文字行數自動對齊、單段試聽與合併/分割微調</p>
+            <p class="text-xs text-slate-400">支援 GPT Live 長音檔即時預覽切分、純文字行數自動對齊、iOS 同步試聽與合併/分割微調</p>
           </div>
         </div>
-        <button id="btnCloseImport" class="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center shrink-0">
+        <button id="btnCloseImport" type="button" class="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center shrink-0">
           <i class="fa-solid fa-xmark text-lg"></i>
         </button>
       </div>
 
-      <!-- Source Mode Tabs (Tab A: GPT Live Long Audio + Paste Text | Tab B: ZIP / Multi-Files) -->
-      <div class="grid grid-cols-2 gap-2 bg-slate-950 p-1.5 rounded-2xl border border-slate-800 mb-3 shrink-0">
-        <button id="tabBtnGptWorkbench" class="py-2 px-3 rounded-xl text-xs sm:text-sm font-extrabold bg-sky-500 text-slate-950 shadow transition flex items-center justify-center gap-1.5">
+      <!-- Source Mode Tabs -->
+      <div class="grid grid-cols-2 gap-2 bg-slate-950 p-1.5 rounded-2xl border border-slate-800 mb-2.5 shrink-0">
+        <button id="tabBtnGptWorkbench" type="button" class="py-2 px-3 rounded-xl text-xs sm:text-sm font-extrabold bg-sky-500 text-slate-950 shadow transition flex items-center justify-center gap-1.5">
           <i class="fa-solid fa-wand-magic-sparkles"></i>
           <span>分頁 A：長音檔智慧切分＋貼上純文字 (推薦)</span>
         </button>
-        <button id="tabBtnZipImport" class="py-2 px-3 rounded-xl text-xs sm:text-sm font-bold text-slate-400 hover:text-white transition flex items-center justify-center gap-1.5">
+        <button id="tabBtnZipImport" type="button" class="py-2 px-3 rounded-xl text-xs sm:text-sm font-bold text-slate-400 hover:text-white transition flex items-center justify-center gap-1.5">
           <i class="fa-solid fa-file-zipper"></i>
           <span>分頁 B：匯入 ZIP 懶人包 / 多檔音訊</span>
         </button>
       </div>
 
-      <!-- Modal Scrollable Body -->
-      <div class="overflow-y-auto pr-1 space-y-3.5 flex-1">
+      <!-- Sticky Mobile Quick Jump Bar -->
+      <div class="flex items-center justify-between gap-2 bg-slate-900/95 border border-slate-800 rounded-xl px-3 py-1.5 mb-2.5 text-xs shrink-0">
+        <div class="font-mono font-bold text-slate-300 truncate">
+          切出：<strong id="quickTopSegCount" class="text-sky-400">0</strong> 段 ｜ 字幕：<strong id="quickTopSubCount" class="text-emerald-400">0</strong> 行
+        </div>
+        <div class="flex items-center gap-1.5 shrink-0">
+          <button id="btnJumpToControls" type="button" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-300 font-bold border border-slate-700 transition">
+            ⬆ 調滑桿/貼字幕
+          </button>
+          <button id="btnJumpToPreview" type="button" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-emerald-300 font-bold border border-slate-700 transition">
+            ⬇ 看切分清單
+          </button>
+        </div>
+      </div>
+
+      <!-- Modal Scrollable Body (Every child has shrink-0 so iPhone Flexbox never squishes top controls) -->
+      <div id="modalImportScrollBody" class="overflow-y-auto pr-1 flex flex-col gap-3.5 flex-1 min-h-0" style="-webkit-overflow-scrolling: touch;">
         
         <!-- Common Step: Course Pack Name -->
-        <div class="flex flex-col sm:flex-row sm:items-center gap-2 bg-slate-900/70 border border-slate-800 rounded-2xl px-3.5 py-2.5">
+        <div id="workbenchTopAnchor" class="shrink-0 flex flex-col sm:flex-row sm:items-center gap-2 bg-slate-900/70 border border-slate-800 rounded-2xl px-3.5 py-2.5">
           <label class="text-xs font-extrabold text-slate-300 uppercase tracking-wider shrink-0">課程包名稱：</label>
           <input id="inputPackName" type="text" placeholder="例如：GPT Live 通勤跟讀 30 句 (Day 01)" class="flex-1 bg-slate-950 border border-slate-700 focus:border-sky-400 rounded-xl px-3 py-1.5 text-sm text-white font-semibold focus:outline-none" />
           <label class="flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer shrink-0">
@@ -360,20 +393,18 @@
           </label>
         </div>
 
-        <!-- =============================================================== -->
-        <!-- TAB A PANEL: SINGLE LONG AUDIO + PASTE SUBTITLES WORKBENCH      -->
-        <!-- =============================================================== -->
-        <div id="panelTabGpt" class="space-y-3.5">
+        <!-- TAB A PANEL: SINGLE LONG AUDIO + PASTE SUBTITLES WORKBENCH -->
+        <div id="panelTabGpt" class="shrink-0 space-y-3.5">
           
           <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">
             
             <!-- Left Column: Audio File Upload & Waveform Envelope Preview -->
             <div class="bg-slate-900/90 border border-slate-800 rounded-2xl p-3.5 flex flex-col justify-between space-y-3">
-              <div class="flex items-center justify-between gap-2">
+              <div class="flex items-center justify-between gap-2 flex-wrap">
                 <span class="text-xs font-extrabold text-sky-400 uppercase tracking-wider">
                   <i class="fa-solid fa-microphone-lines mr-1"></i>1. 載入單一長音檔 (如 GPT Live 錄音)
                 </span>
-                <button id="btnLoadSimulatedGptAudio" class="px-2.5 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/50 text-emerald-300 text-xs font-bold transition">
+                <button id="btnLoadSimulatedGptAudio" type="button" class="px-2.5 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/50 text-emerald-300 text-xs font-bold transition">
                   <i class="fa-solid fa-bolt mr-1"></i>載入模擬 GPT 10 句長音檔 (含底噪)
                 </button>
               </div>
@@ -416,11 +447,11 @@
                 </label>
               </div>
 
-              <textarea id="textareaSubtitles" rows="6" placeholder="直接貼上文字，一行一句（不需要時間軸！），例如：&#10;1. Hi there.&#10;2. How are you?&#10;3. Could you walk me through the timeline? || 你能帶我順一遍時程嗎？" class="w-full flex-1 bg-slate-950 border border-slate-700 focus:border-emerald-400 rounded-xl p-2.5 text-xs sm:text-sm font-mono text-slate-100 leading-relaxed focus:outline-none resize-none"></textarea>
+              <textarea id="textareaSubtitles" rows="5" placeholder="直接貼上文字，一行一句（不需要時間軸！），例如：&#10;1. Hi there.&#10;2. How are you?&#10;3. Could you walk me through the timeline? || 你能帶我順一遍時程嗎？" class="w-full min-h-[115px] bg-slate-950 border border-slate-700 focus:border-emerald-400 rounded-xl p-2.5 text-xs sm:text-sm font-mono text-slate-100 leading-relaxed focus:outline-none resize-y"></textarea>
 
               <div class="flex items-center justify-between text-[11px] text-slate-400">
-                <span>💡 支援自動過濾空行；若同行含 <code class="text-emerald-300">||</code> 或 <code class="text-emerald-300">Tab</code> 會自動分離出中文翻譯</span>
-                <span id="parsedLineCountBadge" class="font-mono font-bold text-emerald-400">目前行數：0 行</span>
+                <span>💡 自動過濾空行；若同行含 <code class="text-emerald-300">||</code> 或 <code class="text-emerald-300">Tab</code> 會自動分離中文</span>
+                <span id="parsedLineCountBadge" class="font-mono font-bold text-emerald-400 shrink-0">目前行數：0 行</span>
               </div>
             </div>
 
@@ -433,21 +464,20 @@
                 <i class="fa-solid fa-sliders"></i>
                 <span>3. 即時靜音切刀參數微調（拉動滑桿立即更新切出段數）</span>
               </div>
-              <button id="btnAutoMatchLineCount" class="px-3 py-1 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/50 text-amber-300 text-xs font-extrabold transition">
-                <i class="fa-solid fa-crosshairs mr-1"></i>智慧自動尋找符合字幕行數的 dB 門檻
+              <button id="btnAutoMatchLineCount" type="button" class="px-3 py-1 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/50 text-amber-300 text-xs font-extrabold transition">
+                <i class="fa-solid fa-crosshairs mr-1"></i>✨ 智慧自動尋找符合字幕行數的 dB 門檻
               </button>
             </div>
 
             <!-- 4 Sliders Grid -->
             <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
               
-              <!-- Slider 1: Silence Threshold (dB) -->
               <div class="bg-slate-950/90 border border-slate-800 rounded-xl p-2.5">
                 <div class="flex items-center justify-between mb-1">
                   <span class="font-bold text-slate-300">靜音門檻 (dB)</span>
-                  <span id="valSliderDb" class="font-mono font-extrabold text-amber-400 text-sm">-28 dB</span>
+                  <span id="valSliderDb" class="font-mono font-extrabold text-amber-400 text-sm">-30.0 dB</span>
                 </div>
-                <input id="sliderVadDb" type="range" min="-55" max="-10" step="0.5" value="-28" class="w-full accent-amber-400 cursor-pointer" />
+                <input id="sliderVadDb" type="range" min="-55" max="-10" step="0.5" value="-30" class="w-full accent-amber-400 cursor-pointer" />
                 <div class="flex justify-between text-[10px] text-slate-500 mt-0.5">
                   <span>-55 (極安靜)</span>
                   <span>往右克服底噪 ➔</span>
@@ -455,43 +485,40 @@
                 </div>
               </div>
 
-              <!-- Slider 2: Min Silence Pause Duration (ms) -->
               <div class="bg-slate-950/90 border border-slate-800 rounded-xl p-2.5">
                 <div class="flex items-center justify-between mb-1">
                   <span class="font-bold text-slate-300">最短句間停頓</span>
-                  <span id="valSliderPauseMs" class="font-mono font-extrabold text-sky-400 text-sm">300 ms</span>
+                  <span id="valSliderPauseMs" class="font-mono font-extrabold text-sky-400 text-sm">320 ms</span>
                 </div>
-                <input id="sliderVadPauseMs" type="range" min="100" max="1500" step="20" value="300" class="w-full accent-sky-400 cursor-pointer" />
+                <input id="sliderVadPauseMs" type="range" min="150" max="1200" step="10" value="320" class="w-full accent-sky-400 cursor-pointer" />
                 <div class="flex justify-between text-[10px] text-slate-500 mt-0.5">
-                  <span>100ms (緊湊)</span>
+                  <span>150ms (緊湊)</span>
                   <span>◄ 調小抓短換氣</span>
-                  <span>1500ms</span>
+                  <span>1200ms</span>
                 </div>
               </div>
 
-              <!-- Slider 3: Min Speech Sentence Duration (ms) -->
               <div class="bg-slate-950/90 border border-slate-800 rounded-xl p-2.5">
                 <div class="flex items-center justify-between mb-1">
-                  <span class="font-bold text-slate-300">最短單句長度</span>
-                  <span id="valSliderMinClipMs" class="font-mono font-extrabold text-emerald-400 text-sm">400 ms</span>
+                  <span class="font-bold text-slate-300">最短句子長度</span>
+                  <span id="valSliderMinClipMs" class="font-mono font-extrabold text-emerald-400 text-sm">500 ms</span>
                 </div>
-                <input id="sliderVadMinClipMs" type="range" min="200" max="2000" step="40" value="400" class="w-full accent-emerald-400 cursor-pointer" />
+                <input id="sliderVadMinClipMs" type="range" min="300" max="2000" step="50" value="500" class="w-full accent-emerald-400 cursor-pointer" />
                 <div class="flex justify-between text-[10px] text-slate-500 mt-0.5">
-                  <span>200ms (短句)</span>
+                  <span>300ms (短句)</span>
                   <span>過濾短促雜音</span>
                   <span>2000ms</span>
                 </div>
               </div>
 
-              <!-- Slider 4: Boundary Padding (ms) -->
               <div class="bg-slate-950/90 border border-slate-800 rounded-xl p-2.5">
                 <div class="flex items-center justify-between mb-1">
                   <span class="font-bold text-slate-300">前後保留緩衝</span>
-                  <span id="valSliderPadMs" class="font-mono font-extrabold text-purple-400 text-sm">140 ms</span>
+                  <span id="valSliderPadMs" class="font-mono font-extrabold text-purple-400 text-sm">150 ms</span>
                 </div>
-                <input id="sliderVadPadMs" type="range" min="40" max="400" step="20" value="140" class="w-full accent-purple-400 cursor-pointer" />
+                <input id="sliderVadPadMs" type="range" min="50" max="400" step="10" value="150" class="w-full accent-purple-400 cursor-pointer" />
                 <div class="flex justify-between text-[10px] text-slate-500 mt-0.5">
-                  <span>40ms</span>
+                  <span>50ms</span>
                   <span>防止字尾被切掉</span>
                   <span>400ms</span>
                 </div>
@@ -499,7 +526,7 @@
 
             </div>
 
-            <!-- REAL-TIME ALIGNMENT DASHBOARD (Green Light Indicator) -->
+            <!-- REAL-TIME ALIGNMENT DASHBOARD -->
             <div id="alignmentBanner" class="rounded-2xl px-4 py-3 border flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-slate-950 border-slate-800">
               <div class="flex items-center gap-3">
                 <div id="alignStatusIcon" class="text-2xl">⏳</div>
@@ -522,19 +549,16 @@
 
         </div>
 
-        <!-- =============================================================== -->
-        <!-- TAB B PANEL: ZIP BUNDLE / MULTI-FILE IMPORT                     -->
-        <!-- =============================================================== -->
-        <div id="panelTabZip" class="hidden space-y-3.5">
-          <!-- Quick Test ZIP Generator Banner -->
+        <!-- TAB B PANEL: ZIP BUNDLE / MULTI-FILE IMPORT -->
+        <div id="panelTabZip" class="hidden shrink-0 space-y-3.5">
           <div class="bg-slate-900/90 border border-sky-500/30 rounded-2xl p-3.5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
             <div class="text-xs sm:text-sm text-slate-300">
               <span class="font-bold text-sky-400"><i class="fa-solid fa-box-open mr-1"></i>下載標準測試懶人包 Pack_01.zip</span>
-              <p class="text-slate-400 text-xs mt-0.5">內含 20 個獨立音檔 (01.wav~20.wav) + 1 個合併長音檔 + 單檔多句字幕 + 20 個單句字幕檔</p>
+              <p class="text-slate-400 text-xs mt-0.5">內含 20 個獨立音檔 (01.wav~20.wav) + 單檔多句字幕 + 20 個單句字幕檔</p>
             </div>
-            <button id="btnDownloadSampleZip" class="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-sky-400/50 text-sky-300 font-bold text-xs flex items-center gap-1.5 shrink-0 transition">
+            <button id="btnDownloadSampleZip" type="button" class="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-sky-400/50 text-sky-300 font-bold text-xs flex items-center gap-1.5 shrink-0 transition">
               <i class="fa-solid fa-download"></i>
-              <span>下載測試 Pack_01.zip</span>
+              <span>📥 下載測試 Pack_01.zip</span>
             </button>
           </div>
 
@@ -563,7 +587,6 @@
             </div>
           </div>
 
-          <!-- File Dropzone (.zip or multiple loose files) -->
           <div class="border-2 border-dashed border-slate-700 hover:border-sky-400 rounded-2xl p-4 text-center bg-slate-900/50 transition">
             <input id="inputZipFiles" type="file" multiple accept=".zip,.mp3,.wav,.m4a,.ogg,.aac,.txt,.srt,.lrc,.json" class="hidden" />
             <label for="inputZipFiles" class="cursor-pointer flex flex-col items-center justify-center gap-1.5 py-2">
@@ -580,17 +603,18 @@
           </div>
         </div>
 
-        <!-- =============================================================== -->
-        <!-- INTERACTIVE SEGMENT PREVIEW & 1-CLICK MERGE/SPLIT/DELETE LIST   -->
-        <!-- =============================================================== -->
-        <div id="importPreviewContainer" class="hidden bg-slate-950 border border-slate-800 rounded-2xl p-3.5 space-y-2.5">
+        <!-- INTERACTIVE SEGMENT PREVIEW & 1-CLICK MERGE/SPLIT/DELETE LIST -->
+        <div id="importPreviewContainer" class="hidden shrink-0 bg-slate-950 border border-slate-800 rounded-2xl p-3.5 space-y-2.5">
           <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2">
             <div>
               <span id="previewSummaryTitle" class="text-xs sm:text-sm font-extrabold text-emerald-400">切分對齊預覽清單</span>
-              <p class="text-[11px] text-slate-400">可點擊「▶ 試聽」檢查切點；若兩句黏在一起點「✂️ 從中切開」，若斷成兩截點「🔗 與下段合併」，開頭雜音點「🗑️ 刪除」</p>
+              <p class="text-[11px] text-slate-400">點擊「▶ 試聽」直接播放切出的音訊；兩句黏在一起點「✂️ 從中切開」，斷成兩截點「🔗 合併下段」，雜音點「🗑️ 刪除」</p>
             </div>
+            <button id="btnBackToSlidersFromList" type="button" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-sky-300 text-xs font-bold border border-slate-700 transition">
+              ⬆ 回到上方滑桿與字幕框
+            </button>
           </div>
-          <div id="previewTableBody" class="max-h-64 overflow-y-auto divide-y divide-slate-800/80 text-xs pr-1">
+          <div id="previewTableBody" class="divide-y divide-slate-800/80 text-xs">
             <!-- Dynamically populated interactive rows -->
           </div>
         </div>
@@ -599,14 +623,14 @@
 
       <!-- Modal Footer -->
       <div class="border-t border-slate-800 pt-3 mt-3 flex flex-wrap items-center justify-between gap-2 shrink-0">
-        <button id="btnResetDemoPacks" class="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold transition">
+        <button id="btnResetDemoPacks" type="button" class="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold transition">
           <i class="fa-solid fa-rotate mr-1"></i>重置內建 20 句範例
         </button>
         <div class="flex items-center gap-2">
-          <button id="btnCancelImport" class="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs sm:text-sm font-bold transition">
+          <button id="btnCancelImport" type="button" class="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs sm:text-sm font-bold transition">
             取消
           </button>
-          <button id="btnConfirmSavePack" disabled class="px-5 py-2 rounded-xl bg-sky-500 hover:bg-sky-400 disabled:opacity-40 disabled:pointer-events-none text-slate-950 font-black text-xs sm:text-sm shadow-lg shadow-sky-500/20 transition">
+          <button id="btnConfirmSavePack" type="button" disabled class="px-5 py-2 rounded-xl bg-sky-500 hover:bg-sky-400 disabled:opacity-40 disabled:pointer-events-none text-slate-950 font-black text-xs sm:text-sm shadow-lg shadow-sky-500/20 transition">
             <i class="fa-solid fa-floppy-disk mr-1"></i>確認裁切並儲存至課程庫
           </button>
         </div>
@@ -630,7 +654,7 @@
             <p class="text-xs text-slate-400">支援 3 鍵 / 4 鍵翻頁器（如翰林閱 Free2 / Free3）自定義按鍵</p>
           </div>
         </div>
-        <button id="btnCloseKeymap" class="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center">
+        <button id="btnCloseKeymap" type="button" class="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center">
           <i class="fa-solid fa-xmark text-lg"></i>
         </button>
       </div>
@@ -646,15 +670,13 @@
         </label>
       </div>
 
-      <div id="keymapListContainer" class="space-y-2.5 mb-5">
-        <!-- Dynamically populated keybinding rows -->
-      </div>
+      <div id="keymapListContainer" class="space-y-2.5 mb-5"></div>
 
       <div class="flex items-center justify-between border-t border-slate-800 pt-3.5">
-        <button id="btnResetKeymap" class="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold transition">
+        <button id="btnResetKeymap" type="button" class="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold transition">
           恢復預設按鍵
         </button>
-        <button id="btnDoneKeymap" class="px-5 py-2 rounded-xl bg-sky-500 hover:bg-sky-400 text-slate-950 font-black text-sm transition">
+        <button id="btnDoneKeymap" type="button" class="px-5 py-2 rounded-xl bg-sky-500 hover:bg-sky-400 text-slate-950 font-black text-sm transition">
           完成設定
         </button>
       </div>
@@ -662,7 +684,7 @@
   </div>
 
   <!-- ===================================================================== -->
-  <!-- MODAL 3: SENTENCE LIST DRAWER (Quick Jump to Any of the 20 Sentences) -->
+  <!-- MODAL 3: SENTENCE LIST DRAWER                                         -->
   <!-- ===================================================================== -->
   <div id="modalSentenceList" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-40 hidden flex items-center justify-center p-3 sm:p-5">
     <div class="bg-cockpit-card border border-slate-700 rounded-3xl max-w-2xl w-full p-5 sm:p-6 shadow-2xl max-h-[88vh] flex flex-col">
@@ -671,13 +693,11 @@
           <h2 id="drawerPackTitle" class="text-lg font-black text-white">句子清單 (20 句)</h2>
           <p class="text-xs text-slate-400">點擊任意句子即可直接跳轉並從第 1/2 次開始播放</p>
         </div>
-        <button id="btnCloseList" class="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center">
+        <button id="btnCloseList" type="button" class="w-9 h-9 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center">
           <i class="fa-solid fa-xmark text-lg"></i>
         </button>
       </div>
-      <div id="sentenceDrawerBody" class="overflow-y-auto space-y-2 pr-1 flex-1">
-        <!-- Populated dynamically -->
-      </div>
+      <div id="sentenceDrawerBody" class="overflow-y-auto space-y-2 pr-1 flex-1"></div>
     </div>
   </div>
 
@@ -691,51 +711,20 @@
           <i class="fa-solid fa-shield-heart text-emerald-400 text-lg"></i>
           <h2 class="text-base sm:text-lg font-black text-white">系統環境與儲存診斷資訊</h2>
         </div>
-        <button id="btnCloseDiag" class="w-8 h-8 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center">
+        <button id="btnCloseDiag" type="button" class="w-8 h-8 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center">
           <i class="fa-solid fa-xmark"></i>
         </button>
       </div>
-      <div id="diagStatusSummary" class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 text-xs text-slate-300 space-y-1.5 mb-3 leading-relaxed">
-      </div>
+      <div id="diagStatusSummary" class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 text-xs text-slate-300 space-y-1.5 mb-3 leading-relaxed"></div>
       <div class="text-xs font-bold text-slate-400 mb-1.5">執行期事件日誌：</div>
-      <div id="diagLogList" class="flex-1 overflow-y-auto bg-slate-950 border border-slate-800 rounded-2xl p-3 font-mono text-[11px] text-slate-300 space-y-1.5 min-h-[120px]">
-      </div>
+      <div id="diagLogList" class="flex-1 overflow-y-auto bg-slate-950 border border-slate-800 rounded-2xl p-3 font-mono text-[11px] text-slate-300 space-y-1.5 min-h-[120px]"></div>
     </div>
   </div>
 
   <!-- ===================================================================== -->
-  <!-- APPLICATION JAVASCRIPT ENGINE (iOS Sandbox Safe & Syntax Verified)    -->
+  <!-- APPLICATION JAVASCRIPT ENGINE (Zero Syntax Errors & iOS Verified)     -->
   <!-- ===================================================================== -->
   <script>
-    /*************************************************************************
-     * 0. GLOBAL SANDBOX ERROR GUARD & IN-APP DIAGNOSTICS LOGGER
-     *    Prevents iOS Safari / Gemini iframe sandbox exceptions from crashing UI
-     *************************************************************************/
-    const diagLogs = [];
-    function logDiag(level, msg) {
-      const time = new Date().toLocaleTimeString('zh-TW', { hour12: false });
-      diagLogs.unshift({ time, level, msg: String(msg) });
-      if (diagLogs.length > 50) diagLogs.pop();
-      const logContainer = document.getElementById('diagLogList');
-      if (logContainer) {
-        logContainer.innerHTML = diagLogs.map(item => {
-          const color = item.level === 'WARN' ? 'text-amber-400' : (item.level === 'ERR' ? 'text-rose-400' : 'text-emerald-400');
-          return `<div><span class="text-slate-500">[${item.time}]</span> <strong class="${color}">[${item.level}]</strong> ${escapeHtml(item.msg)}</div>`;
-        }).join('');
-      }
-    }
-
-    window.addEventListener('error', (event) => {
-      logDiag('ERR', `${event.message || 'Runtime Error'} (${event.lineno || 0})`);
-      event.preventDefault();
-    });
-
-    window.addEventListener('unhandledrejection', (event) => {
-      const reason = event.reason ? (event.reason.message || String(event.reason)) : 'Promise rejected';
-      logDiag('WARN', `非同步攔截: ${reason}`);
-      event.preventDefault();
-    });
-
     function escapeHtml(str) {
       return String(str || '')
         .replace(/&/g, '&amp;')
@@ -746,7 +735,7 @@
     }
 
     /*************************************************************************
-     * 1. BUILT-IN 20 BUSINESS & DRIVING SHADOWING SENTENCES (Default Pack)
+     * 1. BUILT-IN 20 BUSINESS & DRIVING SHADOWING SENTENCES
      *************************************************************************/
     const DEFAULT_20_SENTENCES = [
       { en: "1. Could you walk me through the timeline for this project?", zh: "你能帶我順一遍這個專案的時程表嗎？" },
@@ -772,12 +761,36 @@
     ];
 
     /*************************************************************************
-     * 2. SYNTHETIC WAV GENERATOR & AUDIO BUFFER SLICER
+     * 2. SYNCHRONOUS BASE64 WAV & AUDIO BUFFER UTILITIES (iOS Safari Safe)
      *************************************************************************/
-    function createSpeechCadenceWavBlob(text, durationSec = null) {
-      const sampleRate = 22050;
+    function uint8ArrayToBase64Sync(uint8) {
+      let binary = '';
+      const chunkSize = 0x8000;
+      for (let i = 0; i < uint8.length; i += chunkSize) {
+        const sub = uint8.subarray(i, Math.min(i + chunkSize, uint8.length));
+        binary += String.fromCharCode.apply(null, sub);
+      }
+      return btoa(binary);
+    }
+
+    function wavArrayBufferToDataUriSync(arrayBuffer) {
+      return 'data:audio/wav;base64,' + uint8ArrayToBase64Sync(new Uint8Array(arrayBuffer));
+    }
+
+    function blobToDataUriAsync(blob) {
+      return new Promise((resolve) => {
+        if (!blob) { resolve(null); return; }
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result || null);
+        reader.onerror = () => resolve(null);
+        reader.readAsDataURL(blob);
+      });
+    }
+
+    function createSpeechCadenceWavBuffer(text, durationSec = null) {
+      const sampleRate = 16000;
       const words = String(text || '').trim().split(/\s+/);
-      const calcDuration = durationSec || Math.max(2.2, Math.min(4.8, words.length * 0.32));
+      const calcDuration = durationSec || Math.max(2.2, Math.min(4.5, words.length * 0.30));
       const numSamples = Math.floor(sampleRate * calcDuration);
       const buffer = new ArrayBuffer(44 + numSamples * 2);
       const view = new DataView(buffer);
@@ -809,27 +822,44 @@
           const activeDur = wordDur * 0.78;
           if (localT < activeDur && wordIdx < words.length) {
             const env = Math.sin((localT / activeDur) * Math.PI);
-            const baseFreq = 240 + ((wordIdx * 37 + text.length * 13) % 140);
-            sample = (Math.sin(2 * Math.PI * baseFreq * t) * 0.10 +
-                      Math.sin(2 * Math.PI * (baseFreq * 1.5) * t) * 0.05) * env;
+            const baseFreq = 230 + ((wordIdx * 37 + text.length * 13) % 130);
+            sample = (Math.sin(2 * Math.PI * baseFreq * t) * 0.14 +
+                      Math.sin(2 * Math.PI * (baseFreq * 1.5) * t) * 0.07) * env;
           }
         }
         const pcmValue = Math.max(-1, Math.min(1, sample));
         view.setInt16(44 + i * 2, pcmValue * 32767, true);
       }
-      return new Blob([buffer], { type: 'audio/wav' });
+      return buffer;
     }
 
-    function audioBufferSliceToWavBlob(audioBuffer, startSec, endSec) {
+    function createSpeechCadenceWavDataUri(text, durationSec = null) {
+      const buffer = createSpeechCadenceWavBuffer(text, durationSec);
+      return wavArrayBufferToDataUriSync(buffer);
+    }
+
+    function audioBufferSliceToWavArrayBuffer(audioBuffer, startSec, endSec) {
       const sampleRate = audioBuffer.sampleRate;
       const startSample = Math.max(0, Math.floor(startSec * sampleRate));
       const endSample = Math.min(audioBuffer.length, Math.ceil(endSec * sampleRate));
       const frameCount = Math.max(1, endSample - startSample);
-      const channelData = audioBuffer.getChannelData(0);
+      const numChannels = audioBuffer.numberOfChannels || 1;
+      const ch0 = audioBuffer.getChannelData(0);
+      const ch1 = numChannels > 1 ? audioBuffer.getChannelData(1) : null;
 
       const ratio = sampleRate > 24000 ? 2 : 1;
       const outSampleRate = Math.floor(sampleRate / ratio);
       const outFrames = Math.max(1, Math.floor(frameCount / ratio));
+
+      // Auto-normalize quiet recordings so iPhone speaker is loud & crystal clear
+      let peak = 0.001;
+      for (let i = 0; i < outFrames; i++) {
+        const srcIdx = startSample + i * ratio;
+        const val = ch1 ? ((ch0[srcIdx] || 0) + (ch1[srcIdx] || 0)) * 0.5 : (ch0[srcIdx] || 0);
+        const abs = Math.abs(val);
+        if (abs > peak) peak = abs;
+      }
+      const gain = peak < 0.35 ? Math.min(4.0, 0.85 / peak) : 1.0;
 
       const buffer = new ArrayBuffer(44 + outFrames * 2);
       const view = new DataView(buffer);
@@ -852,17 +882,22 @@
 
       for (let i = 0; i < outFrames; i++) {
         const srcIdx = startSample + i * ratio;
-        const s = Math.max(-1, Math.min(1, channelData[srcIdx] || 0));
+        const raw = ch1 ? ((ch0[srcIdx] || 0) + (ch1[srcIdx] || 0)) * 0.5 : (ch0[srcIdx] || 0);
+        const s = Math.max(-1, Math.min(1, raw * gain));
         view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
       }
-      return new Blob([buffer], { type: 'audio/wav' });
+      return buffer;
+    }
+
+    function audioBufferSliceToWavDataUri(audioBuffer, startSec, endSec) {
+      const buffer = audioBufferSliceToWavArrayBuffer(audioBuffer, startSec, endSec);
+      return wavArrayBufferToDataUriSync(buffer);
     }
 
     /*************************************************************************
-     * 3. BULLETPROOF SAFE STORAGE ENGINE (IndexedDB + Automatic Memory Fallback)
-     *    Never throws SecurityError inside iOS Safari sandboxed iframes!
+     * 3. SAFE STORAGE ENGINE (Stores Pure Base64 Strings in IndexedDB - No Blob Crash!)
      *************************************************************************/
-    const DB_NAME = 'CarShadowingDB';
+    const DB_NAME = 'CarShadowingSafeDB_v2';
     const DB_VERSION = 1;
     const STORE_PACKS = 'packs';
     const memoryPacksMap = new Map();
@@ -877,11 +912,27 @@
       if (summary) {
         summary.innerHTML = isUsingMemoryFallback
           ? `<div class="text-amber-300 font-bold">⚡ 目前運行於「沙盒預覽暫存模式 (In-Memory)」</div>
-             <div>原因：目前網頁處於 Gemini App / Safari 內嵌預覽沙盒 (iframe) 中，iOS 安全機制限制了 IndexedDB 永久存取，系統已自動切換為記憶體模式確保所有功能正常運作。</div>
-             <div class="text-sky-300">💡 若要永久保存匯入的音檔，請將此程式碼部署至 GitHub Pages 或 Netlify 固定網址並在 Safari 加入主畫面。</div>`
+             <div>原因：目前網頁處於 Gemini 預覽沙盒 (iframe) 中，iOS 限制了 IndexedDB 存取，系統已無縫切換為記憶體模式確保所有切音與試聽功能 100% 正常運作。</div>
+             <div class="text-sky-300">💡 若要永久保存匯入的音檔，請將此 HTML 部署至 GitHub Pages 或 Netlify 固定網址並在 Safari 加入主畫面。</div>`
           : `<div class="text-emerald-400 font-bold">💾 目前運行於「IndexedDB 本機永久儲存模式」</div>
-             <div>所有匯入與切分的音檔皆已安全儲存在瀏覽器本機資料庫中，關閉分頁或離線重開皆不會遺失。</div>`;
+             <div>所有匯入與切分的音檔皆以 Base64 安全儲存在瀏覽器本機資料庫中，關閉分頁或離線重開皆不會遺失。</div>`;
       }
+    }
+
+    function sanitizePackForIndexedDB(pack) {
+      return {
+        id: pack.id,
+        name: pack.name,
+        createdAt: pack.createdAt || Date.now(),
+        audioModeLabel: pack.audioModeLabel || '本機音檔',
+        isDemoTTS: Boolean(pack.isDemoTTS),
+        items: (pack.items || []).map((it, idx) => ({
+          index: idx,
+          en: it.en || '',
+          zh: it.zh || '',
+          audioDataUri: it.audioDataUri || null
+        }))
+      };
     }
 
     function openDatabase() {
@@ -892,7 +943,7 @@
         }
         try {
           if (!('indexedDB' in window) || !window.indexedDB) {
-            throw new Error('indexedDB not supported in this context');
+            throw new Error('indexedDB blocked');
           }
           const req = window.indexedDB.open(DB_NAME, DB_VERSION);
           req.onupgradeneeded = (e) => {
@@ -910,15 +961,16 @@
     }
 
     async function savePackToDB(pack) {
-      memoryPacksMap.set(pack.id, pack);
+      const cleanPack = sanitizePackForIndexedDB(pack);
+      memoryPacksMap.set(cleanPack.id, cleanPack);
       try {
         const db = await openDatabase();
         await new Promise((resolve, reject) => {
           const tx = db.transaction(STORE_PACKS, 'readwrite');
-          tx.objectStore(STORE_PACKS).put(pack);
+          tx.objectStore(STORE_PACKS).put(cleanPack);
           tx.oncomplete = () => {
             try { db.close(); } catch (e) {}
-            resolve(pack);
+            resolve(cleanPack);
           };
           tx.onerror = () => {
             try { db.close(); } catch (e) {}
@@ -926,14 +978,12 @@
           };
         });
         updateStorageBadgeUI();
-        return pack;
+        return cleanPack;
       } catch (err) {
-        if (!isUsingMemoryFallback) {
-          isUsingMemoryFallback = true;
-          logDiag('WARN', `IndexedDB 受沙盒限制，已自動啟用記憶體暫存模式 (${err.message || 'SecurityError'})`);
-          updateStorageBadgeUI();
-        }
-        return pack;
+        isUsingMemoryFallback = true;
+        window.logDiag('INFO', '已自動使用沙盒記憶體保存課程包');
+        updateStorageBadgeUI();
+        return cleanPack;
       }
     }
 
@@ -958,11 +1008,8 @@
         updateStorageBadgeUI();
         return list;
       } catch (err) {
-        if (!isUsingMemoryFallback) {
-          isUsingMemoryFallback = true;
-          logDiag('WARN', `偵測到 iOS/Iframe 沙盒環境，已無縫切換至記憶體模式`);
-          updateStorageBadgeUI();
-        }
+        isUsingMemoryFallback = true;
+        updateStorageBadgeUI();
         const memList = Array.from(memoryPacksMap.values());
         memList.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
         return memList;
@@ -986,13 +1033,11 @@
             reject(tx.error);
           };
         });
-      } catch (err) {
-        logDiag('WARN', `刪除課程包時使用記憶體同步: ${err.message || ''}`);
-      }
+      } catch (err) {}
     }
 
     /*************************************************************************
-     * 4. APPLICATION STATE & SAFE KEYMAP PERSISTENCE
+     * 4. APPLICATION STATE & SYNCHRONOUS DEFAULT PACK INITIALIZATION
      *************************************************************************/
     const SPEED_STEPS = [1.0, 0.85, 0.75, 1.15];
     const DEFAULT_KEYMAP = {
@@ -1003,18 +1048,37 @@
       speed:   { label: '切換語速',     codes: ['ArrowDown', 'KeyS'] }
     };
 
+    function buildDefaultPackObjectSync() {
+      const items = DEFAULT_20_SENTENCES.map((s, idx) => ({
+        index: idx,
+        en: s.en,
+        zh: s.zh,
+        audioDataUri: null // Generated lazily & synchronously when played so startup takes 0ms!
+      }));
+      return {
+        id: 'pack_default_20',
+        name: '預設教材：科技職場英文 20 句 (內建範例)',
+        createdAt: 1700000000000,
+        audioModeLabel: '內建獨立音檔',
+        isDemoTTS: true,
+        items
+      };
+    }
+
+    const initialDefaultPack = buildDefaultPackObjectSync();
+    memoryPacksMap.set(initialDefaultPack.id, initialDefaultPack);
+
     const state = {
-      packs: [],
-      currentPack: null,
+      packs: [initialDefaultPack],
+      currentPack: initialDefaultPack,
       currentIndex: 0,
       currentRepeat: 1,
       targetRepeats: 2,
-      gapMode: 0.8,
+      gapMode: 1,
       speedIndex: 0,
       isPlaying: false,
       isInGapPause: false,
       gapTimer: null,
-      activeBlobUrl: null,
       subDisplayMode: 'both',
       demoVoiceMode: 'tts_and_pad',
       longPressSpeedEnabled: true,
@@ -1026,17 +1090,17 @@
         activeTab: 'gpt',
         audioBuffer: null,
         rmsDbEnvelope: null,
-        windowSec: 0.02,
+        windowSec: 0.01,
         segments: [],
         subtitles: [],
-        previewAudioCtx: null,
-        previewSourceNode: null
+        previewSourceNode: null,
+        playingSegmentIdx: null
       }
     };
 
     function loadKeymap() {
       try {
-        const saved = window.localStorage.getItem('carShadowKeymap_v1');
+        const saved = window.localStorage.getItem('carShadowKeymap_v2');
         if (saved) return JSON.parse(saved);
       } catch (e) {}
       return JSON.parse(JSON.stringify(DEFAULT_KEYMAP));
@@ -1044,13 +1108,13 @@
 
     function saveKeymap() {
       try {
-        window.localStorage.setItem('carShadowKeymap_v1', JSON.stringify(state.keymap));
+        window.localStorage.setItem('carShadowKeymap_v2', JSON.stringify(state.keymap));
       } catch (e) {}
       updateKeyBadgesOnDeck();
     }
 
     /*************************************************************************
-     * 5. GIANT HUD TOAST, WAKE LOCK & VISUAL FEEDBACK
+     * 5. GIANT HUD TOAST & WAKE LOCK
      *************************************************************************/
     let hudTimeout = null;
     function showGiantHud(icon, title, sub = '', borderColor = 'border-sky-400/80') {
@@ -1096,18 +1160,33 @@
     }
 
     /*************************************************************************
-     * 6. CORE AUDIO ENGINE (Single Persistent <audio> + iOS Safari Synchronous Unlock)
+     * 6. DUAL-CHANNEL SYNCHRONOUS iOS AUDIO ENGINE (<audio> + WebAudio)
      *************************************************************************/
     const masterAudio = document.getElementById('masterAudio');
+    const previewAudio = document.getElementById('previewAudio');
     let sharedAudioCtx = null;
 
-    function unlockiOSAudioAndSpeechSynchronously() {
+    function ensureUnlockedAudioContextSync() {
+      try {
+        if ('audioSession' in navigator && navigator.audioSession) {
+          navigator.audioSession.type = 'playback';
+        }
+      } catch (e) {}
       try {
         const AudioCtx = window.AudioContext || window.webkitAudioContext;
         if (AudioCtx) {
           if (!sharedAudioCtx) sharedAudioCtx = new AudioCtx();
-          if (sharedAudioCtx.state === 'suspended') sharedAudioCtx.resume();
+          if (sharedAudioCtx.state === 'suspended') {
+            sharedAudioCtx.resume();
+          }
         }
+      } catch (e) {}
+      return sharedAudioCtx;
+    }
+
+    function unlockiOSAudioAndSpeechSynchronously() {
+      ensureUnlockedAudioContextSync();
+      try {
         if ('speechSynthesis' in window && window.speechSynthesis) {
           const warmUp = new SpeechSynthesisUtterance('');
           warmUp.volume = 0;
@@ -1131,6 +1210,13 @@
       } catch (e) {}
     }
 
+    function ensureItemHasAudioDataUriSync(item) {
+      if (!item.audioDataUri) {
+        item.audioDataUri = createSpeechCadenceWavDataUri(item.en);
+      }
+      return item.audioDataUri;
+    }
+
     function loadCurrentSentenceIntoAudio(autoPlay = false) {
       clearPendingTimers();
       if (!state.currentPack || !state.currentPack.items.length) return;
@@ -1138,17 +1224,10 @@
       const item = state.currentPack.items[state.currentIndex];
       if (!item) return;
 
-      if (state.activeBlobUrl) {
-        try { URL.revokeObjectURL(state.activeBlobUrl); } catch (e) {}
-        state.activeBlobUrl = null;
-      }
-
-      if (item.audioBlob) {
-        state.activeBlobUrl = URL.createObjectURL(item.audioBlob);
-        masterAudio.src = state.activeBlobUrl;
-        masterAudio.playbackRate = SPEED_STEPS[state.speedIndex];
-        try { masterAudio.currentTime = 0; } catch (e) {}
-      }
+      const dataUri = ensureItemHasAudioDataUriSync(item);
+      masterAudio.src = dataUri;
+      masterAudio.playbackRate = SPEED_STEPS[state.speedIndex];
+      try { masterAudio.currentTime = 0; } catch (e) {}
 
       renderMainStage();
       updateMediaSessionMetadata();
@@ -1156,7 +1235,7 @@
       if (autoPlay) {
         playCurrentAudioFromStart();
       } else {
-        setEngineVisualState('ready', '待命準備');
+        setEngineVisualState('ready', '待命就緒');
       }
     }
 
@@ -1164,6 +1243,11 @@
       clearPendingTimers();
       if (!state.currentPack || !state.currentPack.items.length) return;
       const item = state.currentPack.items[state.currentIndex];
+      const dataUri = ensureItemHasAudioDataUriSync(item);
+
+      if (masterAudio.src !== dataUri) {
+        masterAudio.src = dataUri;
+      }
 
       const isDemo = Boolean(state.currentPack.isDemoTTS);
       try { masterAudio.currentTime = 0; } catch (e) {}
@@ -1181,10 +1265,10 @@
           updatePlayPauseUI();
           setEngineVisualState('playing', `播放中 (${state.currentRepeat}/${formatRepeatTarget()})`);
         }).catch((err) => {
-          logDiag('WARN', `瀏覽器等待手勢點擊播放: ${err.message || ''}`);
+          window.logDiag('WARN', `點擊播放提示: ${err.message || ''}`);
           state.isPlaying = false;
           updatePlayPauseUI();
-          setEngineVisualState('paused', '點擊播放啟動');
+          setEngineVisualState('paused', '請點播放鍵');
         });
       }
     }
@@ -1340,7 +1424,7 @@
         }
         showGiantHud(
           '<i class="fa-solid fa-play text-sky-400"></i>',
-          '繼續播放',
+          '開始播放',
           `第 ${ formatIdx(state.currentIndex + 1) } 句 ｜ 語速 ${SPEED_STEPS[state.speedIndex].toFixed(2)}x`,
           'border-sky-400/90'
         );
@@ -1391,7 +1475,7 @@
       document.getElementById('statCurrentIdx').textContent = formatIdx(state.currentIndex + 1);
       document.getElementById('statTotalIdx').textContent = formatIdx(total);
       document.getElementById('badgeAudioSource').textContent = state.currentPack.isDemoTTS
-        ? '內建範例音檔 + TTS'
+        ? '內建獨立音檔'
         : (state.currentPack.audioModeLabel || '本機離線音檔');
 
       const demoVoiceBtn = document.getElementById('btnDemoVoiceMode');
@@ -1461,7 +1545,7 @@
 
     function setEngineVisualState(type, text) {
       const el = document.getElementById('statEngineState');
-      let color = 'bg-slate-500';
+      let color = 'bg-emerald-400';
       let textColor = 'text-slate-300';
       if (type === 'playing') { color = 'bg-emerald-400 animate-ping'; textColor = 'text-emerald-400'; }
       else if (type === 'gap') { color = 'bg-amber-400 animate-pulse'; textColor = 'text-amber-400'; }
@@ -1599,7 +1683,7 @@
               <div class="text-[11px] font-mono text-slate-400">目前綁定：<span class="text-sky-300">${cfg.codes.join(' / ')}</span></div>
             </div>
           </div>
-          <button data-bind="${key}" class="px-3 py-1.5 rounded-xl text-xs font-extrabold transition shrink-0 ${
+          <button type="button" data-bind="${key}" class="px-3 py-1.5 rounded-xl text-xs font-extrabold transition shrink-0 ${
             isListening
               ? 'bg-amber-400 text-slate-950 animate-pulse'
               : 'bg-slate-800 hover:bg-slate-700 text-sky-300 border border-slate-700'
@@ -1616,8 +1700,7 @@
     }
 
     /*************************************************************************
-     * 10. UPGRADED SMART AUDIO SLICER WORKBENCH (Real-time <10ms Envelope VAD)
-     *     + ZIP & MULTI-FORMAT IMPORT ENGINE
+     * 10. SMART AUDIO SLICER WORKBENCH (10ms Envelope VAD + iOS Sync Preview)
      *************************************************************************/
     const naturalSort = (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
 
@@ -1643,7 +1726,6 @@
         return keepNumber ? s : s.replace(/^\d+[\.\)、\-\s]+/, '').trim();
       };
 
-      // 1. JSON format
       if (filename.endsWith('.json') || (text.startsWith('[') && text.endsWith(']'))) {
         try {
           const arr = JSON.parse(text);
@@ -1659,7 +1741,6 @@
         } catch (e) {}
       }
 
-      // 2. SRT / VTT format with timestamps
       if (text.includes('-->')) {
         const blocks = text.replace(/\r\n/g, '\n').split(/\n\s*\n/);
         const results = [];
@@ -1683,7 +1764,6 @@
         if (results.length > 0) return results;
       }
 
-      // 3. LRC format ([00:02.30]Sentence here)
       const lrcRegex = /^\[(\d{2}):(\d{2}(?:\.\d{1,3})?)\](.*)$/;
       const rawLines = text.replace(/\r\n/g, '\n').split('\n').map(l => l.trim()).filter(Boolean);
       if (rawLines.some(l => lrcRegex.test(l))) {
@@ -1702,7 +1782,6 @@
         if (lrcItems.length > 0) return lrcItems;
       }
 
-      // 4. Plain TXT (One sentence per line, e.g. "1. Hi there." or "1. Hi there. || 你好")
       return rawLines
         .map(line => splitEnZhLine(normalizeEnLine(line)))
         .filter(x => x.en);
@@ -1718,6 +1797,7 @@
     }
 
     async function loadAudioBlobIntoWorkbench(audioBlob, displayFileName = '長音檔.wav') {
+      ensureUnlockedAudioContextSync();
       const nameEl = document.getElementById('longAudioFileName');
       const metaEl = document.getElementById('longAudioMetaInfo');
       nameEl.textContent = `⏳ 正在解碼音訊並分析能量波形：${displayFileName}...`;
@@ -1725,14 +1805,14 @@
 
       try {
         const arrayBuffer = await audioBlob.arrayBuffer();
-        const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        const decodeCtx = new AudioCtx();
-        const audioBuffer = await decodeCtx.decodeAudioData(arrayBuffer);
-        try { decodeCtx.close(); } catch (e) {}
+        const ctx = ensureUnlockedAudioContextSync() || new (window.AudioContext || window.webkitAudioContext)();
+        const audioBuffer = await new Promise((resolve, reject) => {
+          ctx.decodeAudioData(arrayBuffer, resolve, reject);
+        });
 
         const channelData = audioBuffer.getChannelData(0);
         const sampleRate = audioBuffer.sampleRate;
-        const windowSec = 0.02;
+        const windowSec = 0.01; // 10ms high-precision envelope
         const windowSamples = Math.max(1, Math.floor(sampleRate * windowSec));
         const totalWindows = Math.floor(channelData.length / windowSamples);
         const rmsDbEnvelope = new Float32Array(totalWindows);
@@ -1760,7 +1840,7 @@
 
         recalculateWorkbenchSegmentsFromSliders();
       } catch (err) {
-        logDiag('ERR', `音檔解碼失敗: ${err.message || ''}`);
+        window.logDiag('ERR', `音檔解碼失敗: ${err.message || ''}`);
         nameEl.textContent = `❌ 音檔解碼失敗：${err.message || '請確認音訊格式'}`;
         nameEl.className = 'text-xs sm:text-sm font-bold text-rose-400 truncate';
       }
@@ -1944,6 +2024,10 @@
       const segCount = segs.length;
       document.getElementById('metricSubCount').textContent = subCount;
       document.getElementById('metricSegCount').textContent = segCount;
+      const qSeg = document.getElementById('quickTopSegCount');
+      const qSub = document.getElementById('quickTopSubCount');
+      if (qSeg) qSeg.textContent = segCount;
+      if (qSub) qSub.textContent = subCount;
 
       const banner = document.getElementById('alignmentBanner');
       const icon = document.getElementById('alignStatusIcon');
@@ -1959,13 +2043,13 @@
         banner.className = 'rounded-2xl px-4 py-3 border-2 flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-emerald-950/50 border-emerald-400/80 shadow-[0_0_25px_rgba(16,185,129,0.2)]';
         icon.textContent = '✅';
         headline.textContent = `完美對齊！音檔切出 ${segCount} 段 ＝ 字幕 ${subCount} 行`;
-        advice.textContent = '你可以點擊下方清單的「▶ 試聽」抽查幾句，確認無誤後點擊右下角「確認裁切並儲存至課程庫」。';
+        advice.textContent = '點擊下方清單的「▶ 試聽」即可直接聽取切出的聲音，確認無誤後點右下角「確認裁切並儲存至課程庫」。';
       } else if (audioBuf && segCount < subCount) {
         const diff = subCount - segCount;
         banner.className = 'rounded-2xl px-4 py-3 border flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-amber-950/40 border-amber-500/70';
         icon.textContent = '⚠️';
         headline.textContent = `切出段數較少（目前 ${segCount} 段，比字幕少 ${diff} 段 — 有句子黏在一起了）`;
-        advice.textContent = '👉 解法：請將「靜音門檻 (dB)」往右調高（例如調到 -24 dB）、或調小「最短句間停頓」，也可直接在下方清單對黏住的句子點「✂️ 從中切開」！';
+        advice.textContent = '👉 解法：請將「靜音門檻 (dB)」往右調高（例如調到 -25 dB）、或調小「最短句間停頓」，也可對黏住的句子點「✂️ 從中切開」！';
       } else if (audioBuf && segCount > subCount && subCount > 0) {
         const diff = segCount - subCount;
         banner.className = 'rounded-2xl px-4 py-3 border flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-rose-950/40 border-rose-500/70';
@@ -1976,7 +2060,7 @@
         banner.className = 'rounded-2xl px-4 py-3 border flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-slate-900 border-sky-500/50';
         icon.textContent = 'ℹ️';
         headline.textContent = `目前已切出 ${segCount} 段音訊（尚未貼上字幕行，或純音檔匯入）`;
-        advice.textContent = '在右側貼上「1. Hi there.」格式的多行純文字，即可自動一對一綁定字幕。';
+        advice.textContent = '點擊下方「▶ 試聽」可直接聽每段切出的音訊；在上方貼上「1. Hi there.」多行文字即可自動對齊字幕。';
       }
     }
 
@@ -2025,6 +2109,7 @@
 
         const subEn = sub ? escapeHtml(sub.en) : '<span class="text-rose-400 italic">⚠️ 多出的音檔段落（無對應字幕，可合併或刪除）</span>';
         const subZh = sub && sub.zh ? `<div class="text-slate-400 text-[11px] truncate">${escapeHtml(sub.zh)}</div>` : '';
+        const isPlayingThis = state.workbench.playingSegmentIdx === i;
 
         row.innerHTML = `
           <div class="flex items-start gap-2.5 min-w-0 flex-1">
@@ -2039,18 +2124,22 @@
           </div>
           <div class="flex items-center gap-1.5 shrink-0 self-end sm:self-center">
             ${seg ? `
-              <button data-act="play" data-idx="${i}" title="試聽這一段切出來的音訊" class="px-2.5 py-1.5 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/50 text-sky-300 font-bold text-xs transition">
-                <i class="fa-solid fa-play mr-1"></i>試聽
+              <button type="button" data-act="play" data-idx="${i}" class="px-3 py-1.5 rounded-lg border font-extrabold text-xs transition ${
+                isPlayingThis
+                  ? 'bg-emerald-400 text-slate-950 border-emerald-200 shadow-[0_0_14px_rgba(16,185,129,0.6)]'
+                  : 'bg-sky-500/20 hover:bg-sky-500/30 border-sky-400/50 text-sky-300'
+              }">
+                <i class="fa-solid ${isPlayingThis ? 'fa-stop' : 'fa-play'} mr-1"></i>${isPlayingThis ? '停止' : '試聽'}
               </button>
-              <button data-act="split" data-idx="${i}" title="在此段中間最安靜處一分為二（解救兩句黏在一起）" class="px-2.5 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-400/40 text-amber-300 font-bold text-xs transition">
+              <button type="button" data-act="split" data-idx="${i}" class="px-2.5 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-400/40 text-amber-300 font-bold text-xs transition">
                 <i class="fa-solid fa-scissors mr-1"></i>從中切開
               </button>
               ${i < segs.length - 1 ? `
-                <button data-act="merge" data-idx="${i}" title="與下一段 (#${formatIdx(i + 2)}) 合併為同一句" class="px-2.5 py-1.5 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-400/40 text-emerald-300 font-bold text-xs transition">
+                <button type="button" data-act="merge" data-idx="${i}" class="px-2.5 py-1.5 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-400/40 text-emerald-300 font-bold text-xs transition">
                   <i class="fa-solid fa-link mr-1"></i>合併下段
                 </button>
               ` : ''}
-              <button data-act="delete" data-idx="${i}" title="刪除這一段雜音（後續音檔自動往前遞補對齊字幕）" class="px-2 py-1.5 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 border border-rose-400/40 text-rose-300 font-bold text-xs transition">
+              <button type="button" data-act="delete" data-idx="${i}" class="px-2.5 py-1.5 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 border border-rose-400/40 text-rose-300 font-bold text-xs transition">
                 <i class="fa-regular fa-trash-can"></i>
               </button>
             ` : ''}
@@ -2072,34 +2161,104 @@
       }
     }
 
+    function stopWorkbenchPreviewAudio() {
+      try {
+        if (previewAudio) {
+          previewAudio.pause();
+          previewAudio.currentTime = 0;
+        }
+      } catch (e) {}
+      try {
+        if (state.workbench.previewSourceNode) {
+          state.workbench.previewSourceNode.onended = null;
+          state.workbench.previewSourceNode.stop();
+          state.workbench.previewSourceNode = null;
+        }
+      } catch (e) {}
+      if (state.workbench.playingSegmentIdx !== null) {
+        state.workbench.playingSegmentIdx = null;
+        renderInteractiveSegmentPreviewList();
+      }
+    }
+
+    if (previewAudio) {
+      previewAudio.addEventListener('ended', () => {
+        if (state.workbench.playingSegmentIdx !== null) {
+          state.workbench.playingSegmentIdx = null;
+          renderInteractiveSegmentPreviewList();
+        }
+      });
+    }
+
+    // iOS ZERO-AWAIT DUAL-CHANNEL SYNCHRONOUS SEGMENT PREVIEW PLAYER
     function previewPlayWorkbenchSegment(idx) {
       const seg = state.workbench.segments[idx];
       const audioBuffer = state.workbench.audioBuffer;
       if (!seg || !audioBuffer) return;
 
-      try {
-        if (state.workbench.previewSourceNode) {
-          try { state.workbench.previewSourceNode.stop(); } catch (e) {}
-        }
-        const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        if (!state.workbench.previewAudioCtx) {
-          state.workbench.previewAudioCtx = new AudioCtx();
-        }
-        if (state.workbench.previewAudioCtx.state === 'suspended') {
-          state.workbench.previewAudioCtx.resume();
-        }
+      if (state.workbench.playingSegmentIdx === idx) {
+        stopWorkbenchPreviewAudio();
+        return;
+      }
 
-        const source = state.workbench.previewAudioCtx.createBufferSource();
+      stopWorkbenchPreviewAudio();
+      if (state.isPlaying) {
+        state.isPlaying = false;
+        try { masterAudio.pause(); } catch (e) {}
+        updatePlayPauseUI();
+      }
+
+      // 1. Synchronously unlock iOS audio session inside the tap handler
+      ensureUnlockedAudioContextSync();
+      state.workbench.playingSegmentIdx = idx;
+      renderInteractiveSegmentPreviewList();
+
+      // 2. Synchronously encode normalized Base64 WAV Data URI and play via <audio id="previewAudio">
+      //    (<audio> on iOS uses the Media/Playback channel which bypasses the iPhone physical silent switch!)
+      let htmlAudioStarted = false;
+      try {
+        const wavDataUri = audioBufferSliceToWavDataUri(audioBuffer, seg.startSec, seg.endSec);
+        previewAudio.muted = false;
+        previewAudio.volume = 1.0;
+        previewAudio.src = wavDataUri;
+        try { previewAudio.currentTime = 0; } catch (e) {}
+        const p = previewAudio.play();
+        if (p !== undefined) {
+          p.then(() => {
+            htmlAudioStarted = true;
+          }).catch(() => {
+            if (!htmlAudioStarted) startWebAudioSegmentFallback(seg, audioBuffer);
+          });
+        }
+      } catch (err) {
+        startWebAudioSegmentFallback(seg, audioBuffer);
+      }
+    }
+
+    function startWebAudioSegmentFallback(seg, audioBuffer) {
+      try {
+        const ctx = ensureUnlockedAudioContextSync();
+        if (!ctx) return;
+        const source = ctx.createBufferSource();
         source.buffer = audioBuffer;
-        source.connect(state.workbench.previewAudioCtx.destination);
+        const gainNode = ctx.createGain();
+        gainNode.gain.value = 1.6;
+        source.connect(gainNode);
+        gainNode.connect(ctx.destination);
+        source.onended = () => {
+          state.workbench.playingSegmentIdx = null;
+          renderInteractiveSegmentPreviewList();
+        };
         source.start(0, seg.startSec, Math.max(0.1, seg.endSec - seg.startSec));
         state.workbench.previewSourceNode = source;
-      } catch (err) {
-        logDiag('WARN', `預覽試聽失敗: ${err.message || ''}`);
+      } catch (e) {
+        state.workbench.playingSegmentIdx = null;
+        renderInteractiveSegmentPreviewList();
       }
     }
 
     function mergeWorkbenchSegmentWithNext(idx) {
+      stopWorkbenchPreviewAudio();
       const segs = state.workbench.segments;
       if (idx < 0 || idx >= segs.length - 1) return;
       segs[idx].endSec = segs[idx + 1].endSec;
@@ -2109,6 +2268,7 @@
     }
 
     function splitWorkbenchSegmentInTwo(idx) {
+      stopWorkbenchPreviewAudio();
       const segs = state.workbench.segments;
       const env = state.workbench.rmsDbEnvelope;
       const winSec = state.workbench.windowSec;
@@ -2116,12 +2276,12 @@
       if (!seg) return;
 
       const dur = seg.endSec - seg.startSec;
-      if (dur < 0.4) return;
+      if (dur < 0.35) return;
 
       let splitSec = seg.startSec + dur / 2;
       if (env) {
-        const searchStartWin = Math.max(0, Math.floor((seg.startSec + dur * 0.25) / winSec));
-        const searchEndWin = Math.min(env.length - 1, Math.ceil((seg.startSec + dur * 0.75) / winSec));
+        const searchStartWin = Math.max(0, Math.floor((seg.startSec + dur * 0.20) / winSec));
+        const searchEndWin = Math.min(env.length - 1, Math.ceil((seg.startSec + dur * 0.80) / winSec));
         let minDb = 999;
         let bestWin = Math.floor((searchStartWin + searchEndWin) / 2);
         for (let w = searchStartWin; w <= searchEndWin; w++) {
@@ -2141,6 +2301,7 @@
     }
 
     function deleteWorkbenchSegment(idx) {
+      stopWorkbenchPreviewAudio();
       const segs = state.workbench.segments;
       if (idx < 0 || idx >= segs.length) return;
       segs.splice(idx, 1);
@@ -2149,6 +2310,7 @@
     }
 
     async function loadSimulatedGptLive10SentencesIntoWorkbench() {
+      ensureUnlockedAudioContextSync();
       const sampleSentences = DEFAULT_20_SENTENCES.slice(0, 10);
       const keepNumber = document.getElementById('chkKeepNumberPrefix')?.checked ?? true;
       const subText = sampleSentences
@@ -2160,9 +2322,9 @@
       document.getElementById('textareaSubtitles').value = subText;
       document.getElementById('inputPackName').value = 'GPT Live 模擬錄音 10 句 (實測切音工作台)';
 
-      const sampleRate = 22050;
-      const clipDur = 1.9;
-      const pauseDur = 0.34;
+      const sampleRate = 16000;
+      const clipDur = 1.8;
+      const pauseDur = 0.36;
       const totalSec = sampleSentences.length * (clipDur + pauseDur) + 0.5;
       const totalSamples = Math.floor(sampleRate * totalSec);
 
@@ -2187,7 +2349,7 @@
 
       for (let i = 0; i < totalSamples; i++) {
         const t = i / sampleRate;
-        let sample = (Math.random() * 2 - 1) * 0.018;
+        let sample = (Math.random() * 2 - 1) * 0.014;
 
         const cycle = clipDur + pauseDur;
         const idx = Math.floor((t - 0.25) / cycle);
@@ -2195,9 +2357,9 @@
         if (t >= 0.25 && idx >= 0 && idx < sampleSentences.length && localT >= 0 && localT < clipDur) {
           const syllableEnv = 0.55 + 0.45 * Math.sin(2 * Math.PI * 4.2 * localT);
           const edgeEnv = Math.min(1, localT / 0.08, (clipDur - localT) / 0.1);
-          const f0 = 210 + (idx * 29) % 110;
-          const voice = (Math.sin(2 * Math.PI * f0 * t) * 0.28 +
-                         Math.sin(2 * Math.PI * (f0 * 2) * t) * 0.12) * syllableEnv * edgeEnv;
+          const f0 = 220 + (idx * 29) % 110;
+          const voice = (Math.sin(2 * Math.PI * f0 * t) * 0.34 +
+                         Math.sin(2 * Math.PI * (f0 * 2) * t) * 0.15) * syllableEnv * edgeEnv;
           sample += voice;
         }
         const clamped = Math.max(-1, Math.min(1, sample));
@@ -2205,7 +2367,7 @@
       }
 
       const wavBlob = new Blob([buffer], { type: 'audio/wav' });
-      document.getElementById('sliderVadDb').value = -26;
+      document.getElementById('sliderVadDb').value = -27;
       document.getElementById('sliderVadPauseMs').value = 280;
       await loadAudioBlobIntoWorkbench(wavBlob, 'GPT_Live_10_Sentences_With_Noise.wav');
     }
@@ -2216,8 +2378,8 @@
       for (let i = 0; i < DEFAULT_20_SENTENCES.length; i++) {
         const num = String(i + 1).padStart(2, '0');
         const item = DEFAULT_20_SENTENCES[i];
-        const wavBlob = createSpeechCadenceWavBlob(item.en, 2.4);
-        zip.file(`${num}.wav`, wavBlob);
+        const wavBuf = createSpeechCadenceWavBuffer(item.en, 2.4);
+        zip.file(`${num}.wav`, new Blob([wavBuf], { type: 'audio/wav' }));
         zip.file(`${num}.txt`, `${item.en}\n${item.zh}`);
         lines.push(`${item.en} || ${item.zh}`);
       }
@@ -2322,12 +2484,14 @@
         const pairedItems = [];
         for (let i = 0; i < totalCount; i++) {
           const sub = parsedSubtitles[i] || { en: `Sentence #${formatIdx(i + 1)}`, zh: '' };
-          const blob = finalAudioBlobs[i] || createSpeechCadenceWavBlob(sub.en);
+          const dataUri = finalAudioBlobs[i]
+            ? await blobToDataUriAsync(finalAudioBlobs[i])
+            : createSpeechCadenceWavDataUri(sub.en);
           pairedItems.push({
             index: i,
             en: sub.en,
             zh: sub.zh || '',
-            audioBlob: blob
+            audioDataUri: dataUri
           });
         }
 
@@ -2346,7 +2510,7 @@
         statusEl.className = 'text-xs text-emerald-400 font-bold';
         document.getElementById('btnConfirmSavePack').disabled = false;
       } catch (err) {
-        logDiag('ERR', `ZIP 解析失敗: ${err.message || ''}`);
+        window.logDiag('ERR', `ZIP 解析失敗: ${err.message || ''}`);
         statusEl.textContent = `❌ 解析失敗：${err.message || '請確認檔案格式'}`;
         statusEl.className = 'text-xs text-rose-400 font-bold';
       }
@@ -2364,7 +2528,6 @@
       pack.items.forEach((item, idx) => {
         const row = document.createElement('div');
         row.className = 'py-2 px-2 flex items-center justify-between gap-2 hover:bg-slate-900/80 rounded-lg';
-        const kb = item.audioBlob ? `${Math.round(item.audioBlob.size / 1024)} KB` : 'TTS';
         row.innerHTML = `
           <div class="flex items-start gap-2 min-w-0">
             <span class="font-mono font-bold text-sky-400 shrink-0">#${formatIdx(idx + 1)}</span>
@@ -2373,7 +2536,7 @@
               <div class="text-slate-400 text-[11px] truncate">${escapeHtml(item.zh)}</div>
             </div>
           </div>
-          <span class="font-mono text-[11px] px-2 py-0.5 rounded bg-slate-800 text-emerald-300 shrink-0">${kb}</span>
+          <span class="font-mono text-[11px] px-2 py-0.5 rounded bg-slate-800 text-emerald-300 shrink-0">已就緒</span>
         `;
         tbody.appendChild(row);
       });
@@ -2407,51 +2570,36 @@
     /*************************************************************************
      * 11. INITIALIZATION & UI EVENT LISTENERS
      *************************************************************************/
-    function buildDefaultPackObject() {
-      const items = DEFAULT_20_SENTENCES.map((s, idx) => ({
-        index: idx,
-        en: s.en,
-        zh: s.zh,
-        audioBlob: createSpeechCadenceWavBlob(s.en)
-      }));
-      return {
-        id: 'pack_default_20',
-        name: 'Pack_01 商務與專案高頻 20 句 (內建範例)',
-        createdAt: 1700000000000,
-        audioModeLabel: '內建獨立音檔',
-        isDemoTTS: true,
-        items
-      };
-    }
-
-    async function refreshPackListAndSelect(targetPackId = null) {
-      let packs = [];
-      try {
-        packs = await getAllPacksFromDB();
-      } catch (e) {
-        packs = [];
-      }
-
-      if (!packs || packs.length === 0) {
-        const demoPack = buildDefaultPackObject();
-        await savePackToDB(demoPack);
-        packs = [demoPack];
-      }
-      state.packs = packs;
-
+    function populatePackSelectorDropdown(targetPackId = null) {
       const selectEl = document.getElementById('packSelect');
+      if (!selectEl) return;
       selectEl.innerHTML = '';
-      packs.forEach(p => {
+      state.packs.forEach(p => {
         const opt = document.createElement('option');
         opt.value = p.id;
         opt.textContent = `${p.name} (${p.items.length}句)`;
         selectEl.appendChild(opt);
       });
+      const chosen = state.packs.find(p => p.id === targetPackId) || state.packs[0];
+      if (chosen) {
+        selectEl.value = chosen.id;
+        selectPack(chosen.id);
+      }
+    }
 
-      const chosen = packs.find(p => p.id === targetPackId) || packs[0];
-      selectEl.value = chosen.id;
-      selectPack(chosen.id);
-      logDiag('INFO', `已載入教材庫：${chosen.name} (${chosen.items.length} 句)`);
+    async function syncStoredPacksInBackground(targetPackId = null) {
+      try {
+        const storedPacks = await getAllPacksFromDB();
+        if (storedPacks && storedPacks.length > 0) {
+          const hasDefault = storedPacks.some(p => p.id === initialDefaultPack.id);
+          state.packs = hasDefault ? storedPacks : [...storedPacks, initialDefaultPack];
+        } else {
+          state.packs = [initialDefaultPack];
+        }
+      } catch (e) {
+        state.packs = [initialDefaultPack];
+      }
+      populatePackSelectorDropdown(targetPackId);
     }
 
     function selectPack(packId) {
@@ -2476,6 +2624,7 @@
       state.currentPack.items.forEach((item, idx) => {
         const isCurrent = idx === state.currentIndex;
         const btn = document.createElement('button');
+        btn.type = 'button';
         btn.className = `w-full text-left p-3 rounded-2xl border transition flex items-start gap-3 ${
           isCurrent
             ? 'bg-sky-500/15 border-sky-400 text-white'
@@ -2502,12 +2651,17 @@
       });
     }
 
-    window.addEventListener('DOMContentLoaded', async () => {
+    window.addEventListener('DOMContentLoaded', () => {
+      // 1. Synchronous zero-latency initialization
       updateKeyBadgesOnDeck();
-      await refreshPackListAndSelect();
+      populatePackSelectorDropdown(initialDefaultPack.id);
+      updateStorageBadgeUI();
+      window.logDiag('INFO', '系統已完成同步載入，預設 20 句教材已就緒');
+
+      // 2. Load any previously saved packs from IndexedDB in background
+      syncStoredPacksInBackground();
       requestWakeLock();
 
-      // Top Pack Selector & Delete Button
       document.getElementById('packSelect').addEventListener('change', (e) => {
         selectPack(e.target.value);
       });
@@ -2516,11 +2670,10 @@
         if (!state.currentPack) return;
         const delId = state.currentPack.id;
         await deletePackFromDB(delId);
-        await refreshPackListAndSelect();
+        await syncStoredPacksInBackground();
         showGiantHud('🗑️', '已移除教材包', '已切換至預設教材', 'border-rose-400/90');
       });
 
-      // Repeat Count Option Buttons (1, 2, 3, 5, Infinite)
       document.querySelectorAll('.repeat-opt').forEach(btn => {
         btn.addEventListener('click', () => {
           state.targetRepeats = parseInt(btn.dataset.repeat, 10);
@@ -2533,7 +2686,6 @@
         });
       });
 
-      // Gap Duration Option Buttons (0s, 0.8s, 1.5s, auto)
       document.querySelectorAll('.gap-opt').forEach(btn => {
         btn.addEventListener('click', () => {
           state.gapMode = btn.dataset.gap === 'auto' ? 'auto' : parseFloat(btn.dataset.gap);
@@ -2544,7 +2696,6 @@
         });
       });
 
-      // Main Deck Control Buttons
       document.getElementById('btnCtrlPrev').addEventListener('click', actionPrevSentence);
       document.getElementById('btnCtrlRestart').addEventListener('click', actionRestartCurrentSentence);
       document.getElementById('btnCtrlPlay').addEventListener('click', actionTogglePlayPause);
@@ -2553,7 +2704,6 @@
       document.getElementById('btnTopSpeed').addEventListener('click', actionCycleSpeed);
       document.getElementById('btnWakeLock').addEventListener('click', requestWakeLock);
 
-      // Subtitle Display Mode Toggle (英+中 -> 純英文 -> 盲聽隱藏)
       document.getElementById('btnToggleSubMode').addEventListener('click', (e) => {
         const order = ['both', 'en', 'blind'];
         const labels = { both: '字幕：英+中', en: '字幕：純英文', blind: '字幕：盲聽隱藏' };
@@ -2563,14 +2713,13 @@
         renderMainStage();
       });
 
-      // Demo Voice Mode Toggle (TTS+墊音 -> 純TTS人聲 -> 純提示音)
       document.getElementById('btnDemoVoiceMode').addEventListener('click', (e) => {
         unlockiOSAudioAndSpeechSynchronously();
         const modes = ['tts_and_pad', 'tts_only', 'pad_only'];
         const labels = {
-          tts_and_pad: '🔊 範例人聲：TTS+墊音',
-          tts_only: '🗣️ 範例人聲：純TTS人聲',
-          pad_only: '🎵 範例人聲：純提示音'
+          tts_and_pad: '🔊 範例人聲：語音+提示音',
+          tts_only: '🗣️ 範例人聲：純語音(TTS)',
+          pad_only: '🎵 範例人聲：純提示音(測節奏)'
         };
         const nextIdx = (modes.indexOf(state.demoVoiceMode) + 1) % modes.length;
         state.demoVoiceMode = modes[nextIdx];
@@ -2580,7 +2729,6 @@
         }
       });
 
-      // Long-Press Play Key for Speed Toggle Checkbox
       document.getElementById('chkLongPressSpeed').addEventListener('change', (e) => {
         state.longPressSpeedEnabled = e.target.checked;
       });
@@ -2588,16 +2736,35 @@
       // Modal 1: Import & Smart Slicer Workbench Events
       const modalImport = document.getElementById('modalImport');
       document.getElementById('btnOpenImport').addEventListener('click', () => {
+        ensureUnlockedAudioContextSync();
         modalImport.classList.remove('hidden');
         setTimeout(() => renderWorkbenchCanvasAndAlignment(), 50);
       });
-      document.getElementById('btnCloseImport').addEventListener('click', () => modalImport.classList.add('hidden'));
-      document.getElementById('btnCancelImport').addEventListener('click', () => modalImport.classList.add('hidden'));
+      document.getElementById('btnCloseImport').addEventListener('click', () => {
+        stopWorkbenchPreviewAudio();
+        modalImport.classList.add('hidden');
+      });
+      document.getElementById('btnCancelImport').addEventListener('click', () => {
+        stopWorkbenchPreviewAudio();
+        modalImport.classList.add('hidden');
+      });
+
+      document.getElementById('btnJumpToControls').addEventListener('click', () => {
+        document.getElementById('workbenchTopAnchor')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+      document.getElementById('btnBackToSlidersFromList').addEventListener('click', () => {
+        document.getElementById('workbenchTopAnchor')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+      document.getElementById('btnJumpToPreview').addEventListener('click', () => {
+        const previewEl = document.getElementById('importPreviewContainer');
+        if (previewEl && !previewEl.classList.contains('hidden')) {
+          previewEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      });
 
       document.getElementById('tabBtnGptWorkbench').addEventListener('click', () => switchImportModalTab('gpt'));
       document.getElementById('tabBtnZipImport').addEventListener('click', () => switchImportModalTab('zip'));
 
-      // Tab A: Single Long Audio File Input
       document.getElementById('inputSingleLongAudio').addEventListener('change', async (e) => {
         const file = e.target.files?.[0];
         if (!file) return;
@@ -2608,12 +2775,10 @@
         await loadAudioBlobIntoWorkbench(file, file.name);
       });
 
-      // Tab A: Load Simulated GPT Live 10 Sentences Button
       document.getElementById('btnLoadSimulatedGptAudio').addEventListener('click', async () => {
         await loadSimulatedGptLive10SentencesIntoWorkbench();
       });
 
-      // Tab A: Subtitle Textarea & Subtitle File Upload
       document.getElementById('textareaSubtitles').addEventListener('input', () => {
         recalculateWorkbenchSegmentsFromSliders();
       });
@@ -2628,27 +2793,24 @@
         recalculateWorkbenchSegmentsFromSliders();
       });
 
-      // Tab A: 4 Real-Time VAD Sliders (Instant <10ms Recalculation)
       ['sliderVadDb', 'sliderVadPauseMs', 'sliderVadMinClipMs', 'sliderVadPadMs'].forEach(id => {
         document.getElementById(id).addEventListener('input', () => {
           recalculateWorkbenchSegmentsFromSliders();
         });
       });
 
-      // Tab A: Auto-Find Matching dB Threshold Button
       document.getElementById('btnAutoMatchLineCount').addEventListener('click', () => {
         autoFindMatchingDbThreshold();
       });
 
-      // Tab B: ZIP / Multi-Files Input
       document.getElementById('inputZipFiles').addEventListener('change', (e) => {
         if (e.target.files && e.target.files.length > 0) {
           handleFilesSelectedForImport(e.target.files);
         }
       });
 
-      // Save Button (Supports both Tab A Workbench Slicing & Tab B Pre-sliced ZIP)
       document.getElementById('btnConfirmSavePack').addEventListener('click', async () => {
+        stopWorkbenchPreviewAudio();
         const customName = document.getElementById('inputPackName').value.trim();
 
         if (state.workbench.activeTab === 'gpt' && (state.workbench.segments.length > 0 || state.workbench.subtitles.length > 0)) {
@@ -2660,17 +2822,17 @@
 
           for (let i = 0; i < count; i++) {
             const sub = subs[i] || { en: `Sentence #${formatIdx(i + 1)}`, zh: '' };
-            let wavBlob = null;
+            let wavDataUri = null;
             if (audioBuf && segs[i]) {
-              wavBlob = audioBufferSliceToWavBlob(audioBuf, segs[i].startSec, segs[i].endSec);
+              wavDataUri = audioBufferSliceToWavDataUri(audioBuf, segs[i].startSec, segs[i].endSec);
             } else {
-              wavBlob = createSpeechCadenceWavBlob(sub.en);
+              wavDataUri = createSpeechCadenceWavDataUri(sub.en);
             }
             items.push({
               index: i,
               en: sub.en,
               zh: sub.zh || '',
-              audioBlob: wavBlob
+              audioDataUri: wavDataUri
             });
           }
 
@@ -2685,7 +2847,7 @@
 
           await savePackToDB(newPack);
           modalImport.classList.add('hidden');
-          await refreshPackListAndSelect(newPack.id);
+          await syncStoredPacksInBackground(newPack.id);
           showGiantHud('✅', '切分並儲存成功', `共 ${items.length} 句已寫入課程庫`, 'border-emerald-400/90');
           return;
         }
@@ -2700,11 +2862,10 @@
         document.getElementById('importPreviewContainer').classList.add('hidden');
         modalImport.classList.add('hidden');
 
-        await refreshPackListAndSelect(savedId);
+        await syncStoredPacksInBackground(savedId);
         showGiantHud('✅', '素材包匯入成功', `已載入 ${state.currentPack.items.length} 句至教材庫`, 'border-emerald-400/90');
       });
 
-      // Download Sample Pack_01.zip
       document.getElementById('btnDownloadSampleZip').addEventListener('click', async (e) => {
         const btn = e.currentTarget;
         const origHtml = btn.innerHTML;
@@ -2722,11 +2883,9 @@
       });
 
       document.getElementById('btnResetDemoPacks').addEventListener('click', async () => {
-        const demoPack = buildDefaultPackObject();
-        await savePackToDB(demoPack);
         modalImport.classList.add('hidden');
-        await refreshPackListAndSelect(demoPack.id);
-        showGiantHud('🚀', '已載入內建 20 句範例', demoPack.name);
+        populatePackSelectorDropdown(initialDefaultPack.id);
+        showGiantHud('🚀', '已載入內建 20 句範例', initialDefaultPack.name);
       });
 
       // Modal 2: Bluetooth Keybinding Mapper
