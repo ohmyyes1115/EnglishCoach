@@ -254,7 +254,20 @@
             🔊 範例人聲：語音+提示音
           </button>
         </div>
-        <div class="flex items-center gap-1.5 ml-auto">
+        <div class="flex items-center gap-1.5 flex-wrap ml-auto">
+          <!-- Dynamic Live Merge Next Sentence Controls (Fixes Mis-sliced Sentences on the Fly) -->
+          <div class="inline-flex items-center rounded-lg bg-emerald-950/80 border border-emerald-500/50 p-0.5">
+            <button id="btnMergeWithNext" type="button" title="將目前這句與下一句音檔無縫合併，並立即從頭重播 (快捷鍵 M)" class="px-2.5 py-1 rounded-md bg-emerald-500/25 hover:bg-emerald-500/40 active:scale-95 text-emerald-200 font-sans font-extrabold transition flex items-center gap-1">
+              <i class="fa-solid fa-link"></i>
+              <span>合併下句</span>
+            </button>
+            <button id="btnToggleMergeMode" type="button" title="點擊切換合併模式：僅合音檔(修復後續字幕錯位) vs 音檔+字幕同合" class="px-2 py-1 rounded-md hover:bg-slate-800/80 text-[11px] text-emerald-300/90 font-sans font-semibold transition border-l border-emerald-500/30">
+              模式:僅合音檔(修錯位)
+            </button>
+          </div>
+          <button id="btnUndoMerge" type="button" title="復原上一次的合併動作" class="hidden px-2.5 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 border border-rose-400/50 text-rose-200 font-sans font-bold transition">
+            ↩️ 復原
+          </button>
           <button id="btnBalanceCourseVolume" type="button" title="將目前教材所有句子統一均衡至 -16 dBFS 人聲響度" class="px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-400/50 text-amber-300 font-sans font-bold transition">
             🎚️ 平衡音量
           </button>
@@ -1094,6 +1107,146 @@
     }
 
     /**
+     * FAST SYNCHRONOUS 16-BIT PCM WAV PARSER & CONCATENATOR (< 5ms)
+     * Seamlessly joins two WAV Data URIs, runs Active Speech RMS Normalization (-16 dBFS) + Soft Limiter,
+     * and returns { dataUri, durationSec }. Falls back to WebAudio decode if non-WAV format.
+     */
+    function extractPcmFloat32FromWavBufferSync(arrayBuffer) {
+      if (!arrayBuffer || arrayBuffer.byteLength < 44) return null;
+      const view = new DataView(arrayBuffer);
+      // Verify "RIFF" and "WAVE"
+      if (view.getUint32(0, false) !== 0x52494646 || view.getUint32(8, false) !== 0x57415645) {
+        return null;
+      }
+      let offset = 12;
+      let sampleRate = 16000;
+      let numChannels = 1;
+      let bitsPerSample = 16;
+
+      while (offset + 8 <= view.byteLength) {
+        const chunkId = view.getUint32(offset, false);
+        const chunkSize = view.getUint32(offset + 4, true);
+        if (chunkId === 0x666d7420) { // "fmt "
+          numChannels = view.getUint16(offset + 10, true) || 1;
+          sampleRate = view.getUint32(offset + 12, true) || 16000;
+          bitsPerSample = view.getUint16(offset + 22, true) || 16;
+        } else if (chunkId === 0x64617461) { // "data"
+          const dataStart = offset + 8;
+          const availableBytes = Math.min(chunkSize, view.byteLength - dataStart);
+          if (bitsPerSample !== 16 || availableBytes <= 0) return null;
+          const totalFrames = Math.floor(availableBytes / (2 * numChannels));
+          const floatSamples = new Float32Array(totalFrames);
+          let bytePos = dataStart;
+          for (let i = 0; i < totalFrames; i++) {
+            let sum = 0;
+            for (let c = 0; c < numChannels; c++) {
+              sum += view.getInt16(bytePos, true) / 32768;
+              bytePos += 2;
+            }
+            floatSamples[i] = sum / numChannels;
+          }
+          return { samples: floatSamples, sampleRate };
+        }
+        offset += 8 + chunkSize + (chunkSize % 2);
+      }
+      return null;
+    }
+
+    function encodeFloat32SamplesToWavDataUriSync(samples, sampleRate, normMode = 'rms') {
+      const normalized = normalizeAudioSlice(samples, sampleRate, normMode, 1.0);
+      const outFrames = normalized.length;
+      const buffer = new ArrayBuffer(44 + outFrames * 2);
+      const view = new DataView(buffer);
+      const writeString = (off, str) => {
+        for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i));
+      };
+      writeString(0, 'RIFF');
+      view.setUint32(4, 36 + outFrames * 2, true);
+      writeString(8, 'WAVE');
+      writeString(12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * 2, true);
+      view.setUint16(32, 2, true);
+      view.setUint16(34, 16, true);
+      writeString(36, 'data');
+      view.setUint32(40, outFrames * 2, true);
+
+      for (let i = 0; i < outFrames; i++) {
+        const s = Math.max(-1, Math.min(1, normalized[i]));
+        view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      }
+      return {
+        dataUri: wavArrayBufferToDataUriSync(buffer),
+        durationSec: outFrames / sampleRate
+      };
+    }
+
+    function resampleFloat32Linear(samples, fromRate, toRate) {
+      if (fromRate === toRate) return samples;
+      const ratio = fromRate / toRate;
+      const outLen = Math.max(1, Math.round(samples.length / ratio));
+      const out = new Float32Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        const srcPos = i * ratio;
+        const idx0 = Math.floor(srcPos);
+        const idx1 = Math.min(samples.length - 1, idx0 + 1);
+        const frac = srcPos - idx0;
+        out[i] = samples[idx0] * (1 - frac) + samples[idx1] * frac;
+      }
+      return out;
+    }
+
+    function concatTwoWavDataUrisSync(uriA, uriB) {
+      try {
+        const bufA = dataUriToArrayBufferSync(uriA);
+        const bufB = dataUriToArrayBufferSync(uriB);
+        const pcmA = extractPcmFloat32FromWavBufferSync(bufA);
+        const pcmB = extractPcmFloat32FromWavBufferSync(bufB);
+        if (!pcmA || !pcmB) return null;
+
+        const targetRate = pcmA.sampleRate;
+        const samplesA = pcmA.samples;
+        const samplesB = pcmB.sampleRate === targetRate
+          ? pcmB.samples
+          : resampleFloat32Linear(pcmB.samples, pcmB.sampleRate, targetRate);
+
+        // Add 45ms smooth bridge between the two slices
+        const gapSamples = Math.floor(targetRate * 0.045);
+        const merged = new Float32Array(samplesA.length + gapSamples + samplesB.length);
+        merged.set(samplesA, 0);
+        merged.set(samplesB, samplesA.length + gapSamples);
+
+        return encodeFloat32SamplesToWavDataUriSync(merged, targetRate, 'rms');
+      } catch (e) {
+        return null;
+      }
+    }
+
+    async function concatTwoAudioDataUrisAsyncFallback(uriA, uriB) {
+      const syncResult = concatTwoWavDataUrisSync(uriA, uriB);
+      if (syncResult) return syncResult;
+
+      const ctx = ensureUnlockedAudioContextSync() || new (window.AudioContext || window.webkitAudioContext)();
+      const rawA = dataUriToArrayBufferSync(uriA);
+      const rawB = dataUriToArrayBufferSync(uriB);
+      const decA = await new Promise((res, rej) => ctx.decodeAudioData(rawA.slice(0), res, rej));
+      const decB = await new Promise((res, rej) => ctx.decodeAudioData(rawB.slice(0), res, rej));
+
+      const targetRate = 16000;
+      const sA = resampleFloat32Linear(decA.getChannelData(0), decA.sampleRate, targetRate);
+      const sB = resampleFloat32Linear(decB.getChannelData(0), decB.sampleRate, targetRate);
+      const gapSamples = Math.floor(targetRate * 0.045);
+      const merged = new Float32Array(sA.length + gapSamples + sB.length);
+      merged.set(sA, 0);
+      merged.set(sB, sA.length + gapSamples);
+
+      return encodeFloat32SamplesToWavDataUriSync(merged, targetRate, 'rms');
+    }
+
+    /**
      * 1-CLICK COURSE VOLUME BALANCER (For Already-Imported Courses)
      * Equalizes all sentences in state.currentPack to -16 dBFS active speech RMS without re-importing!
      */
@@ -1324,11 +1477,12 @@
      *************************************************************************/
     const SPEED_STEPS = [1.0, 0.9, 0.8, 0.75, 1.15, 1.25];
     const DEFAULT_KEYMAP = {
-      prev:    { label: '上一句',       codes: ['ArrowLeft', 'PageUp', 'MediaTrackPrevious'] },
-      restart: { label: '回到這句開頭', codes: ['ArrowUp', 'KeyR', 'Backspace'] },
-      play:    { label: '播放 / 暫停 (長按調速)', codes: ['Space', 'Enter', 'MediaPlayPause'] },
-      next:    { label: '下一句',       codes: ['ArrowRight', 'PageDown', 'MediaTrackNext'] },
-      speed:   { label: '切換語速',     codes: ['ArrowDown', 'KeyS'] }
+      prev:      { label: '上一句',       codes: ['ArrowLeft', 'PageUp', 'MediaTrackPrevious'] },
+      restart:   { label: '回到這句開頭', codes: ['ArrowUp', 'KeyR', 'Backspace'] },
+      play:      { label: '播放 / 暫停 (長按調速)', codes: ['Space', 'Enter', 'MediaPlayPause'] },
+      next:      { label: '下一句',       codes: ['ArrowRight', 'PageDown', 'MediaTrackNext'] },
+      speed:     { label: '切換語速',     codes: ['ArrowDown', 'KeyS'] },
+      mergeNext: { label: '動態合併下一句', codes: ['KeyM'] }
     };
 
     function buildDefaultPackObjectSync() {
@@ -1365,6 +1519,8 @@
       gapTimer: null,
       subDisplayMode: 'both',
       demoVoiceMode: 'tts_and_pad',
+      liveMergeMode: 'audio_shift', // 'audio_shift' (僅合音檔並往前遞補修復錯位) | 'audio_and_sub' (音檔+字幕同合)
+      mergeUndoStack: [],
       longPressSpeedEnabled: true,
       keymap: loadKeymap(),
       listeningAction: null,
@@ -1398,7 +1554,10 @@
     function loadKeymap() {
       try {
         const saved = window.localStorage.getItem('carShadowKeymap_v2');
-        if (saved) return JSON.parse(saved);
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          return Object.assign(JSON.parse(JSON.stringify(DEFAULT_KEYMAP)), parsed);
+        }
       } catch (e) {}
       return JSON.parse(JSON.stringify(DEFAULT_KEYMAP));
     }
@@ -1476,6 +1635,19 @@
       const demoBtn = document.getElementById('btnDemoVoiceMode');
       if (demoBtn) {
         demoBtn.classList.toggle('hidden', !state.currentPack.isDemoTTS);
+      }
+
+      const mergeBtn = document.getElementById('btnMergeWithNext');
+      if (mergeBtn) {
+        const canMerge = state.currentIndex < total - 1;
+        mergeBtn.disabled = !canMerge;
+        mergeBtn.classList.toggle('opacity-40', !canMerge);
+        mergeBtn.classList.toggle('pointer-events-none', !canMerge);
+      }
+
+      const undoBtn = document.getElementById('btnUndoMerge');
+      if (undoBtn) {
+        undoBtn.classList.toggle('hidden', state.mergeUndoStack.length === 0);
       }
 
       if (item.durationSec && isFinite(item.durationSec)) {
@@ -2080,6 +2252,164 @@
       );
     }
 
+    /**
+     * LIVE DYNAMIC MERGE WITH NEXT SENTENCE (WHILE PLAYING)
+     * Supports 2 modes:
+     * 1. 'audio_shift' (僅合音檔修復錯位): Concatenates current clip i + clip i+1, keeps subtitle i intact,
+     *    and shifts all subsequent audio clips (i+2, i+3...) forward by 1 to fix misaligned subtitles!
+     * 2. 'audio_and_sub' (音檔+字幕同合): Concatenates both audio and En/Zh text of i and i+1.
+     */
+    async function actionMergeCurrentWithNextSentence() {
+      unlockiOSAudioAndSpeechSynchronously();
+      if (!state.currentPack || !state.currentPack.items || state.currentPack.items.length < 2) {
+        showGiantHud('⚠️', '無法合併下一句', '目前已無下一句可供合併', 'border-amber-400/90');
+        return;
+      }
+
+      const idx = state.currentIndex;
+      const items = state.currentPack.items;
+      if (idx >= items.length - 1) {
+        showGiantHud('⚠️', '已是最後一句', '最後一句無法再往後合併', 'border-amber-400/90');
+        return;
+      }
+
+      // Pause active timers while splicing
+      clearPendingTimers();
+      try { masterAudio.pause(); } catch (e) {}
+
+      // Save deep snapshot to Undo stack (max 10 steps)
+      const snapshotItems = items.map((it, i) => ({
+        index: i,
+        en: it.en,
+        zh: it.zh,
+        audioDataUri: ensureItemHasAudioDataUriSync(it),
+        durationSec: it.durationSec || 3.0
+      }));
+      state.mergeUndoStack.push({
+        packId: state.currentPack.id,
+        currentIndex: idx,
+        isDemoTTS: state.currentPack.isDemoTTS,
+        items: snapshotItems
+      });
+      if (state.mergeUndoStack.length > 10) state.mergeUndoStack.shift();
+
+      const curItem = items[idx];
+      const nextItem = items[idx + 1];
+      const uriA = ensureItemHasAudioDataUriSync(curItem);
+      const uriB = ensureItemHasAudioDataUriSync(nextItem);
+
+      // 1. Try <5ms Synchronous WAV PCM Concatenation first so iOS tap gesture stays 100% synchronous
+      let mergedAudio = concatTwoWavDataUrisSync(uriA, uriB);
+      if (!mergedAudio) {
+        try {
+          mergedAudio = await concatTwoAudioDataUrisAsyncFallback(uriA, uriB);
+        } catch (err) {
+          mergedAudio = { dataUri: uriA, durationSec: (curItem.durationSec || 2.5) + (nextItem.durationSec || 2.5) };
+        }
+      }
+
+      const mode = state.liveMergeMode;
+      if (mode === 'audio_shift') {
+        // Mode A: Keep subtitle [idx] intact, merge audio [idx]+[idx+1], shift subsequent audios forward by 1!
+        curItem.audioDataUri = mergedAudio.dataUri;
+        curItem.durationSec = mergedAudio.durationSec;
+        curItem._cachedAudioBuffer = null;
+
+        for (let k = idx + 1; k < items.length - 1; k++) {
+          items[k].audioDataUri = items[k + 1].audioDataUri;
+          items[k].durationSec = items[k + 1].durationSec;
+          items[k]._cachedAudioBuffer = null;
+        }
+        // Remove the trailing extra item if it was an unaligned tail, or pop the last item after shifting
+        items.pop();
+      } else {
+        // Mode B: Merge both audio and subtitles of [idx] and [idx+1]
+        const cleanNextEn = String(nextItem.en || '').replace(/^\d+[\.\)、\-\s]+/, '').trim();
+        curItem.en = `${curItem.en} ${cleanNextEn || nextItem.en}`.trim();
+        if (nextItem.zh) {
+          curItem.zh = curItem.zh ? `${curItem.zh} ${nextItem.zh}` : nextItem.zh;
+        }
+        curItem.audioDataUri = mergedAudio.dataUri;
+        curItem.durationSec = mergedAudio.durationSec;
+        curItem._cachedAudioBuffer = null;
+        items.splice(idx + 1, 1);
+      }
+
+      items.forEach((it, i) => { it.index = i; });
+      // Once merged into a real combined WAV clip, play the actual WAV audio rather than TTS
+      state.currentPack.isDemoTTS = false;
+      state.loadedAudioKey = null;
+
+      // Restart the newly merged sentence immediately from 00:00.0 (Repeat 1/N)
+      state.currentRepeat = 1;
+      state.isPlaying = true;
+      loadCurrentSentenceIntoAudio(true);
+
+      const modeText = mode === 'audio_shift'
+        ? `僅合音檔 (後續音檔已往前遞補對齊｜共 ${items.length} 句)`
+        : `音檔+字幕同合 (${mergedAudio.durationSec.toFixed(1)}s｜共 ${items.length} 句)`;
+
+      showGiantHud('🔗', `已合併第 #${formatIdx(idx + 1)} 與 #${formatIdx(idx + 2)} 句`, modeText, 'border-emerald-400/90');
+
+      // Persist updated course to IndexedDB
+      await savePackToDB(state.currentPack);
+      const selectEl = document.getElementById('packSelect');
+      if (selectEl && selectEl.selectedOptions[0]) {
+        selectEl.selectedOptions[0].textContent = `${state.currentPack.name} (${items.length}句)`;
+      }
+    }
+
+    async function actionUndoLastMerge() {
+      unlockiOSAudioAndSpeechSynchronously();
+      if (!state.mergeUndoStack.length || !state.currentPack) return;
+      const lastSnap = state.mergeUndoStack.pop();
+      if (lastSnap.packId !== state.currentPack.id) return;
+
+      clearPendingTimers();
+      try { masterAudio.pause(); } catch (e) {}
+
+      state.currentPack.items = lastSnap.items.map((it, i) => ({
+        index: i,
+        en: it.en,
+        zh: it.zh,
+        audioDataUri: it.audioDataUri,
+        durationSec: it.durationSec,
+        _cachedAudioBuffer: null
+      }));
+      state.currentPack.isDemoTTS = lastSnap.isDemoTTS;
+      state.currentIndex = Math.min(lastSnap.currentIndex, state.currentPack.items.length - 1);
+      state.currentRepeat = 1;
+      state.loadedAudioKey = null;
+      state.isPlaying = true;
+
+      loadCurrentSentenceIntoAudio(true);
+      showGiantHud('↩️', '已復原合併動作', `已還原為 ${state.currentPack.items.length} 句並重播本句`, 'border-sky-400/90');
+
+      await savePackToDB(state.currentPack);
+      const selectEl = document.getElementById('packSelect');
+      if (selectEl && selectEl.selectedOptions[0]) {
+        selectEl.selectedOptions[0].textContent = `${state.currentPack.name} (${state.currentPack.items.length}句)`;
+      }
+    }
+
+    function actionToggleLiveMergeMode() {
+      state.liveMergeMode = state.liveMergeMode === 'audio_shift' ? 'audio_and_sub' : 'audio_shift';
+      const btn = document.getElementById('btnToggleMergeMode');
+      if (btn) {
+        btn.textContent = state.liveMergeMode === 'audio_shift'
+          ? '模式:僅合音檔(修錯位)'
+          : '模式:音檔+字幕同合';
+      }
+      showGiantHud(
+        '⚙️',
+        state.liveMergeMode === 'audio_shift' ? '合併模式：僅合音檔 (修復錯位)' : '合併模式：音檔＋字幕同合',
+        state.liveMergeMode === 'audio_shift'
+          ? '保留本句完整字幕，將下段音檔接過來並讓後續音檔往前遞補'
+          : '同時將本句與下一句的音檔及英中文字幕合併為同一句',
+        'border-emerald-400/90'
+      );
+    }
+
     function updateMediaSessionMetadata() {
       try {
         if (!('mediaSession' in navigator) || !navigator.mediaSession || !state.currentPack) return;
@@ -2155,6 +2485,7 @@
       else if (action === 'restart') actionRestartCurrentSentence();
       else if (action === 'next') actionNextSentence();
       else if (action === 'speed') actionCycleSpeed();
+      else if (action === 'mergeNext') actionMergeCurrentWithNextSentence();
     });
 
     window.addEventListener('keyup', (e) => {
@@ -2188,11 +2519,12 @@
       container.innerHTML = '';
 
       const actionMeta = [
-        { key: 'prev',    icon: 'fa-backward-step text-sky-400', title: '回到前一句 (上一句)' },
-        { key: 'restart', icon: 'fa-rotate-left text-emerald-400', title: '回到這句開頭 (0.0秒重播)' },
-        { key: 'play',    icon: 'fa-play text-sky-300', title: '播放 / 暫停 (長按 0.5 秒切換語速)' },
-        { key: 'next',    icon: 'fa-forward-step text-sky-400', title: '前進下一句' },
-        { key: 'speed',   icon: 'fa-bolt text-amber-400', title: '獨立調速度鍵 (選配)' }
+        { key: 'prev',      icon: 'fa-backward-step text-sky-400', title: '回到前一句 (上一句)' },
+        { key: 'restart',   icon: 'fa-rotate-left text-emerald-400', title: '回到這句開頭 (0.0秒重播)' },
+        { key: 'play',      icon: 'fa-play text-sky-300', title: '播放 / 暫停 (長按 0.5 秒切換語速)' },
+        { key: 'next',      icon: 'fa-forward-step text-sky-400', title: '前進下一句' },
+        { key: 'speed',     icon: 'fa-bolt text-amber-400', title: '獨立調速度鍵 (選配)' },
+        { key: 'mergeNext', icon: 'fa-link text-emerald-400', title: '🔗 播放中動態合併下一句 (修復誤切)' }
       ];
 
       actionMeta.forEach(({ key, icon, title }) => {
@@ -3135,6 +3467,7 @@
       const found = state.packs.find(p => p.id === packId);
       if (!found) return;
       state.isPlaying = false;
+      state.mergeUndoStack = [];
       try { masterAudio.pause(); } catch (e) {}
       updatePlayPauseUI();
 
@@ -3233,6 +3566,9 @@
       document.getElementById('btnTopSpeed').addEventListener('click', actionCycleSpeed);
       document.getElementById('btnWakeLock').addEventListener('click', requestWakeLock);
       document.getElementById('btnBalanceCourseVolume').addEventListener('click', balanceCurrentCourseVolume);
+      document.getElementById('btnMergeWithNext').addEventListener('click', actionMergeCurrentWithNextSentence);
+      document.getElementById('btnToggleMergeMode').addEventListener('click', actionToggleLiveMergeMode);
+      document.getElementById('btnUndoMerge').addEventListener('click', actionUndoLastMerge);
 
       document.getElementById('btnToggleSubMode').addEventListener('click', (e) => {
         const order = ['both', 'en', 'zh', 'blind'];
