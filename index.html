@@ -255,6 +255,9 @@
           </button>
         </div>
         <div class="flex items-center gap-1.5 ml-auto">
+          <button id="btnBalanceCourseVolume" type="button" title="將目前教材所有句子統一均衡至 -16 dBFS 人聲響度" class="px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-400/50 text-amber-300 font-sans font-bold transition">
+            🎚️ 平衡音量
+          </button>
           <button id="btnToggleSubMode" type="button" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-sans font-semibold transition">
             <i class="fa-regular fa-eye mr-1"></i>字幕：英+中
           </button>
@@ -421,7 +424,7 @@
                   <i class="fa-solid fa-microphone-lines mr-1"></i>1. 載入單一長音檔 (如 GPT Live 錄音)
                 </span>
                 <button id="btnLoadSimulatedGptAudio" type="button" class="px-2.5 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/50 text-emerald-300 text-xs font-bold transition">
-                  <i class="fa-solid fa-bolt mr-1"></i>載入模擬 GPT 10 句長音檔 (含底噪)
+                  <i class="fa-solid fa-bolt mr-1"></i>🧪 載入模擬 GPT 10 句長音檔 (含底噪與大小聲差異)
                 </button>
               </div>
 
@@ -540,6 +543,28 @@
                 </div>
               </div>
 
+            </div>
+
+            <!-- VOLUME NORMALIZATION MODE SELECTOR (Prevents Uneven Chunk Loudness) -->
+            <div class="bg-slate-950/90 border border-slate-800 rounded-xl p-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+              <div class="flex items-center gap-2">
+                <span class="font-extrabold text-amber-300"><i class="fa-solid fa-volume-high mr-1"></i>切塊音量均衡模式：</span>
+                <span class="text-slate-400 hidden md:inline">解決爆破音 (p/t/k) 或語氣起伏造成的每句大小聲不一</span>
+              </div>
+              <div class="flex flex-wrap items-center gap-1.5">
+                <label class="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-700 cursor-pointer flex items-center gap-1.5 hover:border-amber-400 transition">
+                  <input type="radio" name="vadNormMode" value="rms" checked class="accent-amber-400" />
+                  <span class="font-bold text-amber-300">智慧人聲 RMS 均勻化 (-16dBFS，推薦)</span>
+                </label>
+                <label class="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-700 cursor-pointer flex items-center gap-1.5 hover:border-sky-400 transition">
+                  <input type="radio" name="vadNormMode" value="global" class="accent-sky-400" />
+                  <span class="font-semibold text-slate-300">全檔統一倍率</span>
+                </label>
+                <label class="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-700 cursor-pointer flex items-center gap-1.5 hover:border-slate-500 transition">
+                  <input type="radio" name="vadNormMode" value="none" class="accent-slate-400" />
+                  <span class="font-semibold text-slate-400">原始無增益 (1.0x)</span>
+                </label>
+              </div>
             </div>
 
             <!-- REAL-TIME ALIGNMENT DASHBOARD -->
@@ -897,7 +922,124 @@
       return wavArrayBufferToDataUriSync(buffer);
     }
 
-    function audioBufferSliceToWavArrayBuffer(audioBuffer, startSec, endSec) {
+    /**
+     * ACTIVE SPEECH RMS VOLUME NORMALIZATION + SOFT-KNEE LIMITER
+     * Solves uneven chunk loudness where plosives (p/t/k) fool peak normalizers
+     * or quiet sentences get over-boosted vs loud sentences.
+     */
+    function getSelectedWorkbenchNormMode() {
+      const checked = document.querySelector('input[name="vadNormMode"]:checked');
+      return checked ? checked.value : 'rms';
+    }
+
+    function computeGlobalAudioBufferGain(audioBuffer) {
+      if (!audioBuffer) return 1.0;
+      const ch0 = audioBuffer.getChannelData(0);
+      const sampleRate = audioBuffer.sampleRate || 16000;
+      const frameLen = Math.max(1, Math.floor(sampleRate * 0.02));
+      const numFrames = Math.floor(ch0.length / frameLen);
+      const frameRms = [];
+      let maxRms = 0.0001;
+
+      for (let f = 0; f < numFrames; f++) {
+        let sum = 0;
+        const offset = f * frameLen;
+        for (let i = 0; i < frameLen; i++) {
+          const s = ch0[offset + i];
+          sum += s * s;
+        }
+        const r = Math.sqrt(sum / frameLen);
+        frameRms.push(r);
+        if (r > maxRms) maxRms = r;
+      }
+
+      const activeGate = Math.max(0.008, maxRms * 0.18);
+      let activeSqSum = 0;
+      let activeCount = 0;
+      for (let i = 0; i < frameRms.length; i++) {
+        if (frameRms[i] >= activeGate) {
+          activeSqSum += frameRms[i] * frameRms[i];
+          activeCount++;
+        }
+      }
+
+      const activeRms = activeCount > 0 ? Math.sqrt(activeSqSum / activeCount) : maxRms * 0.5;
+      const targetRms = 0.158; // -16 dBFS standard speech loudness
+      return Math.max(0.5, Math.min(4.5, targetRms / Math.max(0.005, activeRms)));
+    }
+
+    function normalizeAudioSlice(samples, sampleRate, mode = 'rms', globalGain = 1.0) {
+      const out = new Float32Array(samples.length);
+      if (mode === 'none') {
+        for (let i = 0; i < samples.length; i++) {
+          out[i] = Math.max(-1, Math.min(1, samples[i]));
+        }
+        return out;
+      }
+
+      let gain = 1.0;
+      if (mode === 'global') {
+        gain = globalGain || 1.0;
+      } else {
+        // 'rms' mode: Measure RMS ONLY on active speech frames (20ms windows), ignoring leading/trailing silence & noise floor
+        const frameSize = Math.max(1, Math.floor(sampleRate * 0.02));
+        const totalFrames = Math.floor(samples.length / frameSize);
+        if (totalFrames > 0) {
+          const rmsList = new Float32Array(totalFrames);
+          let maxFrameRms = 0.0001;
+          for (let f = 0; f < totalFrames; f++) {
+            let sumSq = 0;
+            const base = f * frameSize;
+            for (let i = 0; i < frameSize; i++) {
+              const v = samples[base + i];
+              sumSq += v * v;
+            }
+            const r = Math.sqrt(sumSq / frameSize);
+            rmsList[f] = r;
+            if (r > maxFrameRms) maxFrameRms = r;
+          }
+
+          // Active speech gate: ignore background noise & pauses below 20% of chunk's max RMS (or -42 dBFS floor)
+          const speechGate = Math.max(0.008, maxFrameRms * 0.22);
+          let speechSqSum = 0;
+          let speechFrames = 0;
+          for (let f = 0; f < totalFrames; f++) {
+            if (rmsList[f] >= speechGate) {
+              speechSqSum += rmsList[f] * rmsList[f];
+              speechFrames++;
+            }
+          }
+
+          const activeSpeechRms = speechFrames > 0
+            ? Math.sqrt(speechSqSum / speechFrames)
+            : maxFrameRms * 0.6;
+
+          const targetRms = 0.158; // -16 dBFS uniform target loudness
+          if (activeSpeechRms > 0.003) {
+            gain = targetRms / activeSpeechRms;
+          }
+          // Clamp gain to [0.35x, 6.0x] so pure noise is never amplified excessively
+          gain = Math.max(0.35, Math.min(6.0, gain));
+        }
+      }
+
+      // Soft-knee limiter (tanh saturation above 0.65) so plosives (p/t/k) never clip or distort
+      const knee = 0.65;
+      const head = 0.33; // max output ~ 0.98
+      for (let i = 0; i < samples.length; i++) {
+        const x = samples[i] * gain;
+        const absX = Math.abs(x);
+        if (absX <= knee) {
+          out[i] = x;
+        } else {
+          const sign = x < 0 ? -1 : 1;
+          out[i] = sign * (knee + head * Math.tanh((absX - knee) / head));
+        }
+      }
+      return out;
+    }
+
+    function audioBufferSliceToWavArrayBuffer(audioBuffer, startSec, endSec, normMode = null) {
       const sampleRate = audioBuffer.sampleRate;
       const startSample = Math.max(0, Math.floor(startSec * sampleRate));
       const endSample = Math.min(audioBuffer.length, Math.ceil(endSec * sampleRate));
@@ -910,15 +1052,15 @@
       const outSampleRate = Math.floor(sampleRate / ratio);
       const outFrames = Math.max(1, Math.floor(frameCount / ratio));
 
-      // Auto-normalize quiet recordings so iPhone speaker is loud & crystal clear
-      let peak = 0.001;
+      const rawMono = new Float32Array(outFrames);
       for (let i = 0; i < outFrames; i++) {
         const srcIdx = startSample + i * ratio;
-        const val = ch1 ? ((ch0[srcIdx] || 0) + (ch1[srcIdx] || 0)) * 0.5 : (ch0[srcIdx] || 0);
-        const abs = Math.abs(val);
-        if (abs > peak) peak = abs;
+        rawMono[i] = ch1 ? ((ch0[srcIdx] || 0) + (ch1[srcIdx] || 0)) * 0.5 : (ch0[srcIdx] || 0);
       }
-      const gain = peak < 0.35 ? Math.min(4.0, 0.85 / peak) : 1.0;
+
+      const mode = normMode || getSelectedWorkbenchNormMode();
+      const globalGain = state.workbench.globalGain || 1.0;
+      const normalized = normalizeAudioSlice(rawMono, outSampleRate, mode, globalGain);
 
       const buffer = new ArrayBuffer(44 + outFrames * 2);
       const view = new DataView(buffer);
@@ -940,17 +1082,66 @@
       view.setUint32(40, outFrames * 2, true);
 
       for (let i = 0; i < outFrames; i++) {
-        const srcIdx = startSample + i * ratio;
-        const raw = ch1 ? ((ch0[srcIdx] || 0) + (ch1[srcIdx] || 0)) * 0.5 : (ch0[srcIdx] || 0);
-        const s = Math.max(-1, Math.min(1, raw * gain));
+        const s = Math.max(-1, Math.min(1, normalized[i]));
         view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
       }
       return buffer;
     }
 
-    function audioBufferSliceToWavDataUri(audioBuffer, startSec, endSec) {
-      const buffer = audioBufferSliceToWavArrayBuffer(audioBuffer, startSec, endSec);
+    function audioBufferSliceToWavDataUri(audioBuffer, startSec, endSec, normMode = null) {
+      const buffer = audioBufferSliceToWavArrayBuffer(audioBuffer, startSec, endSec, normMode);
       return wavArrayBufferToDataUriSync(buffer);
+    }
+
+    /**
+     * 1-CLICK COURSE VOLUME BALANCER (For Already-Imported Courses)
+     * Equalizes all sentences in state.currentPack to -16 dBFS active speech RMS without re-importing!
+     */
+    async function balanceCurrentCourseVolume() {
+      if (!state.currentPack || !state.currentPack.items || !state.currentPack.items.length) return;
+      unlockiOSAudioAndSpeechSynchronously();
+
+      const btn = document.getElementById('btnBalanceCourseVolume');
+      const origHtml = btn ? btn.innerHTML : '🎚️ 平衡音量';
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner animate-spin mr-1"></i>均衡中...';
+      }
+
+      try {
+        const ctx = ensureUnlockedAudioContextSync() || new (window.AudioContext || window.webkitAudioContext)();
+        const items = state.currentPack.items;
+        let balancedCount = 0;
+
+        for (let i = 0; i < items.length; i++) {
+          const it = items[i];
+          const uri = ensureItemHasAudioDataUriSync(it);
+          if (!uri) continue;
+
+          try {
+            const rawBuf = dataUriToArrayBufferSync(uri);
+            const decoded = await new Promise((resolve, reject) => {
+              ctx.decodeAudioData(rawBuf.slice(0), resolve, reject);
+            });
+            it.audioDataUri = audioBufferSliceToWavDataUri(decoded, 0, decoded.duration, 'rms');
+            it.durationSec = decoded.duration;
+            it._cachedAudioBuffer = null;
+            balancedCount++;
+          } catch (sliceErr) {}
+        }
+
+        state.loadedAudioKey = null;
+        await savePackToDB(state.currentPack);
+        loadCurrentSentenceIntoAudio(state.isPlaying);
+        showGiantHud('🎚️', '已完成全課音量均衡', `已將 ${balancedCount} 句統一校準至 -16 dBFS 響度`, 'border-amber-400/90');
+      } catch (err) {
+        showGiantHud('⚠️', '音量均衡處理失敗', err.message || '請稍後再試', 'border-rose-400/90');
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = origHtml;
+        }
+      }
     }
 
     /*************************************************************************
@@ -1196,6 +1387,7 @@
         audioBuffer: null,
         rmsDbEnvelope: null,
         windowSec: 0.01,
+        globalGain: 1.0,
         segments: [],
         subtitles: [],
         previewSourceNode: null,
@@ -2165,6 +2357,7 @@
         state.workbench.audioBuffer = audioBuffer;
         state.workbench.rmsDbEnvelope = rmsDbEnvelope;
         state.workbench.windowSec = windowSec;
+        state.workbench.globalGain = computeGlobalAudioBufferGain(audioBuffer);
 
         nameEl.textContent = `✅ 已載入：${displayFileName}`;
         nameEl.className = 'text-xs sm:text-sm font-bold text-emerald-400 truncate';
@@ -2691,8 +2884,11 @@
           const syllableEnv = 0.55 + 0.45 * Math.sin(2 * Math.PI * 4.2 * localT);
           const edgeEnv = Math.min(1, localT / 0.08, (clipDur - localT) / 0.1);
           const f0 = 220 + (idx * 29) % 110;
+          // Simulate uneven recording volumes (alternating quiet 0.35x and loud 1.15x sentences + plosive spike)
+          const volumeScale = (idx % 2 === 1) ? 0.35 : 1.15;
+          const plosiveSpike = (localT > 0.12 && localT < 0.15) ? 2.1 : 1.0;
           const voice = (Math.sin(2 * Math.PI * f0 * t) * 0.34 +
-                         Math.sin(2 * Math.PI * (f0 * 2) * t) * 0.15) * syllableEnv * edgeEnv;
+                         Math.sin(2 * Math.PI * (f0 * 2) * t) * 0.15) * syllableEnv * edgeEnv * volumeScale * plosiveSpike;
           sample += voice;
         }
         const clamped = Math.max(-1, Math.min(1, sample));
@@ -3036,6 +3232,7 @@
       document.getElementById('btnCtrlSpeed').addEventListener('click', actionCycleSpeed);
       document.getElementById('btnTopSpeed').addEventListener('click', actionCycleSpeed);
       document.getElementById('btnWakeLock').addEventListener('click', requestWakeLock);
+      document.getElementById('btnBalanceCourseVolume').addEventListener('click', balanceCurrentCourseVolume);
 
       document.getElementById('btnToggleSubMode').addEventListener('click', (e) => {
         const order = ['both', 'en', 'zh', 'blind'];
