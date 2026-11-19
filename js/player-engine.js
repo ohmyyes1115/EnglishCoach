@@ -1,5 +1,5 @@
 // Layer 2: Playback Engine, In-Place Pause/Resume, Watchdog + WebAudio Fallback,
-// Blind-Operation Controls, Dynamic Merge & Pack Volume Normalization
+// iOS Control Center / MediaSession Sync, Blind-Operation Controls, Dynamic Merge & Normalization
 
 import {
   SPEED_STEPS,
@@ -36,6 +36,12 @@ let playbackAttemptId = 0;
 let recoveryInProgress = false;
 let systemHooksBound = false;
 
+// Ignore windows so our own programmatic pause()/play() calls are never mistaken for iOS Control Center actions
+let ignoreMasterPauseUntil = 0;
+let ignoreMasterPlayUntil = 0;
+let ignoreKeepAlivePauseUntil = 0;
+let ignoreKeepAlivePlayUntil = 0;
+
 let activeBlobUrl = null;
 let loadedAudioDataUri = null;
 
@@ -60,12 +66,70 @@ export function registerPlayerCallbacks(cbs = {}) {
 }
 
 // ==========================================
+// MEDIA SESSION (iOS CONTROL CENTER / CAR BLUETOOTH)
+// ==========================================
+function setMediaSessionPlaybackState(playbackState) {
+  try {
+    if ('mediaSession' in navigator) {
+      navigator.mediaSession.playbackState = playbackState;
+    }
+  } catch (e) {}
+}
+
+function updateMediaSessionMetadata() {
+  try {
+    if (!('mediaSession' in navigator) || typeof window.MediaMetadata === 'undefined') return;
+    const pack = state.currentPack;
+    const item = pack?.items?.[state.currentIndex];
+    if (!pack || !item) return;
+    const cleanEn = String(item.en || '').replace(/^\d+[\.\)、\-\s]+/, '').trim();
+    navigator.mediaSession.metadata = new window.MediaMetadata({
+      title: `#${formatIdx(state.currentIndex + 1)}/${formatIdx(pack.items.length)} ${cleanEn}`,
+      artist: pack.name || '英文跟讀播放器',
+      album: `語速 ${(SPEED_STEPS[state.speedIndex] || 1.0).toFixed(2)}x`
+    });
+  } catch (e) {}
+}
+
+function registerMediaSessionHandlers() {
+  try {
+    if (!('mediaSession' in navigator)) return;
+    const safeSet = (action, handler) => {
+      try { navigator.mediaSession.setActionHandler(action, handler); } catch (e) {}
+    };
+    safeSet('play', () => {
+      if (!state.isPlaying) {
+        const resumeFrom = state.pausedOffsetSec || 0;
+        playCurrentSentenceClip(resumeFrom > 0.08, resumeFrom);
+      }
+    });
+    safeSet('pause', () => {
+      if (state.isPlaying) {
+        pausePlaybackInPlace('控制中心暫停');
+      }
+    });
+    safeSet('stop', () => {
+      if (state.isPlaying) {
+        pausePlaybackInPlace('系統停止');
+      }
+    });
+    safeSet('previoustrack', () => {
+      actionPrevSentence();
+    });
+    safeSet('nexttrack', () => {
+      actionNextSentence();
+    });
+  } catch (e) {}
+}
+
+// ==========================================
 // BLOB URL & GAP KEEP-ALIVE HELPERS
 // ==========================================
 function ensureMasterAudioSource(audio, targetDataUri) {
   if (loadedAudioDataUri === targetDataUri && activeBlobUrl && audio.src === activeBlobUrl) {
     return false; // Already loaded
   }
+  ignoreMasterPauseUntil = Date.now() + 350;
   if (activeBlobUrl && activeBlobUrl.startsWith('blob:')) {
     try { URL.revokeObjectURL(activeBlobUrl); } catch (e) {}
   }
@@ -81,6 +145,7 @@ function startGapKeepAlive() {
     if (!ka) return;
     if (!ka.src) ka.src = createSilentWavDataUri(1.0);
     if (ka.paused) {
+      ignoreKeepAlivePlayUntil = Date.now() + 350;
       ka.play().catch(() => {});
     }
   } catch (e) {}
@@ -90,6 +155,7 @@ function stopGapKeepAlive() {
   try {
     const ka = document.getElementById('keepAliveAudio');
     if (ka && !ka.paused) {
+      ignoreKeepAlivePauseUntil = Date.now() + 350;
       ka.pause();
     }
   } catch (e) {}
@@ -118,11 +184,17 @@ export function stopAllAudioTimers() {
 export function pausePlaybackInPlace(reasonLabel = '原地暫停') {
   playbackAttemptId++;
   recoveryInProgress = false;
+  const wasInGap = state.isInGap;
   const audio = document.getElementById('masterAudio');
-  if (activeWebAudioSource && activeWebAudioCtx && activeWebAudioCtx.state === 'running') {
+
+  if (wasInGap) {
+    state.pausedOffsetSec = 0;
+  } else if (activeWebAudioSource && activeWebAudioCtx && activeWebAudioCtx.state === 'running') {
     const elapsed = (activeWebAudioCtx.currentTime - webAudioStartTimestamp) * (SPEED_STEPS[state.speedIndex] || 1.0);
     state.pausedOffsetSec = Math.min(webAudioDuration, webAudioStartOffset + elapsed);
   } else if (audio && !audio.paused && audio.currentTime > 0) {
+    state.pausedOffsetSec = audio.currentTime;
+  } else if (audio && audio.currentTime > 0 && !audio.ended) {
     state.pausedOffsetSec = audio.currentTime;
   } else if (lastObservedAudioTime > 0) {
     state.pausedOffsetSec = lastObservedAudioTime;
@@ -132,7 +204,9 @@ export function pausePlaybackInPlace(reasonLabel = '原地暫停') {
   stopGapKeepAlive();
   state.isPlaying = false;
   state.isInGap = false;
+
   if (audio) {
+    ignoreMasterPauseUntil = Date.now() + 350;
     try { audio.pause(); } catch (e) {}
   }
   try {
@@ -140,6 +214,8 @@ export function pausePlaybackInPlace(reasonLabel = '原地暫停') {
       window.speechSynthesis.cancel();
     }
   } catch (e) {}
+
+  setMediaSessionPlaybackState('paused');
   playerCallbacks.onUpdatePlayPauseUI(`${reasonLabel} (${formatTimeSec(state.pausedOffsetSec)})`);
 }
 
@@ -199,6 +275,7 @@ export function speakDemoSentenceIfEnabled(item, startOffsetSec = 0) {
 export async function startWebAudioMainPlaybackFallback(item, offsetSec = 0, attemptId = playbackAttemptId) {
   const audio = document.getElementById('masterAudio');
   if (audio) {
+    ignoreMasterPauseUntil = Date.now() + 350;
     try { audio.pause(); } catch (e) {}
   }
   stopGapKeepAlive();
@@ -255,6 +332,7 @@ export async function startWebAudioMainPlaybackFallback(item, offsetSec = 0, att
     }
   };
   src.start(0, webAudioStartOffset);
+  setMediaSessionPlaybackState('playing');
   startProgressLoop();
   return true;
 }
@@ -265,6 +343,7 @@ function playMasterAudioAtOffset(audio, targetOffset, attemptId, forceReload = f
     try {
       audio.currentTime = targetOffset;
     } catch (e) {}
+    ignoreMasterPlayUntil = Date.now() + 350;
     const playPromise = audio.play();
     if (playPromise && playPromise.catch) {
       playPromise.catch((err) => {
@@ -276,6 +355,7 @@ function playMasterAudioAtOffset(audio, targetOffset, attemptId, forceReload = f
   };
 
   if (forceReload) {
+    ignoreMasterPauseUntil = Date.now() + 350;
     try { audio.load(); } catch (e) {}
   }
 
@@ -292,7 +372,6 @@ function playMasterAudioAtOffset(audio, targetOffset, attemptId, forceReload = f
     };
     audio.addEventListener('loadedmetadata', onReady, { once: true });
     audio.addEventListener('canplay', onReady, { once: true });
-    // Safety kick in case metadata event already fired or doesn't fire on cached blob
     setTimeout(() => {
       if (!fired && attemptId === playbackAttemptId && state.isPlaying && !state.isInGap) {
         onReady();
@@ -322,6 +401,7 @@ async function recoverStalledPlayback(attemptId, reason = 'stalled') {
       }
       stopAllAudioTimers();
       stopGapKeepAlive();
+      ignoreMasterPauseUntil = Date.now() + 350;
       try { audio.pause(); } catch (e) {}
 
       const targetUri = item.audioDataUri || createToneWavDataUri(item.durationSec || 2.8);
@@ -348,7 +428,7 @@ async function recoverStalledPlayback(attemptId, reason = 'stalled') {
         showGiantHud('⏸️', '系統暫停了音訊', '點擊播放鍵即可原地繼續', 'border-amber-400/90');
       }
     } else {
-      // Stage 3: Both channels blocked by OS (e.g. phone call / Siri / lock-screen suspension)
+      // Stage 3: Both channels blocked by OS
       if (typeof window.logDiag === 'function') {
         window.logDiag('WARN', `播放自癒終止 (${reason})：音訊通道遭系統中斷，自動轉為原地暫停`);
       }
@@ -376,6 +456,8 @@ export function playCurrentSentenceClip(isFastSameSentenceRepeat = false, resume
   const speed = SPEED_STEPS[state.speedIndex] || 1.0;
 
   playerCallbacks.onRenderMainStage();
+  updateMediaSessionMetadata();
+  setMediaSessionPlaybackState('playing');
 
   const targetOffset = Math.max(0, Number(resumeOffsetSec) || 0);
   state.pausedOffsetSec = 0;
@@ -448,12 +530,64 @@ export function handleClipEnded() {
 export function setupWatchdogTimer() {
   if (!systemHooksBound) {
     systemHooksBound = true;
+    registerMediaSessionHandlers();
 
     const audio = document.getElementById('masterAudio');
     if (audio) {
       audio.addEventListener('error', () => {
         if (state.isPlaying && !state.isInGap && !activeWebAudioSource) {
           recoverStalledPlayback(playbackAttemptId, 'masterAudio error event');
+        }
+      });
+
+      // Respect external pause (iOS Control Center, Lock Screen, AirPods removal, phone call)
+      audio.addEventListener('pause', () => {
+        if (!state.isPlaying || state.isInGap || activeWebAudioSource) return;
+        if (Date.now() < ignoreMasterPauseUntil) return;
+        if (audio.ended) return;
+        if (Number.isFinite(audio.duration) && audio.duration > 0 && audio.currentTime >= audio.duration - 0.1) {
+          return;
+        }
+        pausePlaybackInPlace('系統面板暫停');
+      });
+
+      // Respect external resume directly on masterAudio from iOS Control Center
+      audio.addEventListener('play', () => {
+        if (state.isPlaying) return;
+        if (Date.now() < ignoreMasterPlayUntil) return;
+        if (!state.currentPack || !state.currentPack.items.length) return;
+
+        state.isPlaying = true;
+        state.isInGap = false;
+        state.pausedOffsetSec = 0;
+        watchdogRetryCount = 0;
+        lastObservedAudioTime = Number(audio.currentTime) || 0;
+        lastProgressAdvanceMs = Date.now();
+        updateMediaSessionMetadata();
+        setMediaSessionPlaybackState('playing');
+        playerCallbacks.onUpdatePlayPauseUI();
+        startProgressLoop();
+      });
+    }
+
+    const ka = document.getElementById('keepAliveAudio');
+    if (ka) {
+      // Respect external pause tapped in iOS Control Center during inter-sentence gap
+      ka.addEventListener('pause', () => {
+        if (!state.isPlaying || !state.isInGap) return;
+        if (Date.now() < ignoreKeepAlivePauseUntil) return;
+        pausePlaybackInPlace('系統面板暫停');
+      });
+
+      // If user taps Play in Control Center while paused after a gap, hand off cleanly to masterAudio
+      ka.addEventListener('play', () => {
+        if (state.isPlaying) return;
+        if (Date.now() < ignoreKeepAlivePlayUntil) return;
+        ignoreKeepAlivePauseUntil = Date.now() + 350;
+        try { ka.pause(); } catch (e) {}
+        if (state.currentPack && state.currentPack.items.length) {
+          const resumeFrom = state.pausedOffsetSec || 0;
+          playCurrentSentenceClip(resumeFrom > 0.08, resumeFrom);
         }
       });
     }
@@ -583,6 +717,7 @@ export function actionCycleSpeed() {
     activeWebAudioSource.playbackRate.value = speed;
   }
   savePrefsSync();
+  updateMediaSessionMetadata();
   playerCallbacks.onRenderMainStage();
   showGiantHud('⚡', `語速 ${speed.toFixed(2)}x`, '長按播放鍵或按調速鍵可循環切換', 'border-amber-400/90');
 }
@@ -644,7 +779,6 @@ export async function actionMergeWithNextSentence() {
   );
 
   if (state.mergeSubMode === 'audio_only_shift') {
-    // Keep current subtitle intact, merge audio, shift subsequent audio clips up by 1
     curItem.audioDataUri = merged.audioDataUri;
     curItem.durationSec = merged.durationSec;
     for (let i = idx + 1; i < state.currentPack.items.length - 1; i++) {
@@ -653,7 +787,6 @@ export async function actionMergeWithNextSentence() {
     }
     state.currentPack.items.pop();
   } else {
-    // Merge both audio & subtitle
     curItem.audioDataUri = merged.audioDataUri;
     curItem.durationSec = merged.durationSec;
     const cleanNextEn = String(nextItem.en || '').replace(/^\d+[\.\)、\-\s]+/, '').trim();
