@@ -205,4 +205,228 @@ export async function callGroqConciseApi(promptText, apiKey) {
       temperature: 0.25,
       max_tokens: 360,
       messages: [
-        { role: 'system', content: '你是一位專
+        { role: 'system', content: '你是一位專精台灣繁體中文的車用英文口說教練，回答務必極度精簡扼要。' },
+        { role: 'user', content: promptText }
+      ]
+    })
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data?.error?.message || `Groq HTTP ${res.status}`);
+  return { text: data?.choices?.[0]?.message?.content || '', modelUsed: 'llama-3.3-70b' };
+}
+
+export async function callOpenAiMiniConciseApi(promptText, apiKey) {
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${String(apiKey || '').trim()}`
+    },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      temperature: 0.25,
+      max_tokens: 360,
+      messages: [
+        { role: 'system', content: '你是一位專精台灣繁體中文的車用英文口說教練，回答務必極度精簡扼要。' },
+        { role: 'user', content: promptText }
+      ]
+    })
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data?.error?.message || `OpenAI HTTP ${res.status}`);
+  return { text: data?.choices?.[0]?.message?.content || '', modelUsed: 'gpt-4o-mini' };
+}
+
+export async function queryConfiguredAiEngine(promptText) {
+  const cfg = state.aiConfig || { provider: 'gemini', geminiKey: '', groqKey: '', openaiKey: '' };
+  if (cfg.provider === 'free_builtin') throw new Error('UserSelectedFreeBuiltin');
+  if (cfg.provider === 'groq' && cfg.groqKey) return await callGroqConciseApi(promptText, cfg.groqKey);
+  if (cfg.provider === 'openai' && cfg.openaiKey) return await callOpenAiMiniConciseApi(promptText, cfg.openaiKey);
+  return await callGeminiFlashConciseApi(promptText, cfg.geminiKey || '');
+}
+
+export function parseAiStructuredResponse(rawText) {
+  const text = String(rawText || '').trim();
+  let zh = '';
+  let grammar = '';
+  const notes = [];
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const cleanLine = line.replace(/^\*\*|\*\*$/g, '').trim();
+    if (!zh && /^(【?整句中譯】?|中譯|翻譯|中文|整句翻譯)[:：]?/i.test(cleanLine)) {
+      const val = cleanLine.replace(/^(【?整句中譯】?|中譯|翻譯|中文|整句翻譯)[:：]?\s*/i, '').trim();
+      if (val) zh = val;
+    } else if (/^(【?句型.*】?|句型|語氣|文法|用法)[:：]?/i.test(cleanLine)) {
+      const val = cleanLine.replace(/^(【?句型[^:：]*】?|句型|語氣|文法|用法)[:：]?\s*/i, '').trim();
+      if (val) grammar = val;
+    } else if (!/^(【?重點單字.*】?)[:：]?$/i.test(cleanLine)) {
+      notes.push(cleanLine.replace(/^[\-\*•]\s*/, ''));
+    }
+  }
+  if (!zh && notes.length > 0) zh = notes.shift();
+  return { zh, notes: notes.join('\n'), grammar };
+}
+
+export async function persistZhAndNotesToCurrentItem(zhTranslation, notesText, grammarText = '') {
+  const item = state.currentPack?.items?.[state.currentIndex];
+  if (!item) return;
+  let changed = false;
+  if (zhTranslation && (!item.zh || !item.zh.trim())) {
+    item.zh = zhTranslation.trim();
+    changed = true;
+  }
+  if (notesText) {
+    item.aiNotes = notesText.trim();
+    changed = true;
+  }
+  if (grammarText) {
+    item.aiGrammarNote = grammarText.trim();
+    changed = true;
+  }
+  if (changed) {
+    aiCallbacks.onRenderMainStage();
+    await savePackToDB(state.currentPack);
+  }
+}
+
+// ==========================================
+// TAP-WORD LOOKUP & FULL-SENTENCE EXPLAIN ACTIONS
+// ==========================================
+export async function handleTapEnglishWordLookup(word, tokenEl) {
+  const cleanWord = String(word || '').trim();
+  if (!cleanWord) return;
+  state.activeLookupWord = cleanWord;
+  if (state.isPlaying) pausePlaybackInPlace('點字查詢暫停');
+
+  document.querySelectorAll('#displayEnglish .word-token').forEach(el => {
+    el.classList.toggle('word-token-active', el === tokenEl);
+  });
+
+  const item = state.currentPack?.items?.[state.currentIndex];
+  const fullSentence = item ? String(item.en || '').replace(/^\d+[\.\)、\-\s]+/, '').trim() : '';
+  const wordKey = cleanWord.toLowerCase();
+
+  const drawer = document.getElementById('aiExplainDrawer');
+  const badge = document.getElementById('aiDrawerBadge');
+  const targetLabel = document.getElementById('aiDrawerTargetLabel');
+  const speakBtn = document.getElementById('btnSpeakLookupWord');
+  const bodyEl = document.getElementById('aiDrawerBody');
+  if (!drawer || !badge || !targetLabel || !speakBtn || !bodyEl) return;
+
+  drawer.classList.remove('hidden');
+  targetLabel.textContent = `單字：${cleanWord}`;
+  speakBtn.classList.remove('hidden');
+  speakBtn.onclick = () => speakSingleEnglishWord(cleanWord);
+
+  if (item && item.wordNotes && item.wordNotes[wordKey]) {
+    const cached = item.wordNotes[wordKey];
+    badge.textContent = '✨ 單字快取 (0ms)';
+    renderAiDrawerBodyHtml(bodyEl, formatSavedAiNotesHtml(item.zh || cached.zh, cached.notes, cached.grammar || '', false));
+    return;
+  }
+
+  badge.textContent = '👆 點字即查';
+  bodyEl.innerHTML = `<div class="flex items-center gap-2 text-violet-300 font-bold py-2"><i class="fa-solid fa-spinner animate-spin"></i><span>正在查詢「${escapeHtml(cleanWord)}」在本句中的精準字義...</span></div>`;
+
+  const prompt = `請針對英文句子："${fullSentence}" 裡面的單字 "${cleanWord}" 用台灣繁體中文極簡回答（總字數 90 字內）：\n中譯：(整句話的自然繁體中文翻譯)\n• 【${cleanWord}】音標、詞性、在這句話裡的精準中文意思\n• 常見搭配詞或同義替換 1 條\n句型：(該字在本句中的語氣或用法提示 1 短句)`;
+  try {
+    const res = await queryConfiguredAiEngine(prompt);
+    badge.textContent = `🤖 ${res.modelUsed}`;
+    const parsed = parseAiStructuredResponse(res.text);
+    if (item) {
+      if (!item.wordNotes) item.wordNotes = {};
+      item.wordNotes[wordKey] = { zh: parsed.zh || item.zh, notes: parsed.notes, grammar: parsed.grammar };
+    }
+    await persistZhAndNotesToCurrentItem(parsed.zh, item?.aiNotes || parsed.notes, item?.aiGrammarNote || parsed.grammar);
+    renderAiDrawerBodyHtml(bodyEl, formatSavedAiNotesHtml(parsed.zh || item?.zh, parsed.notes, parsed.grammar, false));
+    return;
+  } catch (e) {}
+
+  badge.textContent = '⚡ 免金鑰即時字典';
+  const [wordZh, sentenceZh, dictInfo] = await Promise.all([
+    fetchFreeGoogleTranslateZhTW(cleanWord),
+    (item && item.zh) ? Promise.resolve(item.zh) : fetchFreeGoogleTranslateZhTW(fullSentence),
+    fetchFreeDictionaryEntry(cleanWord)
+  ]);
+  const ph = dictInfo?.phonetic ? ` ${dictInfo.phonetic}` : '';
+  const defs = dictInfo?.meanings?.length ? `\n• 詞性與釋義：${dictInfo.meanings.join(' / ')}` : '';
+  const noteBlock = `【${cleanWord}】${ph}：${wordZh || '請見下方釋義'}${defs}`;
+  if (item) {
+    if (!item.wordNotes) item.wordNotes = {};
+    item.wordNotes[wordKey] = { zh: sentenceZh || item.zh, notes: noteBlock, grammar: '' };
+  }
+  await persistZhAndNotesToCurrentItem(sentenceZh, item?.aiNotes || noteBlock);
+  const hasKey = Boolean(state.aiConfig?.geminiKey || state.aiConfig?.groqKey || state.aiConfig?.openaiKey);
+  renderAiDrawerBodyHtml(bodyEl, formatSavedAiNotesHtml(sentenceZh || item?.zh, noteBlock, '', !hasKey));
+}
+
+export async function actionAiExplainCurrentSentence(forceRefresh = false) {
+  const item = state.currentPack?.items?.[state.currentIndex];
+  if (!item) return;
+  if (state.isPlaying) pausePlaybackInPlace('AI簡答暫停');
+
+  const cleanSentence = String(item.en || '').replace(/^\d+[\.\)、\-\s]+/, '').trim();
+  const drawer = document.getElementById('aiExplainDrawer');
+  const badge = document.getElementById('aiDrawerBadge');
+  const targetLabel = document.getElementById('aiDrawerTargetLabel');
+  const speakBtn = document.getElementById('btnSpeakLookupWord');
+  const bodyEl = document.getElementById('aiDrawerBody');
+  if (!drawer || !badge || !targetLabel || !speakBtn || !bodyEl) return;
+
+  drawer.classList.remove('hidden');
+  speakBtn.classList.add('hidden');
+  targetLabel.textContent = `第 #${formatIdx(state.currentIndex + 1)} 句整句簡答`;
+
+  if (!forceRefresh && item.aiNotes && item.aiNotes.trim()) {
+    badge.textContent = '✨ 已存快取 (0ms)';
+    renderAiDrawerBodyHtml(bodyEl, formatSavedAiNotesHtml(item.zh, item.aiNotes, item.aiGrammarNote || '', false));
+    return;
+  }
+
+  bodyEl.innerHTML = `<div class="flex items-center gap-2 text-violet-300 font-bold py-2"><i class="fa-solid fa-spinner animate-spin"></i><span>正在翻譯並拆解本句重點單字與句型...</span></div>`;
+
+  const prompt = `請幫我用台灣繁體中文極簡解析這句英文口說："${cleanSentence}"\n請嚴格依照以下格式回覆（總字數 120 字內）：\n中譯：(最自然道地的繁體中文翻譯)\n• (核心單字或片語 1：音標＋中文意思)\n• (核心單字或片語 2：音標＋中文意思)\n• (核心單字或片語 3：音標＋中文意思)\n句型：(1句話秒懂這句的文法結構與語氣用法)`;
+  try {
+    const res = await queryConfiguredAiEngine(prompt);
+    badge.textContent = `🤖 ${res.modelUsed}`;
+    const parsed = parseAiStructuredResponse(res.text);
+    if (parsed.zh) item.zh = parsed.zh;
+    await persistZhAndNotesToCurrentItem(parsed.zh, parsed.notes, parsed.grammar);
+    renderAiDrawerBodyHtml(bodyEl, formatSavedAiNotesHtml(parsed.zh || item.zh, parsed.notes, parsed.grammar, false));
+    return;
+  } catch (e) {}
+
+  badge.textContent = '⚡ 免金鑰智慧翻譯';
+  const translatedZh = (forceRefresh ? '' : item.zh) || (await fetchFreeGoogleTranslateZhTW(cleanSentence));
+  const words = (cleanSentence.match(/[A-Za-z]{5,}/g) || [])
+    .map(w => w.toLowerCase())
+    .filter((w, i, arr) => arr.indexOf(w) === i)
+    .slice(0, 3);
+  const wordNotes = [];
+  for (const w of words) {
+    const [wZh, dInfo] = await Promise.all([fetchFreeGoogleTranslateZhTW(w), fetchFreeDictionaryEntry(w)]);
+    const ph = dInfo?.phonetic ? ` ${dInfo.phonetic}` : '';
+    const pos = dInfo?.meanings?.[0] ? ` — ${dInfo.meanings[0]}` : '';
+    wordNotes.push(`【${w}】${ph}：${wZh}${pos}`);
+  }
+  const finalNotes = wordNotes.join('\n') || '點擊上方英文句子中的任一單字，即可單獨查詢發音與字義。';
+  if (translatedZh) item.zh = translatedZh;
+  await persistZhAndNotesToCurrentItem(
+    translatedZh,
+    finalNotes,
+    '可點擊上方英文句子中的任一單字即查音標與字義，或點「🔊 唸出中文解析」用聽的學。'
+  );
+  const hasKey = Boolean(state.aiConfig?.geminiKey || state.aiConfig?.groqKey || state.aiConfig?.openaiKey);
+  renderAiDrawerBodyHtml(bodyEl, formatSavedAiNotesHtml(translatedZh || item.zh, finalNotes, item.aiGrammarNote, !hasKey));
+}
+
+export function actionCopySentenceWithAiPrompt() {
+  const item = state.currentPack?.items?.[state.currentIndex];
+  if (!item) return;
+  const cleanEn = String(item.en || '').replace(/^\d+[\.\)、\-\s]+/, '').trim();
+  const prompt = `請用台灣繁體中文幫我翻譯這句英文，並精簡列出 3 個重點單字/片語與句型結構：\n"${cleanEn}"`;
+  copyTextSynchronously(prompt);
+  showGiantHud('📋', '已連同提問指令複製', '可直接貼到 ChatGPT / Gemini 詢問', 'border-violet-400/90');
+}
+
+// EOF: js/ai-lookup.js
