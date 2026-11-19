@@ -956,3 +956,119 @@ export async function importZipOrMultiFiles(fileList, packNameInput, onStatusUpd
     items
   };
 }
+
+// ==========================================
+// AUDIO CHUNKING & 16kHz WAV ENCODING FOR AI TRANSCRIPTION
+// ==========================================
+function mixDownAudioBufferToMono(audioBuffer) {
+  const numChannels = audioBuffer.numberOfChannels || 1;
+  const len = audioBuffer.length;
+  if (numChannels === 1) return audioBuffer.getChannelData(0);
+  const mono = new Float32Array(len);
+  const inv = 1 / numChannels;
+  for (let ch = 0; ch < numChannels; ch++) {
+    const data = audioBuffer.getChannelData(ch);
+    for (let i = 0; i < len; i++) {
+      mono[i] += data[i] * inv;
+    }
+  }
+  return mono;
+}
+
+function encodeFloat32SliceToWavArrayBuffer(samples, sampleRate) {
+  const len = samples.length;
+  // Gentle gain boost only if recording is very quiet so ASR recognizes soft speech cleanly
+  let maxPeak = 0;
+  for (let i = 0; i < len; i++) {
+    const a = Math.abs(samples[i]);
+    if (a > maxPeak) maxPeak = a;
+  }
+  const gain = (maxPeak > 0.005 && maxPeak < 0.2) ? Math.min(4.0, 0.7 / maxPeak) : 1.0;
+
+  const buffer = new ArrayBuffer(44 + len * 2);
+  const view = new DataView(buffer);
+  const writeStr = (offset, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + len * 2, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, len * 2, true);
+
+  for (let i = 0; i < len; i++) {
+    let s = samples[i] * gain;
+    if (s > 0.98) s = 0.98;
+    else if (s < -0.98) s = -0.98;
+    view.setInt16(44 + i * 2, s * 32767, true);
+  }
+  return buffer;
+}
+
+function arrayBufferToPureBase64(arrBuf) {
+  const bytes = new Uint8Array(arrBuf);
+  let binary = '';
+  const chunk = 8192;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+export function buildTranscribeAudioChunks(audioBuffer, maxChunkSec = 300) {
+  const monoFull = mixDownAudioBufferToMono(audioBuffer);
+  const { samples, sampleRate } = downsampleMonoIfNeeded(monoFull, audioBuffer.sampleRate, 16000);
+  const totalSec = samples.length / sampleRate;
+  const env = state.vadEnvelopeDb;
+
+  const boundaries = [0];
+  let cursorSec = 0;
+  while (totalSec - cursorSec > maxChunkSec + 10) {
+    let splitSec = cursorSec + maxChunkSec;
+    // Prefer splitting at the quietest valley within [splitSec - 15s, splitSec + 5s] to avoid cutting mid-word
+    if (env && env.length > 0) {
+      const fStart = Math.max(0, Math.floor((splitSec - 15) * 100));
+      const fEnd = Math.min(env.length - 1, Math.floor((splitSec + 5) * 100));
+      let minDb = 999;
+      let bestFrame = Math.floor(splitSec * 100);
+      for (let f = fStart; f <= fEnd; f++) {
+        if (env[f] < minDb) {
+          minDb = env[f];
+          bestFrame = f;
+        }
+      }
+      splitSec = bestFrame * 0.01;
+    }
+    boundaries.push(splitSec);
+    cursorSec = splitSec;
+  }
+  boundaries.push(totalSec);
+
+  const chunks = [];
+  for (let i = 0; i < boundaries.length - 1; i++) {
+    const startSec = boundaries[i];
+    const endSec = boundaries[i + 1];
+    const s0 = Math.max(0, Math.floor(startSec * sampleRate));
+    const s1 = Math.min(samples.length, Math.floor(endSec * sampleRate));
+    if (s1 - s0 < sampleRate * 0.2) continue;
+    const wavBuf = encodeFloat32SliceToWavArrayBuffer(samples.subarray(s0, s1), sampleRate);
+    chunks.push({
+      index: chunks.length,
+      startSec,
+      endSec,
+      wavBlob: new Blob([wavBuf], { type: 'audio/wav' }),
+      toBase64: () => arrayBufferToPureBase64(wavBuf)
+    });
+  }
+  return chunks;
+}
+
+// EOF: js/audio-processor.js

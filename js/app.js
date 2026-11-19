@@ -668,6 +668,65 @@ function bindAllEvents() {
   safeOn('textareaLongSubs', 'input', renderVadChunkListUI);
   safeOn('chkKeepLineNumbers', 'change', renderVadChunkListUI);
   safeOn('btnAutoFindDbThreshold', 'click', autoFindMatchingDbThreshold);
+  safeOn('btnAiTranscribeLongAudio', 'click', async () => {
+    if (!state.vadAudioBuffer) {
+      showGiantHud('⚠️', '請先選擇長音檔', '請先在左側載入 .mp3 / .wav / .m4a 後再點聽打', 'border-amber-400/90');
+      return;
+    }
+    const btn = document.getElementById('btnAiTranscribeLongAudio');
+    const statusEl = document.getElementById('aiTranscribeStatus');
+    const textarea = document.getElementById('textareaLongSubs');
+    const keepNumbers = document.getElementById('chkKeepLineNumbers')?.checked;
+
+    if (btn) btn.disabled = true;
+    if (statusEl) {
+      statusEl.classList.remove('hidden');
+      statusEl.textContent = '⏳ 準備開始 AI 自動聽打...';
+    }
+
+    try {
+      const result = await transcribeLongAudioWithAi(state.vadAudioBuffer, (msg) => {
+        if (statusEl) statusEl.textContent = msg;
+      });
+
+      const formattedText = result.lines.map((item, idx) => {
+        const cleanEn = String(item.en || '').replace(/^\d+[\.\)、\-\s]+/, '').trim();
+        const enPart = keepNumbers ? `${idx + 1}. ${cleanEn}` : cleanEn;
+        return item.zh ? `${enPart} || ${item.zh}` : enPart;
+      }).join('\n');
+
+      if (textarea) textarea.value = formattedText;
+
+      if (result.segments && result.segments.length > 0) {
+        state.vadSegments = result.segments;
+        renderVadChunkListUI();
+        drawVadWaveformCanvas();
+        if (statusEl) {
+          statusEl.textContent = `✅ ${result.modelUsed} 聽打完成：共 ${result.lines.length} 句（已自動套用精準時間軸，免調 dB 門檻）`;
+        }
+        showGiantHud('🎙️', `聽打完成 ${result.lines.length} 句`, `已自動套用 ${result.modelUsed} 精準切點`, 'border-emerald-400/90');
+      } else {
+        autoFindMatchingDbThreshold();
+        if (statusEl) {
+          statusEl.textContent = `✅ ${result.modelUsed} 雙語聽打完成：共 ${result.lines.length} 句（已自動尋找符合行數的 dB 門檻）`;
+        }
+        showGiantHud('🎙️', `雙語聽打完成 ${result.lines.length} 句`, '已自動寫入英中字幕並對齊切點', 'border-emerald-400/90');
+      }
+    } catch (err) {
+      if (err && err.code === 'NO_API_KEY') {
+        if (statusEl) {
+          statusEl.textContent = '🔑 尚未設定 API Key，請先填入免費 Groq（推薦）或 Gemini 金鑰後重試';
+        }
+        showGiantHud('🔑', '請先設定免費 AI 金鑰', '填入 Groq 或 Gemini Key 即可一鍵自動聽打', 'border-violet-400/90');
+        openAiSettingsModal();
+      } else {
+        if (statusEl) statusEl.textContent = `❌ 聽打失敗：${err?.message || '未知錯誤'}`;
+        showGiantHud('❌', '自動聽打失敗', err?.message || '請確認網路或金鑰額度', 'border-rose-400/90');
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  });
   safeOn('btnLoadSimulatedGptAudio', 'click', generateSimulatedGpt10SentenceLongAudio);
 
   safeOn('btnScrollToChunks', 'click', () => {

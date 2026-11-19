@@ -1,5 +1,5 @@
 // Layer 2: AI Concise Explanation (Gemini / Groq / OpenAI / Free Fallback),
-// Tap-to-Lookup Word Dictionary, TTS Read Aloud & IndexedDB Note Caching
+// Tap-to-Lookup Word Dictionary, TTS Read Aloud, IndexedDB Note Caching & Audio Transcription
 
 import {
   state,
@@ -10,7 +10,10 @@ import {
   savePackToDB
 } from './state-storage.js';
 
-import { unlockiOSAudioAndSpeechSynchronously } from './audio-processor.js';
+import {
+  unlockiOSAudioAndSpeechSynchronously,
+  buildTranscribeAudioChunks
+} from './audio-processor.js';
 import { pausePlaybackInPlace } from './player-engine.js';
 
 // ==========================================
@@ -427,6 +430,202 @@ export function actionCopySentenceWithAiPrompt() {
   const prompt = `請用台灣繁體中文幫我翻譯這句英文，並精簡列出 3 個重點單字/片語與句型結構：\n"${cleanEn}"`;
   copyTextSynchronously(prompt);
   showGiantHud('📋', '已連同提問指令複製', '可直接貼到 ChatGPT / Gemini 詢問', 'border-violet-400/90');
+}
+
+// ==========================================
+// AI AUDIO TRANSCRIPTION (WHISPER / GEMINI)
+// ==========================================
+function pickTranscriptionEngine() {
+  const cfg = state.aiConfig || { provider: 'gemini', geminiKey: '', groqKey: '', openaiKey: '' };
+  if (cfg.provider === 'groq' && cfg.groqKey) {
+    return { type: 'groq', key: cfg.groqKey };
+  }
+  if (cfg.provider === 'openai' && cfg.openaiKey) {
+    return { type: 'openai', key: cfg.openaiKey };
+  }
+  if (cfg.provider === 'gemini' && cfg.geminiKey) {
+    return { type: 'gemini', key: cfg.geminiKey };
+  }
+  // Fallback to whichever API key is already filled (prefer Whisper for exact timestamps)
+  if (cfg.groqKey) return { type: 'groq', key: cfg.groqKey };
+  if (cfg.openaiKey) return { type: 'openai', key: cfg.openaiKey };
+  if (cfg.geminiKey) return { type: 'gemini', key: cfg.geminiKey };
+  return null;
+}
+
+async function transcribeChunkViaWhisper(chunk, providerType, apiKey) {
+  const isGroq = providerType === 'groq';
+  const endpoint = isGroq
+    ? 'https://api.groq.com/openai/v1/audio/transcriptions'
+    : 'https://api.openai.com/v1/audio/transcriptions';
+  const model = isGroq ? 'whisper-large-v3-turbo' : 'whisper-1';
+
+  const form = new FormData();
+  form.append('file', chunk.wavBlob, `chunk_${chunk.index}.wav`);
+  form.append('model', model);
+  form.append('language', 'en');
+  form.append('response_format', 'verbose_json');
+  form.append('temperature', '0');
+
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${String(apiKey || '').trim()}`
+    },
+    body: form
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data?.error?.message || `${isGroq ? 'Groq' : 'OpenAI'} Whisper HTTP ${res.status}`);
+  }
+
+  const results = [];
+  if (Array.isArray(data.segments) && data.segments.length > 0) {
+    for (const seg of data.segments) {
+      const text = String(seg.text || '').trim();
+      if (!text) continue;
+      if (Number(seg.no_speech_prob) > 0.9 && text.length < 12) continue;
+      const startSec = chunk.startSec + Math.max(0, Number(seg.start) || 0);
+      const endSec = chunk.startSec + Math.max(Number(seg.start) || 0, Number(seg.end) || 0);
+      results.push({ en: text, zh: '', startSec, endSec });
+    }
+  } else if (data.text) {
+    const sentences = String(data.text)
+      .split(/(?<=[.!?])\s+/)
+      .map(s => s.trim())
+      .filter(Boolean);
+    const span = Math.max(0.5, chunk.endSec - chunk.startSec);
+    const step = span / Math.max(1, sentences.length);
+    sentences.forEach((en, i) => {
+      results.push({
+        en,
+        zh: '',
+        startSec: chunk.startSec + i * step,
+        endSec: chunk.startSec + (i + 1) * step
+      });
+    });
+  }
+  return { modelUsed: model, entries: results };
+}
+
+async function transcribeChunkViaGemini(chunk, apiKey) {
+  const cleanKey = String(apiKey || '').trim();
+  const models = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+  const prompt = [
+    'Transcribe all spoken English in this audio accurately with proper capitalization and punctuation.',
+    'Output strictly one natural sentence per line using this exact format:',
+    'English sentence || 自然流暢的台灣繁體中文翻譯',
+    'Rules: Do NOT include line numbers, timestamps, speaker labels, markdown bullets, or any extra explanation.'
+  ].join('\n');
+
+  const base64Audio = chunk.toBase64();
+  let lastErr = null;
+
+  for (const modelName of models) {
+    try {
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(cleanKey)}`;
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              { text: prompt },
+              { inline_data: { mime_type: 'audio/wav', data: base64Audio } }
+            ]
+          }],
+          generationConfig: { temperature: 0.1, maxOutputTokens: 4096 }
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        lastErr = new Error(data?.error?.message || `Gemini HTTP ${res.status}`);
+        continue;
+      }
+      const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      if (!reply) continue;
+
+      const entries = reply
+        .split('\n')
+        .map(line => line.replace(/^[\-\*•\s]+/, '').replace(/^\d+[\.\)、\-\s]+/, '').trim())
+        .filter(Boolean)
+        .filter(line => !/^```/.test(line))
+        .map(line => {
+          const parts = line.split('||');
+          return {
+            en: (parts[0] || '').trim(),
+            zh: (parts[1] || '').trim()
+          };
+        })
+        .filter(item => item.en);
+
+      return { modelUsed: modelName, entries };
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error('Gemini 語音聽打失敗');
+}
+
+export async function transcribeLongAudioWithAi(audioBuffer, onProgress = () => {}) {
+  const engine = pickTranscriptionEngine();
+  if (!engine) {
+    const err = new Error('請先於「AI設定」填入免費的 Groq 或 Gemini API Key');
+    err.code = 'NO_API_KEY';
+    throw err;
+  }
+
+  const totalDur = Number(audioBuffer?.duration) || 0;
+  const isWhisper = engine.type === 'groq' || engine.type === 'openai';
+  const maxChunkSec = isWhisper ? 300 : 180;
+
+  onProgress('⚙️ 正在將音檔轉為 16kHz 單聲道 WAV 並智慧分段...');
+  const chunks = buildTranscribeAudioChunks(audioBuffer, maxChunkSec);
+  if (!chunks.length) {
+    throw new Error('音檔長度過短，無法進行語音聽打');
+  }
+
+  const allLines = [];
+  const allSegments = [];
+  let modelUsed = '';
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    const label = isWhisper
+      ? (engine.type === 'groq' ? 'Groq Whisper' : 'OpenAI Whisper')
+      : 'Gemini 雙語聽打';
+    onProgress(`🎙️ ${label} 辨識中 (${i + 1}/${chunks.length} 段)...`);
+
+    if (isWhisper) {
+      const res = await transcribeChunkViaWhisper(chunk, engine.type, engine.key);
+      modelUsed = res.modelUsed;
+      for (const entry of res.entries) {
+        const pad = 0.08;
+        const prevEnd = allSegments.length > 0 ? allSegments[allSegments.length - 1].endSec : 0;
+        const startSec = Math.max(prevEnd, Math.max(0, entry.startSec - pad));
+        const endSec = Math.min(totalDur, Math.max(startSec + 0.2, entry.endSec + pad));
+        allLines.push({ en: entry.en, zh: '' });
+        allSegments.push({ startSec, endSec });
+      }
+    } else {
+      const res = await transcribeChunkViaGemini(chunk, engine.key);
+      modelUsed = res.modelUsed;
+      for (const entry of res.entries) {
+        allLines.push({ en: entry.en, zh: entry.zh });
+      }
+    }
+  }
+
+  if (!allLines.length) {
+    throw new Error('未辨識出有效英文語音，請確認音檔音量或更換清晰音訊');
+  }
+
+  return {
+    mode: isWhisper ? 'whisper' : 'gemini',
+    modelUsed,
+    lines: allLines,
+    segments: isWhisper && allSegments.length === allLines.length ? allSegments : null
+  };
 }
 
 // EOF: js/ai-lookup.js
