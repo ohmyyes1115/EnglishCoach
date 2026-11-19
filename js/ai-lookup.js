@@ -196,26 +196,117 @@ export async function callGeminiFlashConciseApi(promptText, apiKey) {
   throw lastErr || new Error('Gemini API 呼叫失敗');
 }
 
+let cachedGroqKeyFp = '';
+let cachedGroqModelIds = null;
+let cachedGroqChatModel = '';
+let cachedGroqWhisperModel = '';
+
+async function fetchGroqAvailableModelIds(apiKey) {
+  const cleanKey = String(apiKey || '').trim();
+  const fp = cleanKey.slice(-10);
+  if (cachedGroqModelIds && cachedGroqKeyFp === fp) {
+    return cachedGroqModelIds;
+  }
+  if (cachedGroqKeyFp !== fp) {
+    cachedGroqKeyFp = fp;
+    cachedGroqModelIds = null;
+    cachedGroqChatModel = '';
+    cachedGroqWhisperModel = '';
+  }
+  try {
+    const res = await fetch('https://api.groq.com/openai/v1/models', {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${cleanKey}` }
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const ids = (data?.data || [])
+      .filter(m => m && m.id && m.active !== false)
+      .map(m => m.id);
+    cachedGroqModelIds = ids;
+    return ids;
+  } catch (e) {
+    return [];
+  }
+}
+
+function rankGroqChatModels(availableIds) {
+  const excluded = /whisper|guard|tts|playai|orpheus|moderation|embed|safeguard|prompt-guard/i;
+  const chatIds = availableIds.filter(id => !excluded.test(id));
+  const priority = [
+    /^llama-3\.3-70b-versatile$/i,
+    /llama-4-scout/i,
+    /llama-4-maverick/i,
+    /^llama-3\.1-8b-instant$/i,
+    /llama-3\.3/i,
+    /gpt-oss/i,
+    /qwen/i,
+    /llama/i
+  ];
+  const ranked = [];
+  for (const re of priority) {
+    for (const id of chatIds) {
+      if (re.test(id) && !ranked.includes(id)) ranked.push(id);
+    }
+  }
+  for (const id of chatIds) {
+    if (!ranked.includes(id)) ranked.push(id);
+  }
+  return ranked;
+}
+
 export async function callGroqConciseApi(promptText, apiKey) {
-  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${String(apiKey || '').trim()}`
-    },
-    body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
-      temperature: 0.25,
-      max_tokens: 360,
-      messages: [
-        { role: 'system', content: '你是一位專精台灣繁體中文的車用英文口說教練，回答務必極度精簡扼要。' },
-        { role: 'user', content: promptText }
-      ]
-    })
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data?.error?.message || `Groq HTTP ${res.status}`);
-  return { text: data?.choices?.[0]?.message?.content || '', modelUsed: 'llama-3.3-70b' };
+  const cleanKey = String(apiKey || '').trim();
+  const fp = cleanKey.slice(-10);
+
+  let candidates = [];
+  if (cachedGroqChatModel && cachedGroqKeyFp === fp) {
+    candidates.push(cachedGroqChatModel);
+  }
+
+  const availableIds = await fetchGroqAvailableModelIds(cleanKey);
+  const discovered = rankGroqChatModels(availableIds);
+  const fallbacks = [
+    'llama-3.3-70b-versatile',
+    'llama-3.1-8b-instant',
+    'meta-llama/llama-4-scout-17b-16e-instruct'
+  ];
+
+  for (const m of [...discovered, ...fallbacks]) {
+    if (m && !candidates.includes(m)) candidates.push(m);
+  }
+  candidates = candidates.slice(0, 6);
+
+  let lastErr = null;
+  for (const modelName of candidates) {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${cleanKey}`
+      },
+      body: JSON.stringify({
+        model: modelName,
+        temperature: 0.25,
+        max_tokens: 360,
+        messages: [
+          { role: 'system', content: '你是一位專精台灣繁體中文的車用英文口說教練，回答務必極度精簡扼要。' },
+          { role: 'user', content: promptText }
+        ]
+      })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      cachedGroqChatModel = modelName;
+      return { text: data?.choices?.[0]?.message?.content || '', modelUsed: modelName };
+    }
+    const errMsg = data?.error?.message || `Groq HTTP ${res.status}`;
+    lastErr = new Error(errMsg);
+    if (res.status === 401) break; // Invalid key, stop immediately
+    if (cachedGroqChatModel === modelName) cachedGroqChatModel = '';
+  }
+
+  throw lastErr || new Error('Groq 找不到此金鑰可用的對話模型，請檢查 Groq Console 的模型權限設定');
 }
 
 export async function callOpenAiMiniConciseApi(promptText, apiKey) {
@@ -455,28 +546,62 @@ function pickTranscriptionEngine() {
 
 async function transcribeChunkViaWhisper(chunk, providerType, apiKey) {
   const isGroq = providerType === 'groq';
+  const cleanKey = String(apiKey || '').trim();
   const endpoint = isGroq
     ? 'https://api.groq.com/openai/v1/audio/transcriptions'
-    : 'https://api.openai.com/v1/audio/transcriptions';
-  const model = isGroq ? 'whisper-large-v3-turbo' : 'whisper-1';
+    : 'https://api.openai.com/openai/v1/audio/transcriptions';
 
-  const form = new FormData();
-  form.append('file', chunk.wavBlob, `chunk_${chunk.index}.wav`);
-  form.append('model', model);
-  form.append('language', 'en');
-  form.append('response_format', 'verbose_json');
-  form.append('temperature', '0');
+  let models = isGroq ? ['whisper-large-v3-turbo', 'whisper-large-v3'] : ['whisper-1'];
+  if (isGroq) {
+    const fp = cleanKey.slice(-10);
+    const ordered = [];
+    if (cachedGroqWhisperModel && cachedGroqKeyFp === fp) ordered.push(cachedGroqWhisperModel);
+    const availableIds = await fetchGroqAvailableModelIds(cleanKey);
+    const whisperIds = availableIds.filter(id => /whisper/i.test(id));
+    for (const pref of ['whisper-large-v3-turbo', 'whisper-large-v3']) {
+      if (whisperIds.includes(pref) && !ordered.includes(pref)) ordered.push(pref);
+    }
+    for (const id of whisperIds) {
+      if (!ordered.includes(id)) ordered.push(id);
+    }
+    for (const fb of models) {
+      if (!ordered.includes(fb)) ordered.push(fb);
+    }
+    models = ordered;
+  }
 
-  const res = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${String(apiKey || '').trim()}`
-    },
-    body: form
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data?.error?.message || `${isGroq ? 'Groq' : 'OpenAI'} Whisper HTTP ${res.status}`);
+  let data = null;
+  let modelUsed = models[0];
+  let lastErr = null;
+
+  for (const model of models) {
+    const form = new FormData();
+    form.append('file', chunk.wavBlob, `chunk_${chunk.index}.wav`);
+    form.append('model', model);
+    form.append('language', 'en');
+    form.append('response_format', 'verbose_json');
+    form.append('temperature', '0');
+
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${cleanKey}`
+      },
+      body: form
+    });
+    const json = await res.json().catch(() => ({}));
+    if (res.ok) {
+      data = json;
+      modelUsed = model;
+      if (isGroq) cachedGroqWhisperModel = model;
+      break;
+    }
+    lastErr = new Error(json?.error?.message || `${isGroq ? 'Groq' : 'OpenAI'} Whisper HTTP ${res.status}`);
+    if (res.status === 401) break;
+  }
+
+  if (!data) {
+    throw lastErr || new Error('Whisper 語音辨識失敗');
   }
 
   const results = [];
@@ -505,7 +630,7 @@ async function transcribeChunkViaWhisper(chunk, providerType, apiKey) {
       });
     });
   }
-  return { modelUsed: model, entries: results };
+  return { modelUsed, entries: results };
 }
 
 async function transcribeChunkViaGemini(chunk, apiKey) {

@@ -26,6 +26,7 @@ import {
   precomputeAudioEnvelope,
   refreshVadWorkbenchPreview,
   renderVadChunkListUI,
+  drawVadWaveformCanvas,
   autoFindMatchingDbThreshold,
   generateSimulatedGpt10SentenceLongAudio,
   buildSplitPackFromVad,
@@ -62,7 +63,8 @@ import {
   callOpenAiMiniConciseApi,
   handleTapEnglishWordLookup,
   actionAiExplainCurrentSentence,
-  actionCopySentenceWithAiPrompt
+  actionCopySentenceWithAiPrompt,
+  transcribeLongAudioWithAi
 } from './ai-lookup.js';
 
 // ==========================================
