@@ -156,6 +156,59 @@ export function decodeWavDataUriToPCM(dataUri) {
   }
 }
 
+export function createSilentWavDataUri(durationSec = 1.0) {
+  const sampleRate = 8000;
+  const numSamples = Math.max(800, Math.floor(sampleRate * durationSec));
+  const buffer = new ArrayBuffer(44 + numSamples * 2);
+  const view = new DataView(buffer);
+  const writeStr = (offset, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + numSamples * 2, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, numSamples * 2, true);
+
+  // Near-zero dither (-90dBFS, completely inaudible) so iOS CoreAudio stays active during gaps
+  for (let i = 0; i < numSamples; i++) {
+    view.setInt16(44 + i * 2, (i & 1) ? 1 : -1, true);
+  }
+
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const chunk = 8192;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return 'data:audio/wav;base64,' + btoa(binary);
+}
+
+export function dataUriToBlobUrl(dataUri) {
+  try {
+    const str = String(dataUri || '');
+    const match = str.match(/^data:([^;]+);base64,(.+)$/);
+    if (!match) return str;
+    const mime = match[1] || 'audio/wav';
+    const bin = atob(match[2]);
+    const len = bin.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+    const blob = new Blob([bytes], { type: mime });
+    return URL.createObjectURL(blob);
+  } catch (e) {
+    return dataUri;
+  }
+}
+
 export function unlockiOSAudioAndSpeechSynchronously() {
   try {
     if (navigator.audioSession && navigator.audioSession.type !== 'playback') {
@@ -177,11 +230,20 @@ export function unlockiOSAudioAndSpeechSynchronously() {
   try {
     const ka = document.getElementById('keepAliveAudio');
     if (ka && !ka.src) {
-      ka.src = createToneWavDataUri(1.0, 200, 0.0002);
+      ka.src = createSilentWavDataUri(1.0);
     }
-    if (ka && ka.paused) {
-      ka.volume = 0.01;
-      ka.play().catch(() => {});
+    // Unlock keepAliveAudio only once on first user gesture, then immediately pause
+    // so it never collides with masterAudio on iOS Safari's single-channel audio policy
+    if (ka && !ka.dataset.unlocked) {
+      ka.dataset.unlocked = '1';
+      const p = ka.play();
+      if (p && p.then) {
+        p.then(() => {
+          if (!state.isInGap) ka.pause();
+        }).catch(() => {
+          delete ka.dataset.unlocked;
+        });
+      }
     }
   } catch (e) {}
 }

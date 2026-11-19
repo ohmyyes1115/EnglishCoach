@@ -15,6 +15,8 @@ import {
 import {
   getAudioContext,
   createToneWavDataUri,
+  createSilentWavDataUri,
+  dataUriToBlobUrl,
   decodeWavDataUriToPCM,
   unlockiOSAudioAndSpeechSynchronously,
   mergeAudioPairPCM,
@@ -29,6 +31,13 @@ let progressRafId = null;
 let watchdogIntervalId = null;
 let lastProgressAdvanceMs = 0;
 let lastObservedAudioTime = 0;
+let watchdogRetryCount = 0;
+let playbackAttemptId = 0;
+let recoveryInProgress = false;
+let systemHooksBound = false;
+
+let activeBlobUrl = null;
+let loadedAudioDataUri = null;
 
 let activeWebAudioSource = null;
 let activeWebAudioCtx = null;
@@ -51,6 +60,42 @@ export function registerPlayerCallbacks(cbs = {}) {
 }
 
 // ==========================================
+// BLOB URL & GAP KEEP-ALIVE HELPERS
+// ==========================================
+function ensureMasterAudioSource(audio, targetDataUri) {
+  if (loadedAudioDataUri === targetDataUri && activeBlobUrl && audio.src === activeBlobUrl) {
+    return false; // Already loaded
+  }
+  if (activeBlobUrl && activeBlobUrl.startsWith('blob:')) {
+    try { URL.revokeObjectURL(activeBlobUrl); } catch (e) {}
+  }
+  activeBlobUrl = dataUriToBlobUrl(targetDataUri);
+  loadedAudioDataUri = targetDataUri;
+  audio.src = activeBlobUrl;
+  return true; // Newly assigned
+}
+
+function startGapKeepAlive() {
+  try {
+    const ka = document.getElementById('keepAliveAudio');
+    if (!ka) return;
+    if (!ka.src) ka.src = createSilentWavDataUri(1.0);
+    if (ka.paused) {
+      ka.play().catch(() => {});
+    }
+  } catch (e) {}
+}
+
+function stopGapKeepAlive() {
+  try {
+    const ka = document.getElementById('keepAliveAudio');
+    if (ka && !ka.paused) {
+      ka.pause();
+    }
+  } catch (e) {}
+}
+
+// ==========================================
 // CORE PLAYBACK ENGINE & WATCHDOG
 // ==========================================
 export function stopAllAudioTimers() {
@@ -63,6 +108,7 @@ export function stopAllAudioTimers() {
     progressRafId = null;
   }
   if (activeWebAudioSource) {
+    try { activeWebAudioSource.onended = null; } catch (e) {}
     try { activeWebAudioSource.stop(); } catch (e) {}
     activeWebAudioSource = null;
     activeWebAudioCtx = null;
@@ -70,14 +116,20 @@ export function stopAllAudioTimers() {
 }
 
 export function pausePlaybackInPlace(reasonLabel = '原地暫停') {
+  playbackAttemptId++;
+  recoveryInProgress = false;
   const audio = document.getElementById('masterAudio');
-  if (audio && !audio.paused && audio.currentTime > 0) {
-    state.pausedOffsetSec = audio.currentTime;
-  } else if (activeWebAudioSource && activeWebAudioCtx) {
+  if (activeWebAudioSource && activeWebAudioCtx && activeWebAudioCtx.state === 'running') {
     const elapsed = (activeWebAudioCtx.currentTime - webAudioStartTimestamp) * (SPEED_STEPS[state.speedIndex] || 1.0);
     state.pausedOffsetSec = Math.min(webAudioDuration, webAudioStartOffset + elapsed);
+  } else if (audio && !audio.paused && audio.currentTime > 0) {
+    state.pausedOffsetSec = audio.currentTime;
+  } else if (lastObservedAudioTime > 0) {
+    state.pausedOffsetSec = lastObservedAudioTime;
   }
+
   stopAllAudioTimers();
+  stopGapKeepAlive();
   state.isPlaying = false;
   state.isInGap = false;
   if (audio) {
@@ -91,29 +143,40 @@ export function pausePlaybackInPlace(reasonLabel = '原地暫停') {
   playerCallbacks.onUpdatePlayPauseUI(`${reasonLabel} (${formatTimeSec(state.pausedOffsetSec)})`);
 }
 
+function getLivePlaybackTimeSec() {
+  const speed = SPEED_STEPS[state.speedIndex] || 1.0;
+  if (activeWebAudioSource && activeWebAudioCtx) {
+    if (activeWebAudioCtx.state !== 'running') {
+      return webAudioStartOffset;
+    }
+    return Math.max(0, webAudioStartOffset + (activeWebAudioCtx.currentTime - webAudioStartTimestamp) * speed);
+  }
+  const audio = document.getElementById('masterAudio');
+  return audio ? (Number(audio.currentTime) || 0) : 0;
+}
+
+function renderProgressBarAt(curSec, totalDur) {
+  const pct = Math.min(100, Math.max(0, (curSec / Math.max(0.2, totalDur)) * 100));
+  const timeCurEl = document.getElementById('timeCurrent');
+  const fillEl = document.getElementById('progressBarFill');
+  if (timeCurEl) timeCurEl.textContent = formatTimeSec(curSec);
+  if (fillEl) fillEl.style.width = `${pct}%`;
+}
+
 export function startProgressLoop() {
   if (progressRafId) cancelAnimationFrame(progressRafId);
-  const audio = document.getElementById('masterAudio');
   const item = state.currentPack?.items?.[state.currentIndex];
   const totalDur = Number(item?.durationSec) || 2.8;
 
   const step = () => {
-    if (!state.isPlaying) return;
-    let cur = 0;
-    if (activeWebAudioSource && activeWebAudioCtx) {
-      cur = webAudioStartOffset + (activeWebAudioCtx.currentTime - webAudioStartTimestamp) * (SPEED_STEPS[state.speedIndex] || 1.0);
-    } else if (audio) {
-      cur = audio.currentTime || 0;
-    }
+    if (!state.isPlaying || state.isInGap) return;
+    const cur = getLivePlaybackTimeSec();
     if (Math.abs(cur - lastObservedAudioTime) > 0.02) {
       lastObservedAudioTime = cur;
       lastProgressAdvanceMs = Date.now();
+      watchdogRetryCount = 0;
     }
-    const pct = Math.min(100, Math.max(0, (cur / Math.max(0.2, totalDur)) * 100));
-    const timeCurEl = document.getElementById('timeCurrent');
-    const fillEl = document.getElementById('progressBarFill');
-    if (timeCurEl) timeCurEl.textContent = formatTimeSec(cur);
-    if (fillEl) fillEl.style.width = `${pct}%`;
+    renderProgressBarAt(cur, totalDur);
     progressRafId = requestAnimationFrame(step);
   };
   progressRafId = requestAnimationFrame(step);
@@ -133,16 +196,41 @@ export function speakDemoSentenceIfEnabled(item, startOffsetSec = 0) {
   } catch (e) {}
 }
 
-export function startWebAudioMainPlaybackFallback(item, offsetSec = 0) {
+export async function startWebAudioMainPlaybackFallback(item, offsetSec = 0, attemptId = playbackAttemptId) {
+  const audio = document.getElementById('masterAudio');
+  if (audio) {
+    try { audio.pause(); } catch (e) {}
+  }
+  stopGapKeepAlive();
+
   const pcm = decodeWavDataUriToPCM(item.audioDataUri);
   const ctx = getAudioContext();
   if (!pcm || !ctx) {
-    handleClipEnded();
-    return;
+    return false;
   }
+
+  // Ensure AudioContext is genuinely running before starting (prevents frozen 00:00.0 state on iOS)
+  if (ctx.state !== 'running') {
+    try {
+      await Promise.race([
+        ctx.resume(),
+        new Promise((resolve) => setTimeout(resolve, 450))
+      ]);
+    } catch (e) {}
+  }
+
+  if (attemptId !== playbackAttemptId || !state.isPlaying || state.isInGap) {
+    return false;
+  }
+  if (ctx.state !== 'running') {
+    return false;
+  }
+
   if (activeWebAudioSource) {
+    try { activeWebAudioSource.onended = null; } catch (e) {}
     try { activeWebAudioSource.stop(); } catch (e) {}
   }
+
   const buf = ctx.createBuffer(1, pcm.samples.length, pcm.sampleRate);
   buf.getChannelData(0).set(pcm.samples);
   const src = ctx.createBufferSource();
@@ -156,10 +244,11 @@ export function startWebAudioMainPlaybackFallback(item, offsetSec = 0) {
   webAudioStartOffset = Math.min(Math.max(0, buf.duration - 0.05), Math.max(0, offsetSec));
   webAudioDuration = buf.duration;
   activeWebAudioSource = src;
+  lastObservedAudioTime = webAudioStartOffset;
   lastProgressAdvanceMs = Date.now();
 
   src.onended = () => {
-    if (activeWebAudioSource === src && state.isPlaying && !state.isInGap) {
+    if (activeWebAudioSource === src && attemptId === playbackAttemptId && state.isPlaying && !state.isInGap) {
       activeWebAudioSource = null;
       activeWebAudioCtx = null;
       handleClipEnded();
@@ -167,11 +256,119 @@ export function startWebAudioMainPlaybackFallback(item, offsetSec = 0) {
   };
   src.start(0, webAudioStartOffset);
   startProgressLoop();
+  return true;
+}
+
+function playMasterAudioAtOffset(audio, targetOffset, attemptId, forceReload = false) {
+  const applySeekAndPlay = () => {
+    if (attemptId !== playbackAttemptId || !state.isPlaying || state.isInGap) return;
+    try {
+      audio.currentTime = targetOffset;
+    } catch (e) {}
+    const playPromise = audio.play();
+    if (playPromise && playPromise.catch) {
+      playPromise.catch((err) => {
+        if (attemptId !== playbackAttemptId || !state.isPlaying || state.isInGap) return;
+        if (err && err.name === 'AbortError') return;
+        recoverStalledPlayback(attemptId, `play() rejected: ${err?.name || 'error'}`);
+      });
+    }
+  };
+
+  if (forceReload) {
+    try { audio.load(); } catch (e) {}
+  }
+
+  if (!forceReload && audio.readyState >= 1) {
+    applySeekAndPlay();
+  } else {
+    let fired = false;
+    const onReady = () => {
+      if (fired) return;
+      fired = true;
+      audio.removeEventListener('loadedmetadata', onReady);
+      audio.removeEventListener('canplay', onReady);
+      applySeekAndPlay();
+    };
+    audio.addEventListener('loadedmetadata', onReady, { once: true });
+    audio.addEventListener('canplay', onReady, { once: true });
+    // Safety kick in case metadata event already fired or doesn't fire on cached blob
+    setTimeout(() => {
+      if (!fired && attemptId === playbackAttemptId && state.isPlaying && !state.isInGap) {
+        onReady();
+      }
+    }, 120);
+  }
+}
+
+async function recoverStalledPlayback(attemptId, reason = 'stalled') {
+  if (recoveryInProgress) return;
+  if (attemptId !== playbackAttemptId || !state.isPlaying || state.isInGap) return;
+
+  const item = state.currentPack?.items?.[state.currentIndex];
+  const audio = document.getElementById('masterAudio');
+  if (!item || !audio) return;
+
+  recoveryInProgress = true;
+  const resumeAt = Math.max(0, lastObservedAudioTime || state.pausedOffsetSec || 0);
+
+  try {
+    if (watchdogRetryCount === 0) {
+      // Stage 1: Clean reload on masterAudio (keeps iOS background / lock-screen audio alive)
+      watchdogRetryCount = 1;
+      lastProgressAdvanceMs = Date.now();
+      if (typeof window.logDiag === 'function') {
+        window.logDiag('WARN', `播放自癒 #1 (${reason})：重新載入主音軌自 ${resumeAt.toFixed(1)}s 續播`);
+      }
+      stopAllAudioTimers();
+      stopGapKeepAlive();
+      try { audio.pause(); } catch (e) {}
+
+      const targetUri = item.audioDataUri || createToneWavDataUri(item.durationSec || 2.8);
+      if (activeBlobUrl && activeBlobUrl.startsWith('blob:')) {
+        try { URL.revokeObjectURL(activeBlobUrl); } catch (e) {}
+      }
+      activeBlobUrl = null;
+      loadedAudioDataUri = null;
+      ensureMasterAudioSource(audio, targetUri);
+      audio.muted = Boolean(state.currentPack.isDemoTTS && state.demoVoiceMode === 'tts_only');
+      audio.playbackRate = SPEED_STEPS[state.speedIndex] || 1.0;
+      playMasterAudioAtOffset(audio, resumeAt, attemptId, true);
+      startProgressLoop();
+    } else if (watchdogRetryCount === 1) {
+      // Stage 2: Verified WebAudio fallback (only if AudioContext can actually run)
+      watchdogRetryCount = 2;
+      lastProgressAdvanceMs = Date.now();
+      if (typeof window.logDiag === 'function') {
+        window.logDiag('WARN', `播放自癒 #2 (${reason})：嘗試切換 WebAudio 備援通道`);
+      }
+      const ok = await startWebAudioMainPlaybackFallback(item, resumeAt, attemptId);
+      if (!ok && attemptId === playbackAttemptId && state.isPlaying && !state.isInGap) {
+        pausePlaybackInPlace('系統暫停，點播放續播');
+        showGiantHud('⏸️', '系統暫停了音訊', '點擊播放鍵即可原地繼續', 'border-amber-400/90');
+      }
+    } else {
+      // Stage 3: Both channels blocked by OS (e.g. phone call / Siri / lock-screen suspension)
+      if (typeof window.logDiag === 'function') {
+        window.logDiag('WARN', `播放自癒終止 (${reason})：音訊通道遭系統中斷，自動轉為原地暫停`);
+      }
+      pausePlaybackInPlace('系統暫停，點播放續播');
+      showGiantHud('⏸️', '系統中斷音訊', '點擊播放鍵即可原地繼續', 'border-amber-400/90');
+    }
+  } finally {
+    recoveryInProgress = false;
+  }
 }
 
 export function playCurrentSentenceClip(isFastSameSentenceRepeat = false, resumeOffsetSec = 0) {
   if (!state.currentPack || !state.currentPack.items.length) return;
+  const attemptId = ++playbackAttemptId;
+  recoveryInProgress = false;
+  watchdogRetryCount = 0;
+
   stopAllAudioTimers();
+  stopGapKeepAlive();
+
   state.isPlaying = true;
   state.isInGap = false;
   const item = state.currentPack.items[state.currentIndex];
@@ -179,66 +376,52 @@ export function playCurrentSentenceClip(isFastSameSentenceRepeat = false, resume
   const speed = SPEED_STEPS[state.speedIndex] || 1.0;
 
   playerCallbacks.onRenderMainStage();
-  lastProgressAdvanceMs = Date.now();
-  lastObservedAudioTime = resumeOffsetSec;
 
-  speakDemoSentenceIfEnabled(item, resumeOffsetSec);
+  const targetOffset = Math.max(0, Number(resumeOffsetSec) || 0);
+  state.pausedOffsetSec = 0;
+  lastProgressAdvanceMs = Date.now();
+  lastObservedAudioTime = targetOffset;
+  renderProgressBarAt(targetOffset, Number(item.durationSec) || 2.8);
+
+  speakDemoSentenceIfEnabled(item, targetOffset);
 
   if (!audio) return;
   audio.muted = Boolean(state.currentPack.isDemoTTS && state.demoVoiceMode === 'tts_only');
   audio.playbackRate = speed;
 
-  const targetOffset = Math.max(0, Number(resumeOffsetSec) || 0);
-  state.pausedOffsetSec = 0;
+  const targetUri = item.audioDataUri || createToneWavDataUri(item.durationSec || 2.8);
+  const srcChanged = ensureMasterAudioSource(audio, targetUri);
 
-  // Same-sentence zero-reload fast repeat or in-place resume
-  if (isFastSameSentenceRepeat && audio.src && audio.src.startsWith('data:audio')) {
-    try {
-      audio.currentTime = targetOffset;
-      const p = audio.play();
-      if (p && p.catch) {
-        p.catch(() => startWebAudioMainPlaybackFallback(item, targetOffset));
-      }
-      startProgressLoop();
-      return;
-    } catch (e) {}
+  // Same-sentence zero-reload fast repeat or in-place resume when blob is already ready
+  if (isFastSameSentenceRepeat && !srcChanged && audio.readyState >= 2) {
+    playMasterAudioAtOffset(audio, targetOffset, attemptId, false);
+    startProgressLoop();
+    return;
   }
 
-  audio.src = item.audioDataUri || createToneWavDataUri(item.durationSec || 2.8);
-  try {
-    if (targetOffset > 0.05) {
-      audio.currentTime = targetOffset;
-    }
-  } catch (e) {}
-
-  const playPromise = audio.play();
-  if (playPromise && playPromise.catch) {
-    playPromise.catch(() => {
-      startWebAudioMainPlaybackFallback(item, targetOffset);
-    });
-  }
+  playMasterAudioAtOffset(audio, targetOffset, attemptId, srcChanged);
   startProgressLoop();
 }
 
 export function handleClipEnded() {
-  if (!state.isPlaying) return;
+  if (!state.isPlaying || state.isInGap) return;
+  const endedAttemptId = playbackAttemptId;
   stopAllAudioTimers();
   state.pausedOffsetSec = 0;
+  watchdogRetryCount = 0;
 
   const item = state.currentPack?.items?.[state.currentIndex];
   const dur = Number(item?.durationSec) || 2.8;
-  const timeCurEl = document.getElementById('timeCurrent');
-  const fillEl = document.getElementById('progressBarFill');
-  if (timeCurEl) timeCurEl.textContent = formatTimeSec(dur);
-  if (fillEl) fillEl.style.width = '100%';
+  renderProgressBarAt(dur, dur);
 
   let gapSec = 0;
   if (state.gapMode === 'auto') gapSec = Math.max(1.0, Math.min(8.0, dur));
   else gapSec = Number(state.gapMode) || 0;
 
   const proceedNextStep = () => {
-    if (!state.isPlaying) return;
+    if (!state.isPlaying || endedAttemptId !== playbackAttemptId) return;
     state.isInGap = false;
+    stopGapKeepAlive();
     const isInf = state.repeatTarget >= 999;
     if (isInf || state.repeatCountCurrent < state.repeatTarget) {
       state.repeatCountCurrent++;
@@ -253,14 +436,8 @@ export function handleClipEnded() {
 
   if (gapSec > 0.05) {
     state.isInGap = true;
-    // Ensure silent keep-alive audio remains active during inter-sentence gap on iOS Safari
-    try {
-      const ka = document.getElementById('keepAliveAudio');
-      if (ka && ka.paused && ka.src) {
-        ka.volume = 0.01;
-        ka.play().catch(() => {});
-      }
-    } catch (e) {}
+    // Play pure silent keep-alive ONLY during inter-sentence gap while masterAudio is idle
+    startGapKeepAlive();
     playerCallbacks.onUpdatePlayPauseUI(`跟讀留白 (${gapSec.toFixed(0)}秒)...`);
     gapTimerId = setTimeout(proceedNextStep, gapSec * 1000);
   } else {
@@ -269,19 +446,69 @@ export function handleClipEnded() {
 }
 
 export function setupWatchdogTimer() {
+  if (!systemHooksBound) {
+    systemHooksBound = true;
+
+    const audio = document.getElementById('masterAudio');
+    if (audio) {
+      audio.addEventListener('error', () => {
+        if (state.isPlaying && !state.isInGap && !activeWebAudioSource) {
+          recoverStalledPlayback(playbackAttemptId, 'masterAudio error event');
+        }
+      });
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && state.isPlaying && !state.isInGap) {
+        const cur = getLivePlaybackTimeSec();
+        if (Math.abs(cur - lastObservedAudioTime) > 0.02) {
+          lastObservedAudioTime = cur;
+          lastProgressAdvanceMs = Date.now();
+        }
+        startProgressLoop();
+      }
+    });
+  }
+
   if (watchdogIntervalId) clearInterval(watchdogIntervalId);
   watchdogIntervalId = setInterval(() => {
-    if (!state.isPlaying || state.isInGap) return;
-    const stalledMs = Date.now() - lastProgressAdvanceMs;
+    if (!state.isPlaying || state.isInGap || recoveryInProgress) return;
     const item = state.currentPack?.items?.[state.currentIndex];
     if (!item) return;
-    if (stalledMs > 750 && !activeWebAudioSource) {
-      if (typeof window.logDiag === 'function') {
-        window.logDiag('WARN', `看門狗偵測到 00:00.0 卡住 (${stalledMs}ms)，自動切換 WebAudio 通道續播`);
-      }
-      startWebAudioMainPlaybackFallback(item, lastObservedAudioTime || state.pausedOffsetSec || 0);
+
+    const audio = document.getElementById('masterAudio');
+    const totalDur = Number(item.durationSec) || 2.8;
+
+    // 1. Catch missed 'ended' event on HTMLAudioElement
+    if (!activeWebAudioSource && audio && audio.ended) {
+      handleClipEnded();
+      return;
     }
-  }, 350);
+
+    // 2. Read live audio clock directly (works even when screen is off & rAF is paused)
+    const liveCur = getLivePlaybackTimeSec();
+    if (Math.abs(liveCur - lastObservedAudioTime) > 0.02) {
+      lastObservedAudioTime = liveCur;
+      lastProgressAdvanceMs = Date.now();
+      watchdogRetryCount = 0;
+      renderProgressBarAt(liveCur, totalDur);
+      return;
+    }
+
+    const stalledMs = Date.now() - lastProgressAdvanceMs;
+
+    // 3. Catch near-end freeze where iOS stops 0.1s before end without firing 'ended'
+    if (liveCur > 0.2 && liveCur >= totalDur - 0.15 && stalledMs > 900) {
+      handleClipEnded();
+      return;
+    }
+
+    // 4. Trigger progressive recovery when genuinely stalled (including stalled WebAudio)
+    const stallThresholdMs = activeWebAudioSource ? 1500 : 1200;
+    if (stalledMs > stallThresholdMs) {
+      recoverStalledPlayback(playbackAttemptId, `stalled ${stalledMs}ms at ${liveCur.toFixed(1)}s`);
+    }
+  }, 400);
 }
 
 // ==========================================
@@ -351,7 +578,6 @@ export function actionCycleSpeed() {
   const audio = document.getElementById('masterAudio');
   if (audio) audio.playbackRate = speed;
   if (activeWebAudioSource && activeWebAudioCtx) {
-    // Re-anchor WebAudio elapsed offset before changing playbackRate
     webAudioStartOffset += (activeWebAudioCtx.currentTime - webAudioStartTimestamp) * prevSpeed;
     webAudioStartTimestamp = activeWebAudioCtx.currentTime;
     activeWebAudioSource.playbackRate.value = speed;
@@ -478,3 +704,5 @@ export function triggerCopyCurrentSentence() {
   copyTextSynchronously(cleanEn);
   showGiantHud('📋', '已複製乾淨英文並原地暫停', cleanEn, 'border-sky-400/90');
 }
+
+// EOF: js/player-engine.js
