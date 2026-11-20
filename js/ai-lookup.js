@@ -544,6 +544,8 @@ function pickTranscriptionEngine() {
   return null;
 }
 
+const WHISPER_HALLUCINATION_RE = /^(thank you\.?|thanks for watching\.?|thanks\.?|you\.?|bye\.?|subtitles by.*|amara\.org.*)$/i;
+
 async function transcribeChunkViaWhisper(chunk, providerType, apiKey) {
   const isGroq = providerType === 'groq';
   const cleanKey = String(apiKey || '').trim();
@@ -551,14 +553,15 @@ async function transcribeChunkViaWhisper(chunk, providerType, apiKey) {
     ? 'https://api.groq.com/openai/v1/audio/transcriptions'
     : 'https://api.openai.com/openai/v1/audio/transcriptions';
 
-  let models = isGroq ? ['whisper-large-v3-turbo', 'whisper-large-v3'] : ['whisper-1'];
+  // Prioritize full whisper-large-v3 over turbo for much higher accuracy and fewer skipped sentences
+  let models = isGroq ? ['whisper-large-v3', 'whisper-large-v3-turbo'] : ['whisper-1'];
   if (isGroq) {
     const fp = cleanKey.slice(-10);
     const ordered = [];
     if (cachedGroqWhisperModel && cachedGroqKeyFp === fp) ordered.push(cachedGroqWhisperModel);
     const availableIds = await fetchGroqAvailableModelIds(cleanKey);
     const whisperIds = availableIds.filter(id => /whisper/i.test(id));
-    for (const pref of ['whisper-large-v3-turbo', 'whisper-large-v3']) {
+    for (const pref of ['whisper-large-v3', 'whisper-large-v3-turbo']) {
       if (whisperIds.includes(pref) && !ordered.includes(pref)) ordered.push(pref);
     }
     for (const id of whisperIds) {
@@ -604,15 +607,37 @@ async function transcribeChunkViaWhisper(chunk, providerType, apiKey) {
     throw lastErr || new Error('Whisper 語音辨識失敗');
   }
 
+  const sizeMb = (chunk.wavBlob.size / (1024 * 1024)).toFixed(2);
+  const segCount = Array.isArray(data.segments) ? data.segments.length : 0;
+  console.info(`[ASR] model=${modelUsed} chunk=#${chunk.index} (${chunk.startSec.toFixed(2)}s-${chunk.endSec.toFixed(2)}s, ${sizeMb}MB) -> ${segCount} segments`);
+  if (typeof window.logDiag === 'function') {
+    window.logDiag('INFO', `ASR ${modelUsed} chunk#${chunk.index}: ${segCount} segs (${sizeMb}MB)`);
+  }
+
   const results = [];
   if (Array.isArray(data.segments) && data.segments.length > 0) {
     for (const seg of data.segments) {
       const text = String(seg.text || '').trim();
       if (!text) continue;
-      if (Number(seg.no_speech_prob) > 0.9 && text.length < 12) continue;
-      const startSec = chunk.startSec + Math.max(0, Number(seg.start) || 0);
-      const endSec = chunk.startSec + Math.max(Number(seg.start) || 0, Number(seg.end) || 0);
-      results.push({ en: text, zh: '', startSec, endSec });
+      const noSpeech = Number(seg.no_speech_prob) || 0;
+      const avgLogprob = Number.isFinite(Number(seg.avg_logprob)) ? Number(seg.avg_logprob) : 0;
+      const rawStart = Math.max(0, Number(seg.start) || 0);
+      const rawEnd = Math.max(rawStart, Number(seg.end) || 0);
+      const segDur = rawEnd - rawStart;
+
+      // Filter silence hallucinations without dropping clear real speech
+      if (noSpeech > 0.85 && text.length < 20) continue;
+      if (WHISPER_HALLUCINATION_RE.test(text) && (noSpeech > 0.45 || avgLogprob < -0.85 || segDur > 4.5)) {
+        console.warn(`[ASR] Filtered likely silence hallucination: "${text}" (no_speech=${noSpeech.toFixed(2)}, dur=${segDur.toFixed(1)}s)`);
+        continue;
+      }
+
+      results.push({
+        en: text,
+        zh: '',
+        startSec: chunk.startSec + rawStart,
+        endSec: chunk.startSec + rawEnd
+      });
     }
   } else if (data.text) {
     const sentences = String(data.text)
@@ -702,12 +727,13 @@ export async function transcribeLongAudioWithAi(audioBuffer, onProgress = () => 
 
   const totalDur = Number(audioBuffer?.duration) || 0;
   const isWhisper = engine.type === 'groq' || engine.type === 'openai';
-  const maxChunkSec = isWhisper ? 300 : 180;
+  // 420s of 16kHz 16-bit mono WAV is ~13.4MB (well below Groq/OpenAI 25MB limit)
+  const maxChunkSec = isWhisper ? 420 : 180;
 
-  onProgress('⚙️ 正在將音檔轉為 16kHz 單聲道 WAV 並智慧分段...');
-  const chunks = buildTranscribeAudioChunks(audioBuffer, maxChunkSec);
+  onProgress('⚙️ 正在進行 16kHz 抗混疊重採樣並裁切開頭/結尾靜音...');
+  const { chunks, trimmedHeadSec, resamplerUsed } = await buildTranscribeAudioChunks(audioBuffer, maxChunkSec);
   if (!chunks.length) {
-    throw new Error('音檔長度過短，無法進行語音聽打');
+    throw new Error('音檔長度過短或全段為靜音，無法進行語音聽打');
   }
 
   const allLines = [];
@@ -719,16 +745,25 @@ export async function transcribeLongAudioWithAi(audioBuffer, onProgress = () => 
     const label = isWhisper
       ? (engine.type === 'groq' ? 'Groq Whisper' : 'OpenAI Whisper')
       : 'Gemini 雙語聽打';
-    onProgress(`🎙️ ${label} 辨識中 (${i + 1}/${chunks.length} 段)...`);
+    const trimNote = trimmedHeadSec > 0.2 ? `｜已裁去開頭 ${trimmedHeadSec.toFixed(1)}s 靜音` : '';
+    onProgress(`🎙️ ${label} 辨識中 (${i + 1}/${chunks.length} 段${trimNote})...`);
 
     if (isWhisper) {
       const res = await transcribeChunkViaWhisper(chunk, engine.type, engine.key);
       modelUsed = res.modelUsed;
       for (const entry of res.entries) {
-        const pad = 0.08;
-        const prevEnd = allSegments.length > 0 ? allSegments[allSegments.length - 1].endSec : 0;
-        const startSec = Math.max(prevEnd, Math.max(0, entry.startSec - pad));
-        const endSec = Math.min(totalDur, Math.max(startSec + 0.2, entry.endSec + pad));
+        const pad = 0.06;
+        let startSec = Math.max(0, entry.startSec - pad);
+        let endSec = Math.min(totalDur, Math.max(startSec + 0.2, entry.endSec + pad));
+        if (allSegments.length > 0) {
+          const prev = allSegments[allSegments.length - 1];
+          if (startSec < prev.endSec) {
+            const mid = (prev.endSec + startSec) / 2;
+            prev.endSec = Math.max(prev.startSec + 0.15, mid);
+            startSec = prev.endSec;
+            endSec = Math.max(startSec + 0.15, endSec);
+          }
+        }
         allLines.push({ en: entry.en, zh: '' });
         allSegments.push({ startSec, endSec });
       }
@@ -749,7 +784,10 @@ export async function transcribeLongAudioWithAi(audioBuffer, onProgress = () => 
     mode: isWhisper ? 'whisper' : 'gemini',
     modelUsed,
     lines: allLines,
-    segments: isWhisper && allSegments.length === allLines.length ? allSegments : null
+    segments: isWhisper && allSegments.length === allLines.length ? allSegments : null,
+    trimmedHeadSec,
+    chunkCount: chunks.length,
+    resamplerUsed
   };
 }
 

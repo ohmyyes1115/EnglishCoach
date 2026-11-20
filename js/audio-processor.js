@@ -958,7 +958,7 @@ export async function importZipOrMultiFiles(fileList, packNameInput, onStatusUpd
 }
 
 // ==========================================
-// AUDIO CHUNKING & 16kHz WAV ENCODING FOR AI TRANSCRIPTION
+// AUDIO CHUNKING & 16kHz ANTI-ALIASED WAV ENCODING FOR AI TRANSCRIPTION
 // ==========================================
 function mixDownAudioBufferToMono(audioBuffer) {
   const numChannels = audioBuffer.numberOfChannels || 1;
@@ -975,15 +975,127 @@ function mixDownAudioBufferToMono(audioBuffer) {
   return mono;
 }
 
+function lowPassDecimateMono(samples, srcRate, targetRate = 16000) {
+  if (srcRate <= targetRate) return { samples, sampleRate: srcRate };
+  const ratio = srcRate / targetRate;
+  const outLen = Math.max(1, Math.floor(samples.length / ratio));
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const start = Math.floor(i * ratio);
+    const end = Math.min(samples.length, Math.max(start + 1, Math.floor((i + 1) * ratio)));
+    let sum = 0;
+    for (let j = start; j < end; j++) sum += samples[j];
+    out[i] = sum / (end - start);
+  }
+  return { samples: out, sampleRate: targetRate };
+}
+
+async function resampleBufferTo16kMono(audioBuffer) {
+  const targetRate = 16000;
+  const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  if (OfflineCtx && audioBuffer.sampleRate !== targetRate) {
+    try {
+      const targetLen = Math.max(1, Math.ceil(audioBuffer.duration * targetRate));
+      const offline = new OfflineCtx(1, targetLen, targetRate);
+      const src = offline.createBufferSource();
+      src.buffer = audioBuffer;
+      src.connect(offline.destination);
+      src.start(0);
+      const rendered = await offline.startRendering();
+      return {
+        samples: rendered.getChannelData(0),
+        sampleRate: targetRate,
+        resamplerUsed: 'OfflineAudioContext'
+      };
+    } catch (e) {}
+  }
+  const mono = mixDownAudioBufferToMono(audioBuffer);
+  if (audioBuffer.sampleRate === targetRate) {
+    return { samples: mono, sampleRate: targetRate, resamplerUsed: 'native-16k' };
+  }
+  const decimated = lowPassDecimateMono(mono, audioBuffer.sampleRate, targetRate);
+  return { ...decimated, resamplerUsed: 'boxcar-LPF' };
+}
+
+function compute10msDbEnvelope(samples, sampleRate) {
+  const hop = Math.max(1, Math.floor(sampleRate * 0.01));
+  const numFrames = Math.ceil(samples.length / hop);
+  const envDb = new Float32Array(numFrames);
+  for (let f = 0; f < numFrames; f++) {
+    const start = f * hop;
+    const end = Math.min(samples.length, start + hop);
+    let sum = 0;
+    for (let i = start; i < end; i++) sum += samples[i] * samples[i];
+    const rms = Math.sqrt(sum / Math.max(1, end - start));
+    envDb[f] = 20 * Math.log10(Math.max(1e-5, rms));
+  }
+  return envDb;
+}
+
+function estimateSpeechTrimThresholdDb(envDb) {
+  if (!envDb || !envDb.length) return -40;
+  const step = Math.max(1, Math.floor(envDb.length / 2000));
+  const sampled = [];
+  for (let i = 0; i < envDb.length; i += step) sampled.push(envDb[i]);
+  sampled.sort((a, b) => a - b);
+  const p10 = sampled[Math.floor(sampled.length * 0.1)] ?? -60;
+  const p95 = sampled[Math.floor(sampled.length * 0.95)] ?? -15;
+  if (p95 - p10 < 10) {
+    return Math.max(-50, p95 - 16);
+  }
+  return Math.max(-46, Math.min(-28, p10 + 12));
+}
+
+function findSpeechBoundsInRange(envDb, fromSec, toSec, trimDb, prePadSec = 0.15, postPadSec = 0.2) {
+  const fMin = Math.max(0, Math.floor(fromSec * 100));
+  const fMax = Math.min(envDb.length - 1, Math.ceil(toSec * 100));
+  const minRunFrames = 6; // Require 60ms continuous energy so brief clicks do not count as speech
+
+  let onsetFrame = -1;
+  let run = 0;
+  for (let f = fMin; f <= fMax; f++) {
+    if (envDb[f] >= trimDb) {
+      run++;
+      if (run >= minRunFrames) {
+        onsetFrame = f - minRunFrames + 1;
+        break;
+      }
+    } else {
+      run = 0;
+    }
+  }
+
+  let offsetFrame = -1;
+  run = 0;
+  for (let f = fMax; f >= fMin; f--) {
+    if (envDb[f] >= trimDb) {
+      run++;
+      if (run >= minRunFrames) {
+        offsetFrame = f + minRunFrames - 1;
+        break;
+      }
+    } else {
+      run = 0;
+    }
+  }
+
+  if (onsetFrame === -1 || offsetFrame === -1 || offsetFrame <= onsetFrame) {
+    return { startSec: fromSec, endSec: toSec };
+  }
+
+  const startSec = Math.max(fromSec, onsetFrame * 0.01 - prePadSec);
+  const endSec = Math.min(toSec, offsetFrame * 0.01 + postPadSec);
+  return { startSec, endSec };
+}
+
 function encodeFloat32SliceToWavArrayBuffer(samples, sampleRate) {
   const len = samples.length;
-  // Gentle gain boost only if recording is very quiet so ASR recognizes soft speech cleanly
   let maxPeak = 0;
   for (let i = 0; i < len; i++) {
     const a = Math.abs(samples[i]);
     if (a > maxPeak) maxPeak = a;
   }
-  const gain = (maxPeak > 0.005 && maxPeak < 0.2) ? Math.min(4.0, 0.7 / maxPeak) : 1.0;
+  const gain = (maxPeak > 0.005 && maxPeak < 0.35) ? Math.min(4.0, 0.8 / maxPeak) : 1.0;
 
   const buffer = new ArrayBuffer(44 + len * 2);
   const view = new DataView(buffer);
@@ -1023,52 +1135,60 @@ function arrayBufferToPureBase64(arrBuf) {
   return btoa(binary);
 }
 
-export function buildTranscribeAudioChunks(audioBuffer, maxChunkSec = 300) {
-  const monoFull = mixDownAudioBufferToMono(audioBuffer);
-  const { samples, sampleRate } = downsampleMonoIfNeeded(monoFull, audioBuffer.sampleRate, 16000);
+export async function buildTranscribeAudioChunks(audioBuffer, maxChunkSec = 420) {
+  const { samples, sampleRate, resamplerUsed } = await resampleBufferTo16kMono(audioBuffer);
   const totalSec = samples.length / sampleRate;
-  const env = state.vadEnvelopeDb;
+  const envDb = compute10msDbEnvelope(samples, sampleRate);
+  const trimDb = estimateSpeechTrimThresholdDb(envDb);
 
-  const boundaries = [0];
-  let cursorSec = 0;
-  while (totalSec - cursorSec > maxChunkSec + 10) {
+  // 1. Strip leading & trailing silence from the entire recording to prevent Whisper hallucinations
+  const globalBounds = findSpeechBoundsInRange(envDb, 0, totalSec, trimDb, 0.15, 0.25);
+  const trimmedHeadSec = Number(globalBounds.startSec.toFixed(2));
+
+  // 2. Partition remaining speech into chunks (splitting at quietest valley only when > maxChunkSec)
+  const boundaries = [globalBounds.startSec];
+  let cursorSec = globalBounds.startSec;
+  while (globalBounds.endSec - cursorSec > maxChunkSec + 10) {
     let splitSec = cursorSec + maxChunkSec;
-    // Prefer splitting at the quietest valley within [splitSec - 15s, splitSec + 5s] to avoid cutting mid-word
-    if (env && env.length > 0) {
-      const fStart = Math.max(0, Math.floor((splitSec - 15) * 100));
-      const fEnd = Math.min(env.length - 1, Math.floor((splitSec + 5) * 100));
-      let minDb = 999;
-      let bestFrame = Math.floor(splitSec * 100);
-      for (let f = fStart; f <= fEnd; f++) {
-        if (env[f] < minDb) {
-          minDb = env[f];
-          bestFrame = f;
-        }
+    const fStart = Math.max(0, Math.floor((splitSec - 15) * 100));
+    const fEnd = Math.min(envDb.length - 1, Math.floor((splitSec + 5) * 100));
+    let minDb = 999;
+    let bestFrame = Math.floor(splitSec * 100);
+    for (let f = fStart; f <= fEnd; f++) {
+      if (envDb[f] < minDb) {
+        minDb = envDb[f];
+        bestFrame = f;
       }
-      splitSec = bestFrame * 0.01;
     }
+    splitSec = bestFrame * 0.01;
     boundaries.push(splitSec);
     cursorSec = splitSec;
   }
-  boundaries.push(totalSec);
+  boundaries.push(globalBounds.endSec);
 
+  // 3. Trim each chunk's local leading/trailing silence and encode clean 16kHz mono WAV
   const chunks = [];
   for (let i = 0; i < boundaries.length - 1; i++) {
-    const startSec = boundaries[i];
-    const endSec = boundaries[i + 1];
-    const s0 = Math.max(0, Math.floor(startSec * sampleRate));
-    const s1 = Math.min(samples.length, Math.floor(endSec * sampleRate));
+    const localBounds = findSpeechBoundsInRange(envDb, boundaries[i], boundaries[i + 1], trimDb, 0.12, 0.18);
+    const s0 = Math.max(0, Math.floor(localBounds.startSec * sampleRate));
+    const s1 = Math.min(samples.length, Math.floor(localBounds.endSec * sampleRate));
     if (s1 - s0 < sampleRate * 0.2) continue;
     const wavBuf = encodeFloat32SliceToWavArrayBuffer(samples.subarray(s0, s1), sampleRate);
     chunks.push({
       index: chunks.length,
-      startSec,
-      endSec,
+      startSec: localBounds.startSec,
+      endSec: localBounds.endSec,
       wavBlob: new Blob([wavBuf], { type: 'audio/wav' }),
       toBase64: () => arrayBufferToPureBase64(wavBuf)
     });
   }
-  return chunks;
+
+  return {
+    chunks,
+    trimmedHeadSec,
+    totalDurSec: totalSec,
+    resamplerUsed
+  };
 }
 
 // EOF: js/audio-processor.js

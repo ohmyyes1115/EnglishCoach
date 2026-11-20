@@ -699,18 +699,25 @@ function bindAllEvents() {
 
       if (textarea) textarea.value = formattedText;
 
+      const metaParts = [
+        result.trimmedHeadSec > 0.2 ? `已裁切開頭 ${result.trimmedHeadSec.toFixed(1)}s 靜音` : '無開頭靜音',
+        `分 ${result.chunkCount || 1} 段`,
+        result.resamplerUsed || '16kHz'
+      ];
+      const metaSummary = metaParts.join('｜');
+
       if (result.segments && result.segments.length > 0) {
         state.vadSegments = result.segments;
         renderVadChunkListUI();
         drawVadWaveformCanvas();
         if (statusEl) {
-          statusEl.textContent = `✅ ${result.modelUsed} 聽打完成：共 ${result.lines.length} 句（已自動套用精準時間軸，免調 dB 門檻）`;
+          statusEl.textContent = `✅ ${result.modelUsed} 聽打完成：共 ${result.lines.length} 句（${metaSummary}）`;
         }
-        showGiantHud('🎙️', `聽打完成 ${result.lines.length} 句`, `已自動套用 ${result.modelUsed} 精準切點`, 'border-emerald-400/90');
+        showGiantHud('🎙️', `聽打完成 ${result.lines.length} 句`, `${result.modelUsed}｜已套用精準時間軸`, 'border-emerald-400/90');
       } else {
         autoFindMatchingDbThreshold();
         if (statusEl) {
-          statusEl.textContent = `✅ ${result.modelUsed} 雙語聽打完成：共 ${result.lines.length} 句（已自動尋找符合行數的 dB 門檻）`;
+          statusEl.textContent = `✅ ${result.modelUsed} 雙語聽打完成：共 ${result.lines.length} 句（${metaSummary}）`;
         }
         showGiantHud('🎙️', `雙語聽打完成 ${result.lines.length} 句`, '已自動寫入英中字幕並對齊切點', 'border-emerald-400/90');
       }
