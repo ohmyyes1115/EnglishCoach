@@ -1135,7 +1135,7 @@ function arrayBufferToPureBase64(arrBuf) {
   return btoa(binary);
 }
 
-export async function buildTranscribeAudioChunks(audioBuffer, maxChunkSec = 420) {
+export async function buildTranscribeAudioChunks(audioBuffer, maxChunkSec = 80) {
   const { samples, sampleRate, resamplerUsed } = await resampleBufferTo16kMono(audioBuffer);
   const totalSec = samples.length / sampleRate;
   const envDb = compute10msDbEnvelope(samples, sampleRate);
@@ -1145,22 +1145,40 @@ export async function buildTranscribeAudioChunks(audioBuffer, maxChunkSec = 420)
   const globalBounds = findSpeechBoundsInRange(envDb, 0, totalSec, trimDb, 0.15, 0.25);
   const trimmedHeadSec = Number(globalBounds.startSec.toFixed(2));
 
-  // 2. Partition remaining speech into chunks (splitting at quietest valley only when > maxChunkSec)
+  // 2. Partition remaining speech into chunks strictly under maxChunkSec
+  // Search for a genuine >=240ms inter-sentence silence gap so we never split mid-word
   const boundaries = [globalBounds.startSec];
   let cursorSec = globalBounds.startSec;
-  while (globalBounds.endSec - cursorSec > maxChunkSec + 10) {
+  const silenceWinFrames = 24; // 240ms window
+
+  while (globalBounds.endSec - cursorSec > maxChunkSec + 6) {
+    const searchStartSec = Math.max(cursorSec + 20, cursorSec + maxChunkSec - 18);
+    const searchEndSec = Math.min(globalBounds.endSec - 3, cursorSec + maxChunkSec + 2);
+    const fStart = Math.max(0, Math.floor(searchStartSec * 100));
+    const fEnd = Math.min(envDb.length - silenceWinFrames - 1, Math.floor(searchEndSec * 100));
+
     let splitSec = cursorSec + maxChunkSec;
-    const fStart = Math.max(0, Math.floor((splitSec - 15) * 100));
-    const fEnd = Math.min(envDb.length - 1, Math.floor((splitSec + 5) * 100));
-    let minDb = 999;
-    let bestFrame = Math.floor(splitSec * 100);
-    for (let f = fStart; f <= fEnd; f++) {
-      if (envDb[f] < minDb) {
-        minDb = envDb[f];
-        bestFrame = f;
+    if (fEnd > fStart) {
+      let bestScore = Infinity;
+      let bestCenterFrame = Math.floor(splitSec * 100);
+      for (let f = fStart; f <= fEnd; f++) {
+        let winMax = -100;
+        let winSum = 0;
+        for (let k = 0; k < silenceWinFrames; k++) {
+          const v = envDb[f + k];
+          if (v > winMax) winMax = v;
+          winSum += v;
+        }
+        // Prefer windows where EVERY frame is quiet (true pause between sentences)
+        const score = winMax + (winSum / silenceWinFrames) * 0.25;
+        if (score < bestScore) {
+          bestScore = score;
+          bestCenterFrame = f + Math.floor(silenceWinFrames / 2);
+        }
       }
+      splitSec = bestCenterFrame * 0.01;
     }
-    splitSec = bestFrame * 0.01;
+
     boundaries.push(splitSec);
     cursorSec = splitSec;
   }

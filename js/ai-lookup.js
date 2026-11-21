@@ -717,6 +717,36 @@ async function transcribeChunkViaGemini(chunk, apiKey) {
   throw lastErr || new Error('Gemini 語音聽打失敗');
 }
 
+function mergeBrokenSentenceFragments(lines, segments) {
+  if (!segments || lines.length !== segments.length || lines.length < 2) {
+    return { lines, segments };
+  }
+  const mergedLines = [];
+  const mergedSegments = [];
+  for (let i = 0; i < lines.length; i++) {
+    const curLine = lines[i];
+    const curSeg = segments[i];
+    if (mergedLines.length > 0) {
+      const prevLine = mergedLines[mergedLines.length - 1];
+      const prevSeg = mergedSegments[mergedSegments.length - 1];
+      const prevEndsPunct = /[.!?]["'”’)\]]*$/.test(prevLine.en.trim());
+      const curStartsLower = /^[a-z]/.test(curLine.en.trim());
+      const gap = curSeg.startSec - prevSeg.endSec;
+      const combinedDur = curSeg.endSec - prevSeg.startSec;
+
+      // Rejoin fragments that Whisper split mid-sentence (no end punctuation + lowercase continuation)
+      if (!prevEndsPunct && curStartsLower && gap <= 0.65 && combinedDur <= 9.5) {
+        prevLine.en = `${prevLine.en.trim()} ${curLine.en.trim()}`;
+        prevSeg.endSec = curSeg.endSec;
+        continue;
+      }
+    }
+    mergedLines.push({ ...curLine });
+    mergedSegments.push({ ...curSeg });
+  }
+  return { lines: mergedLines, segments: mergedSegments };
+}
+
 export async function transcribeLongAudioWithAi(audioBuffer, onProgress = () => {}) {
   const engine = pickTranscriptionEngine();
   if (!engine) {
@@ -727,17 +757,17 @@ export async function transcribeLongAudioWithAi(audioBuffer, onProgress = () => 
 
   const totalDur = Number(audioBuffer?.duration) || 0;
   const isWhisper = engine.type === 'groq' || engine.type === 'openai';
-  // 420s of 16kHz 16-bit mono WAV is ~13.4MB (well below Groq/OpenAI 25MB limit)
-  const maxChunkSec = isWhisper ? 420 : 180;
+  // Keep Groq chunks strictly <= 80s to avoid Groq server-side ~100s parallel seam stitching bugs
+  const maxChunkSec = engine.type === 'groq' ? 80 : (engine.type === 'openai' ? 300 : 180);
 
-  onProgress('⚙️ 正在進行 16kHz 抗混疊重採樣並裁切開頭/結尾靜音...');
+  onProgress('⚙️ 正在進行 16kHz 抗混疊重採樣並依句間靜音智慧分段...');
   const { chunks, trimmedHeadSec, resamplerUsed } = await buildTranscribeAudioChunks(audioBuffer, maxChunkSec);
   if (!chunks.length) {
     throw new Error('音檔長度過短或全段為靜音，無法進行語音聽打');
   }
 
-  const allLines = [];
-  const allSegments = [];
+  let allLines = [];
+  let allSegments = [];
   let modelUsed = '';
 
   for (let i = 0; i < chunks.length; i++) {
@@ -774,6 +804,12 @@ export async function transcribeLongAudioWithAi(audioBuffer, onProgress = () => 
         allLines.push({ en: entry.en, zh: entry.zh });
       }
     }
+  }
+
+  if (isWhisper && allSegments.length === allLines.length) {
+    const cleaned = mergeBrokenSentenceFragments(allLines, allSegments);
+    allLines = cleaned.lines;
+    allSegments = cleaned.segments;
   }
 
   if (!allLines.length) {
