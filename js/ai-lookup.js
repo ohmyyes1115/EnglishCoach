@@ -729,14 +729,39 @@ function mergeBrokenSentenceFragments(lines, segments) {
     if (mergedLines.length > 0) {
       const prevLine = mergedLines[mergedLines.length - 1];
       const prevSeg = mergedSegments[mergedSegments.length - 1];
-      const prevEndsPunct = /[.!?]["'”’)\]]*$/.test(prevLine.en.trim());
-      const curStartsLower = /^[a-z]/.test(curLine.en.trim());
-      const gap = curSeg.startSec - prevSeg.endSec;
-      const combinedDur = curSeg.endSec - prevSeg.startSec;
+      const prevText = prevLine.en.trim();
+      const curText = curLine.en.trim();
 
-      // Rejoin fragments that Whisper split mid-sentence (no end punctuation + lowercase continuation)
-      if (!prevEndsPunct && curStartsLower && gap <= 0.65 && combinedDur <= 9.5) {
-        prevLine.en = `${prevLine.en.trim()} ${curLine.en.trim()}`;
+      const prevEndsSentence = /[.!?]["'”’)\]]*$/.test(prevText);
+      const prevEndsComma = /[,;:]["'”’)\]]*$/.test(prevText);
+      const curStartsLower = /^[a-z]/.test(curText);
+      const gap = curSeg.startSec - prevSeg.endSec;
+      const prevDur = prevSeg.endSec - prevSeg.startSec;
+      const curDur = curSeg.endSec - curSeg.startSec;
+      const combinedDur = curSeg.endSec - prevSeg.startSec;
+      const prevWords = prevText.split(/\s+/).filter(Boolean).length;
+      const curWords = curText.split(/\s+/).filter(Boolean).length;
+
+      // Only rejoin genuine mid-sentence fragments; never merge two full-length sentences
+      const isMidClauseCut =
+        !prevEndsSentence &&
+        !prevEndsComma &&
+        curStartsLower &&
+        gap <= 0.5 &&
+        combinedDur <= 7.0 &&
+        (Math.min(prevDur, curDur) <= 2.6 || Math.min(prevWords, curWords) <= 6);
+
+      // Allow merging a short comma-ending intro phrase (e.g. "At the moment,") only when very brief
+      const isShortIntroCommaCut =
+        prevEndsComma &&
+        curStartsLower &&
+        gap <= 0.35 &&
+        prevWords <= 5 &&
+        prevDur <= 2.0 &&
+        combinedDur <= 6.2;
+
+      if (isMidClauseCut || isShortIntroCommaCut) {
+        prevLine.en = `${prevText} ${curText}`;
         prevSeg.endSec = curSeg.endSec;
         continue;
       }
