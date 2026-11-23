@@ -9,6 +9,7 @@ import {
   showGiantHud,
   copyTextSynchronously,
   savePackToDB,
+  showPackSaveFailedHud,
   savePrefsSync
 } from './state-storage.js';
 
@@ -800,10 +801,14 @@ export async function actionMergeWithNextSentence() {
 
   state.repeatCountCurrent = 1;
   state.pausedOffsetSec = 0;
-  await savePackToDB(state.currentPack);
+  const saved = await savePackToDB(state.currentPack);
   savePrefsSync();
   playerCallbacks.onRenderMainStage();
-  showGiantHud('🔗', '已合併下句並重播', `新長度 ${merged.durationSec.toFixed(1)}s (可點 ↩️ 復原)`, 'border-emerald-400/90');
+  if (saved) {
+    showGiantHud('🔗', '已合併下句並重播', `新長度 ${merged.durationSec.toFixed(1)}s (可點 ↩️ 復原)`, 'border-emerald-400/90');
+  } else {
+    showPackSaveFailedHud();
+  }
   playCurrentSentenceClip(false, 0);
 }
 
@@ -820,18 +825,26 @@ export async function actionUndoMergeSentence() {
   state.undoMergeSnapshot = null;
   state.repeatCountCurrent = 1;
   state.pausedOffsetSec = 0;
-  await savePackToDB(state.currentPack);
+  const saved = await savePackToDB(state.currentPack);
   savePrefsSync();
   playerCallbacks.onRenderMainStage();
-  showGiantHud('↩️', '已復原合併', `恢復為 ${state.currentPack.items.length} 句`, 'border-sky-400/90');
+  if (saved) {
+    showGiantHud('↩️', '已復原合併', `恢復為 ${state.currentPack.items.length} 句`, 'border-sky-400/90');
+  } else {
+    showPackSaveFailedHud();
+  }
 }
 
 export async function actionNormalizeCurrentPackVolume() {
   if (!state.currentPack || !state.currentPack.items.length) return;
   const count = normalizePackItemsPCM(state.currentPack.items);
-  await savePackToDB(state.currentPack);
+  const saved = await savePackToDB(state.currentPack);
   playerCallbacks.onRenderMainStage();
-  showGiantHud('🎚️', `已平衡 ${count} 句音量`, '統一校準至 -16dBFS 人聲響度並防爆音', 'border-amber-400/90');
+  if (saved) {
+    showGiantHud('🎚️', `已平衡 ${count} 句音量`, '統一校準至 -16dBFS 人聲響度並防爆音', 'border-amber-400/90');
+  } else {
+    showPackSaveFailedHud();
+  }
 }
 
 export function triggerCopyCurrentSentence() {

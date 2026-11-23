@@ -75,8 +75,12 @@ export function speakChineseExplanationAloud() {
   const rawText = (item?.zh ? `中文翻譯：${item.zh}。` : '') +
     (notesToRead ? `重點解析：${notesToRead.replace(/[•【】\[\]]/g, ' ')}。` : '') +
     (grammarToRead ? `句型語氣：${grammarToRead}` : '');
-  const fallbackText = bodyEl ? bodyEl.innerText.replace(/💡 目前使用.*/g, '').trim() : '';
-  const toSpeak = (rawText || fallbackText).trim();
+  const fallbackText = bodyEl
+    ? bodyEl.innerText.replace(/💡 目前使用.*/g, '').replace(/⚠️.*/g, '').replace(/檢查金鑰/g, '').trim()
+    : '';
+  // An uncached lookup (keyed engine failed) exists only in the drawer, so read the drawer text itself
+  const showingUncachedResult = Boolean(drawerWordKey && !wordNote) || (!drawerWordKey && !notesToRead);
+  const toSpeak = ((showingUncachedResult ? '' : rawText) || fallbackText || rawText).trim();
   if (!toSpeak) return;
 
   try {
@@ -117,12 +121,11 @@ export function formatSavedAiNotesHtml(zhText, notesText, grammarText = '', show
 function renderAiDrawerBodyHtml(bodyEl, html) {
   if (!bodyEl) return;
   bodyEl.innerHTML = html;
-  const openKeyBtn = bodyEl.querySelector('button[data-open-ai-settings="1"]');
-  if (openKeyBtn) {
+  bodyEl.querySelectorAll('button[data-open-ai-settings="1"]').forEach((openKeyBtn) => {
     openKeyBtn.addEventListener('click', () => {
       aiCallbacks.onOpenAiSettings();
     });
-  }
+  });
 }
 
 // ==========================================
@@ -392,15 +395,21 @@ export async function persistZhAndNotesToCurrentItem(zhTranslation, notesText, g
 
 // Word lookups are cached per word only. They must never be written into the sentence-level
 // aiNotes / aiGrammarNote, otherwise "AI 簡答" would show a single-word note as the cached sentence analysis.
+// Pass entry = null to keep only the sentence translation (used when the result is a stand-in we must not cache).
 async function saveWordLookupResult(pack, item, wordKey, entry, sentenceZh) {
   if (!pack || !item) return;
-  if (!item.wordNotes) item.wordNotes = {};
-  item.wordNotes[wordKey] = entry;
+  let changed = false;
+  if (entry) {
+    if (!item.wordNotes) item.wordNotes = {};
+    item.wordNotes[wordKey] = entry;
+    changed = true;
+  }
   if (sentenceZh && !(item.zh && item.zh.trim())) {
     item.zh = sentenceZh.trim();
     aiCallbacks.onRenderMainStage();
+    changed = true;
   }
-  if (state.packs.includes(pack)) {
+  if (changed && state.packs.includes(pack)) {
     await savePackToDB(pack);
   }
 }
@@ -410,6 +419,42 @@ function isSentenceNotesFromWordLookup(item) {
   const notes = String(item?.aiNotes || '').trim();
   if (!notes || !item.wordNotes) return false;
   return Object.values(item.wordNotes).some(w => w && String(w.notes || '').trim() === notes);
+}
+
+// Name of the keyed engine queryConfiguredAiEngine() will call, or '' when running key-less by choice.
+// A failure only counts as an error worth showing when this is non-empty.
+function getActiveAiEngineLabel() {
+  const cfg = state.aiConfig || {};
+  if (cfg.provider === 'free_builtin') return '';
+  if (cfg.provider === 'groq' && cfg.groqKey) return 'Groq';
+  if (cfg.provider === 'openai' && cfg.openaiKey) return 'OpenAI';
+  if (cfg.geminiKey) return 'Gemini';
+  return '';
+}
+
+// Grammar placeholder stored alongside key-less fallback notes; doubles as the marker for such notes
+const FREE_FALLBACK_GRAMMAR_HINT = '可點擊上方英文句子中的任一單字即查音標與字義，或點「🔊 唸出中文解析」用聽的學。';
+
+function hasCachedSentenceAnalysis(item) {
+  if (!item?.aiNotes || !item.aiNotes.trim()) return false;
+  if (isSentenceNotesFromWordLookup(item)) return false;
+  // Key-less fallback notes are only a stand-in: once a keyed engine is configured, analyse for real
+  if (getActiveAiEngineLabel() && item.aiGrammarNote === FREE_FALLBACK_GRAMMAR_HINT) return false;
+  return true;
+}
+
+function reportAiEngineFailure(engineLabel, err) {
+  if (engineLabel && typeof window.logDiag === 'function') {
+    window.logDiag('WARN', `${engineLabel} 呼叫失敗：${err?.message || '未知錯誤'}`);
+  }
+}
+
+function formatAiErrorBannerHtml(engineLabel, err, noteText) {
+  const msg = String(err?.message || '未知錯誤').slice(0, 160);
+  return `<div class="p-2.5 rounded-xl bg-rose-950/40 border border-rose-500/40 text-[11px] text-rose-200 flex items-center justify-between gap-2">
+      <span>⚠️ ${escapeHtml(engineLabel)} 呼叫失敗：${escapeHtml(msg)}｜${escapeHtml(noteText)}</span>
+      <button type="button" data-open-ai-settings="1" class="px-2 py-0.5 rounded bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 font-bold shrink-0">檢查金鑰</button>
+    </div>`;
 }
 
 // ==========================================
@@ -455,10 +500,12 @@ export async function handleTapEnglishWordLookup(word, tokenEl) {
   bodyEl.innerHTML = `<div class="flex items-center gap-2 text-violet-300 font-bold py-2"><i class="fa-solid fa-spinner animate-spin"></i><span>正在查詢「${escapeHtml(cleanWord)}」在本句中的精準字義...</span></div>`;
 
   const prompt = `請針對英文句子："${fullSentence}" 裡面的單字 "${cleanWord}" 用台灣繁體中文極簡回答（總字數 90 字內）：\n中譯：(整句話的自然繁體中文翻譯)\n• 【${cleanWord}】音標、詞性、在這句話裡的精準中文意思\n• 常見搭配詞或同義替換 1 條\n句型：(該字在本句中的語氣或用法提示 1 短句)`;
+  let aiError = null;
   try {
     const res = await queryConfiguredAiEngine(prompt);
-    badge.textContent = `🤖 ${res.modelUsed}`;
     const parsed = parseAiStructuredResponse(res.text);
+    if (!parsed.zh && !parsed.notes) throw new Error('AI 回覆內容為空');
+    badge.textContent = `🤖 ${res.modelUsed}`;
     await saveWordLookupResult(
       pack,
       item,
@@ -468,9 +515,16 @@ export async function handleTapEnglishWordLookup(word, tokenEl) {
     );
     renderAiDrawerBodyHtml(bodyEl, formatSavedAiNotesHtml(parsed.zh || item?.zh, parsed.notes, parsed.grammar, false));
     return;
-  } catch (e) {}
+  } catch (e) {
+    aiError = e;
+  }
 
-  badge.textContent = '⚡ 免金鑰即時字典';
+  // A keyed engine failing (bad key, quota, network) is shown to the user and its stand-in result is not cached,
+  // so the next lookup retries. Running key-less by choice keeps the original silent, cached behaviour.
+  const failedEngine = getActiveAiEngineLabel();
+  reportAiEngineFailure(failedEngine, aiError);
+
+  badge.textContent = failedEngine ? `⚠️ ${failedEngine} 失敗・暫用免金鑰字典` : '⚡ 免金鑰即時字典';
   const [wordZh, sentenceZh, dictInfo] = await Promise.all([
     fetchFreeGoogleTranslateZhTW(cleanWord),
     (item && item.zh) ? Promise.resolve(item.zh) : fetchFreeGoogleTranslateZhTW(fullSentence),
@@ -483,11 +537,14 @@ export async function handleTapEnglishWordLookup(word, tokenEl) {
     pack,
     item,
     wordKey,
-    { zh: sentenceZh || item?.zh, notes: noteBlock, grammar: '' },
+    failedEngine ? null : { zh: sentenceZh || item?.zh, notes: noteBlock, grammar: '' },
     sentenceZh
   );
   const hasKey = Boolean(state.aiConfig?.geminiKey || state.aiConfig?.groqKey || state.aiConfig?.openaiKey);
-  renderAiDrawerBodyHtml(bodyEl, formatSavedAiNotesHtml(sentenceZh || item?.zh, noteBlock, '', !hasKey));
+  const errorBanner = failedEngine
+    ? formatAiErrorBannerHtml(failedEngine, aiError, '本次暫用免金鑰字典，不會存入快取，下次點擊會重試')
+    : '';
+  renderAiDrawerBodyHtml(bodyEl, errorBanner + formatSavedAiNotesHtml(sentenceZh || item?.zh, noteBlock, '', !hasKey));
 }
 
 export async function actionAiExplainCurrentSentence(forceRefresh = false) {
@@ -508,7 +565,7 @@ export async function actionAiExplainCurrentSentence(forceRefresh = false) {
   targetLabel.textContent = `第 #${formatIdx(state.currentIndex + 1)} 句整句簡答`;
   drawerWordKey = '';
 
-  if (!forceRefresh && item.aiNotes && item.aiNotes.trim() && !isSentenceNotesFromWordLookup(item)) {
+  if (!forceRefresh && hasCachedSentenceAnalysis(item)) {
     badge.textContent = '✨ 已存快取 (0ms)';
     renderAiDrawerBodyHtml(bodyEl, formatSavedAiNotesHtml(item.zh, item.aiNotes, item.aiGrammarNote || '', false));
     return;
@@ -517,18 +574,40 @@ export async function actionAiExplainCurrentSentence(forceRefresh = false) {
   bodyEl.innerHTML = `<div class="flex items-center gap-2 text-violet-300 font-bold py-2"><i class="fa-solid fa-spinner animate-spin"></i><span>正在翻譯並拆解本句重點單字與句型...</span></div>`;
 
   const prompt = `請幫我用台灣繁體中文極簡解析這句英文口說："${cleanSentence}"\n請嚴格依照以下格式回覆（總字數 120 字內）：\n中譯：(最自然道地的繁體中文翻譯)\n• (核心單字或片語 1：音標＋中文意思)\n• (核心單字或片語 2：音標＋中文意思)\n• (核心單字或片語 3：音標＋中文意思)\n句型：(1句話秒懂這句的文法結構與語氣用法)`;
+  let aiError = null;
   try {
     const res = await queryConfiguredAiEngine(prompt);
-    badge.textContent = `🤖 ${res.modelUsed}`;
     const parsed = parseAiStructuredResponse(res.text);
+    if (!parsed.zh && !parsed.notes) throw new Error('AI 回覆內容為空');
+    badge.textContent = `🤖 ${res.modelUsed}`;
     if (parsed.zh) item.zh = parsed.zh;
+    // Drop the key-less placeholder so a real analysis without a grammar line is not mistaken for a fallback
+    if (item.aiGrammarNote === FREE_FALLBACK_GRAMMAR_HINT) item.aiGrammarNote = '';
     await persistZhAndNotesToCurrentItem(parsed.zh, parsed.notes, parsed.grammar);
     renderAiDrawerBodyHtml(bodyEl, formatSavedAiNotesHtml(parsed.zh || item.zh, parsed.notes, parsed.grammar, false));
     return;
-  } catch (e) {}
+  } catch (e) {
+    aiError = e;
+  }
 
-  badge.textContent = '⚡ 免金鑰智慧翻譯';
-  const translatedZh = (forceRefresh ? '' : item.zh) || (await fetchFreeGoogleTranslateZhTW(cleanSentence));
+  // A keyed engine failing (bad key, quota, network) is shown to the user and nothing is cached as "已解析",
+  // so the next press retries. Running key-less by choice keeps the original silent, cached behaviour.
+  const failedEngine = getActiveAiEngineLabel();
+  reportAiEngineFailure(failedEngine, aiError);
+
+  if (failedEngine && hasCachedSentenceAnalysis(item)) {
+    // A refresh failed but an earlier real analysis exists: keep showing it rather than a weaker stand-in
+    badge.textContent = `⚠️ ${failedEngine} 失敗・顯示先前解析`;
+    renderAiDrawerBodyHtml(
+      bodyEl,
+      formatAiErrorBannerHtml(failedEngine, aiError, '以下為先前已存的解析') +
+        formatSavedAiNotesHtml(item.zh, item.aiNotes, item.aiGrammarNote || '', false)
+    );
+    return;
+  }
+
+  badge.textContent = failedEngine ? `⚠️ ${failedEngine} 失敗・暫用免金鑰翻譯` : '⚡ 免金鑰智慧翻譯';
+  const translatedZh = ((forceRefresh && !failedEngine) ? '' : item.zh) || (await fetchFreeGoogleTranslateZhTW(cleanSentence));
   const words = (cleanSentence.match(/[A-Za-z]{5,}/g) || [])
     .map(w => w.toLowerCase())
     .filter((w, i, arr) => arr.indexOf(w) === i)
@@ -541,12 +620,19 @@ export async function actionAiExplainCurrentSentence(forceRefresh = false) {
     wordNotes.push(`【${w}】${ph}：${wZh}${pos}`);
   }
   const finalNotes = wordNotes.join('\n') || '點擊上方英文句子中的任一單字，即可單獨查詢發音與字義。';
+  if (failedEngine) {
+    // Keep only the translation (when the sentence had none); notes stay uncached so "已解析" is not shown
+    await persistZhAndNotesToCurrentItem(translatedZh, '', '');
+    renderAiDrawerBodyHtml(
+      bodyEl,
+      formatAiErrorBannerHtml(failedEngine, aiError, '本次暫用免金鑰翻譯，不會標成「已解析」，下次會重試') +
+        formatSavedAiNotesHtml(translatedZh || item.zh, finalNotes, '', false)
+    );
+    return;
+  }
+
   if (translatedZh) item.zh = translatedZh;
-  await persistZhAndNotesToCurrentItem(
-    translatedZh,
-    finalNotes,
-    '可點擊上方英文句子中的任一單字即查音標與字義，或點「🔊 唸出中文解析」用聽的學。'
-  );
+  await persistZhAndNotesToCurrentItem(translatedZh, finalNotes, FREE_FALLBACK_GRAMMAR_HINT);
   const hasKey = Boolean(state.aiConfig?.geminiKey || state.aiConfig?.groqKey || state.aiConfig?.openaiKey);
   renderAiDrawerBodyHtml(bodyEl, formatSavedAiNotesHtml(translatedZh || item.zh, finalNotes, item.aiGrammarNote, !hasKey));
 }

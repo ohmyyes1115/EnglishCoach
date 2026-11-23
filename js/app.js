@@ -12,6 +12,7 @@ import {
   savePackToDB,
   loadAllPacksFromDB,
   deletePackFromDB,
+  showPackSaveFailedHud,
   savePrefsSync,
   loadPrefsSync,
   loadAiConfigSync,
@@ -633,6 +634,30 @@ function bindAllEvents() {
   });
 
   // Global Keyboard / Bluetooth Page Turner Interceptor
+  const KEY_ACTION_ORDER = ['prev', 'restart', 'play', 'next', 'speed', 'loop', 'merge', 'copy', 'ai'];
+  const keyActionHandlers = {
+    prev: actionPrevSentence,
+    restart: actionRestartCurrentSentence,
+    next: actionNextSentence,
+    speed: actionCycleSpeed,
+    loop: actionToggleInfiniteLoop,
+    merge: actionMergeWithNextSentence,
+    copy: triggerCopyCurrentSentence,
+    ai: () => actionAiExplainCurrentSentence(false)
+  };
+
+  let heldPlayCode = null;
+  let heldPlayTimerId = null;
+  let heldPlayLongPressFired = false;
+  const clearHeldPlayKey = () => {
+    if (heldPlayTimerId) {
+      clearTimeout(heldPlayTimerId);
+      heldPlayTimerId = null;
+    }
+    heldPlayCode = null;
+    heldPlayLongPressFired = false;
+  };
+
   window.addEventListener('keydown', (e) => {
     if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
     const code = e.code || e.key;
@@ -647,17 +672,38 @@ function bindAllEvents() {
       renderKeymapRows();
       return;
     }
-    const match = (act) => (state.keymap[act]?.codes || []).includes(code);
-    if (match('prev')) { e.preventDefault(); actionPrevSentence(); }
-    else if (match('restart')) { e.preventDefault(); actionRestartCurrentSentence(); }
-    else if (match('play')) { e.preventDefault(); actionTogglePlayPause(); }
-    else if (match('next')) { e.preventDefault(); actionNextSentence(); }
-    else if (match('speed')) { e.preventDefault(); actionCycleSpeed(); }
-    else if (match('loop')) { e.preventDefault(); actionToggleInfiniteLoop(); }
-    else if (match('merge')) { e.preventDefault(); actionMergeWithNextSentence(); }
-    else if (match('copy')) { e.preventDefault(); triggerCopyCurrentSentence(); }
-    else if (match('ai')) { e.preventDefault(); actionAiExplainCurrentSentence(false); }
+    const matchedAction = KEY_ACTION_ORDER.find((act) => (state.keymap[act]?.codes || []).includes(code));
+    if (!matchedAction) return;
+    e.preventDefault();
+    // A held key auto-repeats keydown; one physical press must fire its action only once
+    if (e.repeat) return;
+
+    if (matchedAction === 'play') {
+      // Same as the on-screen button: a short press toggles on release, holding 0.5s cycles speed instead
+      clearHeldPlayKey();
+      heldPlayCode = code;
+      heldPlayTimerId = setTimeout(() => {
+        heldPlayTimerId = null;
+        heldPlayLongPressFired = true;
+        actionCycleSpeed();
+      }, 500);
+      return;
+    }
+    keyActionHandlers[matchedAction]();
   });
+
+  window.addEventListener('keyup', (e) => {
+    const code = e.code || e.key;
+    if (heldPlayCode === null || code !== heldPlayCode) return;
+    // Also stops Space/Enter from additionally clicking whichever button currently has focus
+    e.preventDefault();
+    const wasLongPress = heldPlayLongPressFired;
+    clearHeldPlayKey();
+    if (!wasLongPress) actionTogglePlayPause();
+  });
+
+  // If the window loses focus mid-press the keyup never arrives; drop the pending press
+  window.addEventListener('blur', clearHeldPlayKey);
 
   // Modal: Import & Smart VAD Splitter Workbench (Tab A + Tab B)
   const modalImport = document.getElementById('modalImport');
@@ -798,7 +844,7 @@ function bindAllEvents() {
       return;
     }
 
-    await savePackToDB(newPack);
+    const saved = await savePackToDB(newPack);
     state.packs.push(newPack);
     state.undoMergeSnapshot = null;
     state.currentPack = newPack;
@@ -808,7 +854,11 @@ function bindAllEvents() {
     savePrefsSync();
     renderMainStage();
     modalImport?.classList.add('hidden');
-    showGiantHud('💾', `已儲存 ${newPack.items.length} 句教材`, newPack.name, 'border-emerald-400/90');
+    if (saved) {
+      showGiantHud('💾', `已儲存 ${newPack.items.length} 句教材`, newPack.name, 'border-emerald-400/90');
+    } else {
+      showPackSaveFailedHud();
+    }
   });
 
   // Tab B: ZIP / Multi-File Import
@@ -853,7 +903,7 @@ function bindAllEvents() {
       const newPack = await importZipOrMultiFiles(files, packName, (msg) => {
         if (statusEl) statusEl.textContent = msg;
       });
-      await savePackToDB(newPack);
+      const saved = await savePackToDB(newPack);
       state.packs.push(newPack);
       state.undoMergeSnapshot = null;
       state.currentPack = newPack;
@@ -862,10 +912,18 @@ function bindAllEvents() {
       state.pausedOffsetSec = 0;
       savePrefsSync();
       renderMainStage();
-      if (statusEl) statusEl.textContent = `✅ 已成功匯入 ${newPack.items.length} 句教材！`;
+      if (statusEl) {
+        statusEl.textContent = saved
+          ? `✅ 已成功匯入 ${newPack.items.length} 句教材！`
+          : `⚠️ 已載入 ${newPack.items.length} 句，但未能寫入裝置（重新整理後會遺失）`;
+      }
       if (fileInput) fileInput.value = '';
       modalImport?.classList.add('hidden');
-      showGiantHud('📦', `已匯入 ${newPack.items.length} 句教材`, newPack.name, 'border-emerald-400/90');
+      if (saved) {
+        showGiantHud('📦', `已匯入 ${newPack.items.length} 句教材`, newPack.name, 'border-emerald-400/90');
+      } else {
+        showPackSaveFailedHud();
+      }
     } catch (err) {
       if (statusEl) statusEl.textContent = `❌ 匯入失敗：${err.message}`;
       showGiantHud('❌', '匯入失敗', err.message || '請檢查檔案格式', 'border-rose-400/90');

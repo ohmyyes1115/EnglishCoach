@@ -136,7 +136,7 @@ export function formatTimeSec(sec) {
   return `${String(mins).padStart(2, '0')}:${rem}`;
 }
 
-export function showGiantHud(icon, title, sub, borderClass = 'border-sky-400/90') {
+export function showGiantHud(icon, title, sub, borderClass = 'border-sky-400/90', durationMs = 1150) {
   const hud = document.getElementById('giantHud');
   const box = document.getElementById('giantHudBox');
   if (!hud || !box) return;
@@ -150,7 +150,7 @@ export function showGiantHud(icon, title, sub, borderClass = 'border-sky-400/90'
   hudTimeoutId = setTimeout(() => {
     hud.classList.remove('opacity-100');
     hud.classList.add('opacity-0');
-  }, 1150);
+  }, durationMs);
 }
 
 export function copyTextSynchronously(text) {
@@ -188,6 +188,7 @@ export function openDatabase() {
       };
       req.onsuccess = (e) => resolve(e.target.result);
       req.onerror = () => resolve(null);
+      req.onblocked = () => resolve(null);
     } catch (err) {
       resolve(null);
     }
@@ -214,21 +215,55 @@ export function sanitizePackForIndexedDB(pack) {
   };
 }
 
+let lastPackSaveErrorName = '';
+
+// Resolves true only when the pack is durably written. Resolves false (never hangs) when IndexedDB is
+// unavailable or the transaction fails/aborts, e.g. QuotaExceededError, which fires 'abort' without 'error'.
 export async function savePackToDB(pack) {
   const clean = sanitizePackForIndexedDB(pack);
   state.memoryPacksFallback.set(clean.id, clean);
+
+  const fail = (errName) => {
+    lastPackSaveErrorName = errName || 'UnknownError';
+    if (typeof window.logDiag === 'function') {
+      window.logDiag('WARN', `教材寫入 IndexedDB 失敗 (${lastPackSaveErrorName})：${clean.name}`);
+    }
+    return false;
+  };
+
   const db = await openDatabase();
-  if (!db) return false;
+  if (!db) return fail('IndexedDBUnavailable');
   return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok, errName) => {
+      if (settled) return;
+      settled = true;
+      resolve(ok ? true : fail(errName));
+    };
     try {
       const tx = db.transaction([STORE_PACKS], 'readwrite');
       tx.objectStore(STORE_PACKS).put(clean);
-      tx.oncomplete = () => resolve(true);
-      tx.onerror = () => resolve(false);
+      tx.oncomplete = () => finish(true);
+      tx.onerror = (e) => finish(false, e?.target?.error?.name || tx.error?.name);
+      tx.onabort = (e) => finish(false, tx.error?.name || e?.target?.error?.name);
     } catch (e) {
-      resolve(false);
+      finish(false, e?.name);
     }
   });
+}
+
+// For user-initiated saves (import, merge, normalize): tell the user the pack only lives in memory
+export function showPackSaveFailedHud() {
+  const reason = lastPackSaveErrorName === 'QuotaExceededError'
+    ? '裝置儲存空間不足'
+    : '瀏覽器無法寫入儲存區';
+  showGiantHud(
+    '⚠️',
+    '教材未能寫入裝置',
+    `${reason}；目前內容只在本次開啟有效，重新整理後會遺失`,
+    'border-rose-400/90',
+    4500
+  );
 }
 
 export async function loadAllPacksFromDB() {
@@ -256,6 +291,7 @@ export async function deletePackFromDB(packId) {
       tx.objectStore(STORE_PACKS).delete(packId);
       tx.oncomplete = () => resolve(true);
       tx.onerror = () => resolve(false);
+      tx.onabort = () => resolve(false);
     } catch (e) {
       resolve(false);
     }
