@@ -764,6 +764,7 @@ export async function actionMergeWithNextSentence() {
 
   // Save deep snapshot for 1-click Undo
   state.undoMergeSnapshot = {
+    packId: state.currentPack.id,
     currentIndex: state.currentIndex,
     itemsClone: JSON.parse(JSON.stringify(state.currentPack.items))
   };
@@ -808,6 +809,12 @@ export async function actionMergeWithNextSentence() {
 
 export async function actionUndoMergeSentence() {
   if (!state.undoMergeSnapshot || !state.currentPack) return;
+  // A snapshot only ever applies to the pack it was taken from; never restore it onto another pack
+  if (state.undoMergeSnapshot.packId !== state.currentPack.id) {
+    state.undoMergeSnapshot = null;
+    playerCallbacks.onRenderMainStage();
+    return;
+  }
   state.currentPack.items = state.undoMergeSnapshot.itemsClone;
   state.currentIndex = state.undoMergeSnapshot.currentIndex;
   state.undoMergeSnapshot = null;

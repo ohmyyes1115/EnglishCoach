@@ -37,6 +37,20 @@ body {
   box-shadow: 0 0 12px rgba(139, 92, 246, 0.45);
 }
 
+/* Delete-pack button after the first tap: waiting for the confirming second tap */
+.btn-delete-armed {
+  background-color: #e11d48 !important;
+  border-color: #fda4af !important;
+  color: #ffffff !important;
+  animation: btn-delete-armed-pulse 0.8s ease-in-out infinite;
+}
+
+@keyframes btn-delete-armed-pulse {
+  50% {
+    opacity: 0.6;
+  }
+}
+
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;

@@ -444,6 +444,7 @@ function bindAllEvents() {
     const found = state.packs.find(p => p.id === id);
     if (found) {
       pausePlaybackInPlace('切換教材');
+      state.undoMergeSnapshot = null;
       state.currentPack = found;
       state.currentIndex = Number(state.packProgressMap[found.id]) || 0;
       state.repeatCountCurrent = 1;
@@ -453,16 +454,42 @@ function bindAllEvents() {
     }
   });
 
+  // Deleting is irreversible, so it takes two taps: the first arms the button, the second (within 4s) deletes
+  let deleteArmedPackId = null;
+  let deleteArmTimerId = null;
+  const disarmDeleteButton = () => {
+    deleteArmedPackId = null;
+    if (deleteArmTimerId) {
+      clearTimeout(deleteArmTimerId);
+      deleteArmTimerId = null;
+    }
+    document.getElementById('btnDeletePack')?.classList.remove('btn-delete-armed');
+  };
+
   safeOn('btnDeletePack', 'click', async () => {
     if (!state.currentPack || state.currentPack.id === 'default_pack') {
       showGiantHud('ℹ️', '預設教材無法刪除', '可匯入自己的長音檔或 ZIP 新增課程', 'border-sky-400/90');
       return;
     }
     const delId = state.currentPack.id;
+    if (deleteArmedPackId !== delId) {
+      disarmDeleteButton();
+      deleteArmedPackId = delId;
+      document.getElementById('btnDeletePack')?.classList.add('btn-delete-armed');
+      deleteArmTimerId = setTimeout(disarmDeleteButton, 4000);
+      showGiantHud('🗑️', '再按一次確認刪除', `${state.currentPack.name}（刪除後無法復原）`, 'border-rose-400/90');
+      return;
+    }
+    disarmDeleteButton();
+    pausePlaybackInPlace('刪除教材');
     await deletePackFromDB(delId);
     state.packs = state.packs.filter(p => p.id !== delId);
+    delete state.packProgressMap[delId];
+    state.undoMergeSnapshot = null;
     state.currentPack = state.packs[0];
-    state.currentIndex = 0;
+    state.currentIndex = Number(state.packProgressMap[state.currentPack.id]) || 0;
+    state.repeatCountCurrent = 1;
+    state.pausedOffsetSec = 0;
     savePrefsSync();
     renderMainStage();
     showGiantHud('🗑️', '已刪除教材包', state.currentPack.name);
@@ -773,6 +800,7 @@ function bindAllEvents() {
 
     await savePackToDB(newPack);
     state.packs.push(newPack);
+    state.undoMergeSnapshot = null;
     state.currentPack = newPack;
     state.currentIndex = 0;
     state.repeatCountCurrent = 1;
@@ -827,6 +855,7 @@ function bindAllEvents() {
       });
       await savePackToDB(newPack);
       state.packs.push(newPack);
+      state.undoMergeSnapshot = null;
       state.currentPack = newPack;
       state.currentIndex = 0;
       state.repeatCountCurrent = 1;
@@ -852,6 +881,7 @@ function bindAllEvents() {
     if (existingIdx >= 0) state.packs[existingIdx] = def;
     else state.packs.unshift(def);
     await savePackToDB(def);
+    state.undoMergeSnapshot = null;
     state.currentPack = def;
     state.currentIndex = 0;
     state.repeatCountCurrent = 1;

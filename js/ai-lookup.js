@@ -24,6 +24,9 @@ let aiCallbacks = {
   onOpenAiSettings: () => {}
 };
 
+// Lower-cased word the drawer is currently showing ('' when it shows the whole-sentence analysis)
+let drawerWordKey = '';
+
 export function registerAiCallbacks(cbs = {}) {
   if (typeof cbs.onRenderMainStage === 'function') {
     aiCallbacks.onRenderMainStage = cbs.onRenderMainStage;
@@ -65,9 +68,13 @@ export function speakChineseExplanationAloud() {
   const bodyEl = document.getElementById('aiDrawerBody');
   if (!item && !bodyEl) return;
 
+  // Read whatever the drawer is currently showing: the tapped word's note, or the sentence analysis
+  const wordNote = drawerWordKey ? item?.wordNotes?.[drawerWordKey] : null;
+  const notesToRead = wordNote ? wordNote.notes : item?.aiNotes;
+  const grammarToRead = wordNote ? wordNote.grammar : item?.aiGrammarNote;
   const rawText = (item?.zh ? `中文翻譯：${item.zh}。` : '') +
-    (item?.aiNotes ? `重點解析：${item.aiNotes.replace(/[•【】\[\]]/g, ' ')}。` : '') +
-    (item?.aiGrammarNote ? `句型語氣：${item.aiGrammarNote}` : '');
+    (notesToRead ? `重點解析：${notesToRead.replace(/[•【】\[\]]/g, ' ')}。` : '') +
+    (grammarToRead ? `句型語氣：${grammarToRead}` : '');
   const fallbackText = bodyEl ? bodyEl.innerText.replace(/💡 目前使用.*/g, '').trim() : '';
   const toSpeak = (rawText || fallbackText).trim();
   if (!toSpeak) return;
@@ -383,6 +390,28 @@ export async function persistZhAndNotesToCurrentItem(zhTranslation, notesText, g
   }
 }
 
+// Word lookups are cached per word only. They must never be written into the sentence-level
+// aiNotes / aiGrammarNote, otherwise "AI 簡答" would show a single-word note as the cached sentence analysis.
+async function saveWordLookupResult(pack, item, wordKey, entry, sentenceZh) {
+  if (!pack || !item) return;
+  if (!item.wordNotes) item.wordNotes = {};
+  item.wordNotes[wordKey] = entry;
+  if (sentenceZh && !(item.zh && item.zh.trim())) {
+    item.zh = sentenceZh.trim();
+    aiCallbacks.onRenderMainStage();
+  }
+  if (state.packs.includes(pack)) {
+    await savePackToDB(pack);
+  }
+}
+
+// Packs saved before this fix may hold a single-word note in aiNotes; treat that as "not analysed yet"
+function isSentenceNotesFromWordLookup(item) {
+  const notes = String(item?.aiNotes || '').trim();
+  if (!notes || !item.wordNotes) return false;
+  return Object.values(item.wordNotes).some(w => w && String(w.notes || '').trim() === notes);
+}
+
 // ==========================================
 // TAP-WORD LOOKUP & FULL-SENTENCE EXPLAIN ACTIONS
 // ==========================================
@@ -396,7 +425,8 @@ export async function handleTapEnglishWordLookup(word, tokenEl) {
     el.classList.toggle('word-token-active', el === tokenEl);
   });
 
-  const item = state.currentPack?.items?.[state.currentIndex];
+  const pack = state.currentPack;
+  const item = pack?.items?.[state.currentIndex];
   const fullSentence = item ? String(item.en || '').replace(/^\d+[\.\)、\-\s]+/, '').trim() : '';
   const wordKey = cleanWord.toLowerCase();
 
@@ -411,6 +441,8 @@ export async function handleTapEnglishWordLookup(word, tokenEl) {
   targetLabel.textContent = `單字：${cleanWord}`;
   speakBtn.classList.remove('hidden');
   speakBtn.onclick = () => speakSingleEnglishWord(cleanWord);
+
+  drawerWordKey = wordKey;
 
   if (item && item.wordNotes && item.wordNotes[wordKey]) {
     const cached = item.wordNotes[wordKey];
@@ -427,11 +459,13 @@ export async function handleTapEnglishWordLookup(word, tokenEl) {
     const res = await queryConfiguredAiEngine(prompt);
     badge.textContent = `🤖 ${res.modelUsed}`;
     const parsed = parseAiStructuredResponse(res.text);
-    if (item) {
-      if (!item.wordNotes) item.wordNotes = {};
-      item.wordNotes[wordKey] = { zh: parsed.zh || item.zh, notes: parsed.notes, grammar: parsed.grammar };
-    }
-    await persistZhAndNotesToCurrentItem(parsed.zh, item?.aiNotes || parsed.notes, item?.aiGrammarNote || parsed.grammar);
+    await saveWordLookupResult(
+      pack,
+      item,
+      wordKey,
+      { zh: parsed.zh || item?.zh, notes: parsed.notes, grammar: parsed.grammar },
+      parsed.zh
+    );
     renderAiDrawerBodyHtml(bodyEl, formatSavedAiNotesHtml(parsed.zh || item?.zh, parsed.notes, parsed.grammar, false));
     return;
   } catch (e) {}
@@ -445,11 +479,13 @@ export async function handleTapEnglishWordLookup(word, tokenEl) {
   const ph = dictInfo?.phonetic ? ` ${dictInfo.phonetic}` : '';
   const defs = dictInfo?.meanings?.length ? `\n• 詞性與釋義：${dictInfo.meanings.join(' / ')}` : '';
   const noteBlock = `【${cleanWord}】${ph}：${wordZh || '請見下方釋義'}${defs}`;
-  if (item) {
-    if (!item.wordNotes) item.wordNotes = {};
-    item.wordNotes[wordKey] = { zh: sentenceZh || item.zh, notes: noteBlock, grammar: '' };
-  }
-  await persistZhAndNotesToCurrentItem(sentenceZh, item?.aiNotes || noteBlock);
+  await saveWordLookupResult(
+    pack,
+    item,
+    wordKey,
+    { zh: sentenceZh || item?.zh, notes: noteBlock, grammar: '' },
+    sentenceZh
+  );
   const hasKey = Boolean(state.aiConfig?.geminiKey || state.aiConfig?.groqKey || state.aiConfig?.openaiKey);
   renderAiDrawerBodyHtml(bodyEl, formatSavedAiNotesHtml(sentenceZh || item?.zh, noteBlock, '', !hasKey));
 }
@@ -470,8 +506,9 @@ export async function actionAiExplainCurrentSentence(forceRefresh = false) {
   drawer.classList.remove('hidden');
   speakBtn.classList.add('hidden');
   targetLabel.textContent = `第 #${formatIdx(state.currentIndex + 1)} 句整句簡答`;
+  drawerWordKey = '';
 
-  if (!forceRefresh && item.aiNotes && item.aiNotes.trim()) {
+  if (!forceRefresh && item.aiNotes && item.aiNotes.trim() && !isSentenceNotesFromWordLookup(item)) {
     badge.textContent = '✨ 已存快取 (0ms)';
     renderAiDrawerBodyHtml(bodyEl, formatSavedAiNotesHtml(item.zh, item.aiNotes, item.aiGrammarNote || '', false));
     return;
@@ -551,7 +588,7 @@ async function transcribeChunkViaWhisper(chunk, providerType, apiKey) {
   const cleanKey = String(apiKey || '').trim();
   const endpoint = isGroq
     ? 'https://api.groq.com/openai/v1/audio/transcriptions'
-    : 'https://api.openai.com/openai/v1/audio/transcriptions';
+    : 'https://api.openai.com/v1/audio/transcriptions';
 
   // Prioritize full whisper-large-v3 over turbo for much higher accuracy and fewer skipped sentences
   let models = isGroq ? ['whisper-large-v3', 'whisper-large-v3-turbo'] : ['whisper-1'];
