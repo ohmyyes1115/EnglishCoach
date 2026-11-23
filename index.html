@@ -35,10 +35,23 @@
 </head>
 <body class="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-between p-2.5 sm:p-4 overflow-x-hidden">
 
-  <!-- Hidden Audio Engines (Single Reusable Elements for iOS Safari Autoplay Unlock) -->
+<!-- Hidden Audio Engines (Single Reusable Elements for iOS Safari Autoplay Unlock) -->
   <audio id="masterAudio" playsinline preload="auto" class="hidden"></audio>
   <audio id="previewAudio" playsinline preload="auto" class="hidden"></audio>
   <audio id="keepAliveAudio" loop playsinline preload="auto" class="hidden"></audio>
+
+  <!-- Hidden Bluetooth HID Key Catcher for iOS Safari / Home Screen PWA -->
+  <input
+    id="btKeyCatcher"
+    type="text"
+    inputmode="none"
+    autocomplete="off"
+    autocorrect="off"
+    autocapitalize="off"
+    spellcheck="false"
+    aria-hidden="true"
+    class="fixed top-0 left-0 w-px h-px opacity-0 text-base border-0 p-0 m-0 bg-transparent text-transparent caret-transparent focus:outline-none"
+  />
 
   <!-- Giant HUD Overlay for Blind Operation Feedback -->
   <div id="giantHud" class="fixed inset-0 pointer-events-none z-50 flex items-center justify-center opacity-0 transition-opacity duration-200">

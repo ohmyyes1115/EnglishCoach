@@ -590,8 +590,38 @@ function bindAllEvents() {
   safeOn('btnOpenChangelog', 'click', () => document.getElementById('modalChangelog')?.classList.remove('hidden'));
   safeOn('btnCloseChangelog', 'click', () => document.getElementById('modalChangelog')?.classList.add('hidden'));
 
-  // Modal: Keymap (Bluetooth Page Turner / Keyboard)
+  // Modal: Keymap (Bluetooth Page Turner / Keyboard) + iOS PWA Hidden Input Catcher
   const modalKeymap = document.getElementById('modalKeymap');
+  const btCatcher = document.getElementById('btKeyCatcher');
+
+  const focusBtKeyCatcher = () => {
+    if (!btCatcher) return;
+    try {
+      btCatcher.value = '';
+      btCatcher.focus({ preventScroll: true });
+    } catch (e) {
+      try { btCatcher.focus(); } catch (err) {}
+    }
+  };
+
+  const blurBtKeyCatcher = () => {
+    if (btCatcher && document.activeElement === btCatcher) {
+      try { btCatcher.blur(); } catch (e) {}
+    }
+  };
+
+  const normalizeKeyCode = (rawCode, rawKey) => {
+    if (rawCode && rawCode !== 'Unidentified' && rawCode !== 'Process') {
+      return rawCode;
+    }
+    const k = String(rawKey || '');
+    if (!k || k === 'Unidentified' || k === 'Process' || k === 'Dead') return '';
+    if (k === ' ') return 'Space';
+    if (/^[a-zA-Z]$/.test(k)) return `Key${k.toUpperCase()}`;
+    if (/^[0-9]$/.test(k)) return `Digit${k}`;
+    return k;
+  };
+
   const renderKeymapRows = () => {
     const box = document.getElementById('keymapListContainer');
     if (!box) return;
@@ -611,29 +641,36 @@ function bindAllEvents() {
       row.querySelector('button').addEventListener('click', () => {
         state.listeningKeyAction = k;
         renderKeymapRows();
+        // Must focus synchronously inside user click so iOS PWA grants hardware keyboard focus
+        focusBtKeyCatcher();
       });
       box.appendChild(row);
     });
   };
+
   safeOn('btnOpenKeymapModal', 'click', () => {
     state.listeningKeyAction = null;
     renderKeymapRows();
     modalKeymap?.classList.remove('hidden');
+    focusBtKeyCatcher();
   });
   safeOn('btnCloseKeymapModal', 'click', () => {
     state.listeningKeyAction = null;
     modalKeymap?.classList.add('hidden');
+    focusBtKeyCatcher();
   });
   safeOn('btnDoneKeymap', 'click', () => {
     state.listeningKeyAction = null;
     modalKeymap?.classList.add('hidden');
+    focusBtKeyCatcher();
   });
   safeOn('btnResetDefaultKeys', 'click', () => {
     saveKeymapSync(cloneDefaultKeymap());
     renderKeymapRows();
+    focusBtKeyCatcher();
   });
 
-  // Global Keyboard / Bluetooth Page Turner Interceptor
+  // Global Keyboard / Bluetooth Page Turner Interceptor (Desktop + iOS PWA)
   const KEY_ACTION_ORDER = ['prev', 'restart', 'play', 'next', 'speed', 'loop', 'merge', 'copy', 'ai'];
   const keyActionHandlers = {
     prev: actionPrevSentence,
@@ -649,6 +686,9 @@ function bindAllEvents() {
   let heldPlayCode = null;
   let heldPlayTimerId = null;
   let heldPlayLongPressFired = false;
+  let lastKeydownHandledCode = '';
+  let lastKeydownHandledAt = 0;
+
   const clearHeldPlayKey = () => {
     if (heldPlayTimerId) {
       clearTimeout(heldPlayTimerId);
@@ -658,23 +698,42 @@ function bindAllEvents() {
     heldPlayLongPressFired = false;
   };
 
+  const learnBoundKey = (code) => {
+    const act = state.listeningKeyAction;
+    if (!act || !state.keymap[act]) return;
+    if (!state.keymap[act].codes.includes(code)) {
+      state.keymap[act].codes.unshift(code);
+    }
+    state.listeningKeyAction = null;
+    saveKeymapSync(state.keymap);
+    renderKeymapRows();
+    showGiantHud('⌨️', `已綁定 ${code}`, state.keymap[act].label, 'border-emerald-400/90');
+  };
+
   window.addEventListener('keydown', (e) => {
-    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
-    const code = e.code || e.key;
+    const activeEl = document.activeElement;
+    const isCatcher = activeEl?.id === 'btKeyCatcher';
+    if (!isCatcher && ['INPUT', 'TEXTAREA', 'SELECT'].includes(activeEl?.tagName)) return;
+
+    const code = normalizeKeyCode(e.code, e.key);
+    if (!code) return;
+
     if (state.listeningKeyAction) {
       e.preventDefault();
-      const act = state.listeningKeyAction;
-      if (!state.keymap[act].codes.includes(code)) {
-        state.keymap[act].codes.unshift(code);
-      }
-      state.listeningKeyAction = null;
-      saveKeymapSync(state.keymap);
-      renderKeymapRows();
+      lastKeydownHandledCode = code;
+      lastKeydownHandledAt = Date.now();
+      if (isCatcher && btCatcher) btCatcher.value = '';
+      learnBoundKey(code);
       return;
     }
+
     const matchedAction = KEY_ACTION_ORDER.find((act) => (state.keymap[act]?.codes || []).includes(code));
     if (!matchedAction) return;
     e.preventDefault();
+    lastKeydownHandledCode = code;
+    lastKeydownHandledAt = Date.now();
+    if (isCatcher && btCatcher) btCatcher.value = '';
+
     // A held key auto-repeats keydown; one physical press must fire its action only once
     if (e.repeat) return;
 
@@ -693,7 +752,7 @@ function bindAllEvents() {
   });
 
   window.addEventListener('keyup', (e) => {
-    const code = e.code || e.key;
+    const code = normalizeKeyCode(e.code, e.key);
     if (heldPlayCode === null || code !== heldPlayCode) return;
     // Also stops Space/Enter from additionally clicking whichever button currently has focus
     e.preventDefault();
@@ -704,6 +763,42 @@ function bindAllEvents() {
 
   // If the window loses focus mid-press the keyup never arrives; drop the pending press
   window.addEventListener('blur', clearHeldPlayKey);
+
+  // Fallback for iOS PWA where Bluetooth HID letters (a, b, c) fire `input` without a usable `keydown`
+  if (btCatcher) {
+    btCatcher.addEventListener('input', () => {
+      const val = btCatcher.value;
+      btCatcher.value = '';
+      if (!val) return;
+      const ch = val.slice(-1);
+      const code = normalizeKeyCode('', ch);
+      if (!code) return;
+      if (code === lastKeydownHandledCode && Date.now() - lastKeydownHandledAt < 120) {
+        return;
+      }
+      if (state.listeningKeyAction) {
+        learnBoundKey(code);
+        return;
+      }
+      const matchedAction = KEY_ACTION_ORDER.find((act) => (state.keymap[act]?.codes || []).includes(code));
+      if (!matchedAction) return;
+      if (matchedAction === 'play') {
+        actionTogglePlayPause();
+      } else {
+        keyActionHandlers[matchedAction]();
+      }
+    });
+  }
+
+  // Keep Bluetooth HID focus active on iOS PWA after tapping main playback controls
+  ['btnControlPrev', 'btnControlRestart', 'btnControlPlay', 'btnControlNext', 'btnControlSpeed'].forEach((id) => {
+    safeOn(id, 'click', focusBtKeyCatcher);
+  });
+
+  // Release hidden catcher when opening modals that contain real text inputs
+  safeOn('btnOpenImportModal', 'click', blurBtKeyCatcher);
+  safeOn('btnOpenAiSettings', 'click', blurBtKeyCatcher);
+  safeOn('btnDrawerOpenAiKey', 'click', blurBtKeyCatcher);
 
   // Modal: Import & Smart VAD Splitter Workbench (Tab A + Tab B)
   const modalImport = document.getElementById('modalImport');
@@ -889,75 +984,4 @@ function bindAllEvents() {
   safeOn('btnConfirmZipImport', 'click', async () => {
     const fileInput = document.getElementById('inputZipOrMultiFiles');
     const statusEl = document.getElementById('zipImportStatus');
-    const btnConfirm = document.getElementById('btnConfirmZipImport');
-    const files = fileInput?.files;
-
-    if (!files || !files.length) {
-      showGiantHud('⚠️', '尚未選擇檔案', '請先選擇 ZIP 壓縮檔或多個音訊檔', 'border-amber-400/90');
-      return;
-    }
-
-    if (btnConfirm) btnConfirm.disabled = true;
-    try {
-      const packName = document.getElementById('inputZipPackName')?.value || 'ZIP_匯入教材';
-      const newPack = await importZipOrMultiFiles(files, packName, (msg) => {
-        if (statusEl) statusEl.textContent = msg;
-      });
-      const saved = await savePackToDB(newPack);
-      state.packs.push(newPack);
-      state.undoMergeSnapshot = null;
-      state.currentPack = newPack;
-      state.currentIndex = 0;
-      state.repeatCountCurrent = 1;
-      state.pausedOffsetSec = 0;
-      savePrefsSync();
-      renderMainStage();
-      if (statusEl) {
-        statusEl.textContent = saved
-          ? `✅ 已成功匯入 ${newPack.items.length} 句教材！`
-          : `⚠️ 已載入 ${newPack.items.length} 句，但未能寫入裝置（重新整理後會遺失）`;
-      }
-      if (fileInput) fileInput.value = '';
-      modalImport?.classList.add('hidden');
-      if (saved) {
-        showGiantHud('📦', `已匯入 ${newPack.items.length} 句教材`, newPack.name, 'border-emerald-400/90');
-      } else {
-        showPackSaveFailedHud();
-      }
-    } catch (err) {
-      if (statusEl) statusEl.textContent = `❌ 匯入失敗：${err.message}`;
-      showGiantHud('❌', '匯入失敗', err.message || '請檢查檔案格式', 'border-rose-400/90');
-    } finally {
-      if (btnConfirm) btnConfirm.disabled = false;
-    }
-  });
-
-  // Reset Built-in Demo Pack
-  safeOn('btnResetBuiltinDemo', 'click', async () => {
-    const def = createDefaultBuiltInPack();
-    const existingIdx = state.packs.findIndex(p => p.id === def.id);
-    if (existingIdx >= 0) state.packs[existingIdx] = def;
-    else state.packs.unshift(def);
-    await savePackToDB(def);
-    state.undoMergeSnapshot = null;
-    state.currentPack = def;
-    state.currentIndex = 0;
-    state.repeatCountCurrent = 1;
-    state.pausedOffsetSec = 0;
-    savePrefsSync();
-    renderMainStage();
-    modalImport?.classList.add('hidden');
-    showGiantHud('🔄', '已重置內建 20 句範例', def.name, 'border-sky-400/90');
-  });
-}
-
-function bootstrapApp() {
-  initApplication();
-  bindAllEvents();
-}
-
-if (document.readyState === 'loading') {
-  window.addEventListener('DOMContentLoaded', bootstrapApp);
-} else {
-  bootstrapApp();
-}
+    const btnConfirm = document.getElement
