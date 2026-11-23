@@ -984,4 +984,77 @@ function bindAllEvents() {
   safeOn('btnConfirmZipImport', 'click', async () => {
     const fileInput = document.getElementById('inputZipOrMultiFiles');
     const statusEl = document.getElementById('zipImportStatus');
-    const btnConfirm = document.getElement
+    const btnConfirm = document.getElementById('btnConfirmZipImport');
+    const files = fileInput?.files;
+
+    if (!files || !files.length) {
+      showGiantHud('⚠️', '尚未選擇檔案', '請先選擇 ZIP 壓縮檔或多個音訊檔', 'border-amber-400/90');
+      return;
+    }
+
+    if (btnConfirm) btnConfirm.disabled = true;
+    try {
+      const packName = document.getElementById('inputZipPackName')?.value || 'ZIP_匯入教材';
+      const newPack = await importZipOrMultiFiles(files, packName, (msg) => {
+        if (statusEl) statusEl.textContent = msg;
+      });
+      const saved = await savePackToDB(newPack);
+      state.packs.push(newPack);
+      state.undoMergeSnapshot = null;
+      state.currentPack = newPack;
+      state.currentIndex = 0;
+      state.repeatCountCurrent = 1;
+      state.pausedOffsetSec = 0;
+      savePrefsSync();
+      renderMainStage();
+      if (statusEl) {
+        statusEl.textContent = saved
+          ? `✅ 已成功匯入 ${newPack.items.length} 句教材！`
+          : `⚠️ 已載入 ${newPack.items.length} 句，但未能寫入裝置（重新整理後會遺失）`;
+      }
+      if (fileInput) fileInput.value = '';
+      modalImport?.classList.add('hidden');
+      if (saved) {
+        showGiantHud('📦', `已匯入 ${newPack.items.length} 句教材`, newPack.name, 'border-emerald-400/90');
+      } else {
+        showPackSaveFailedHud();
+      }
+    } catch (err) {
+      if (statusEl) statusEl.textContent = `❌ 匯入失敗：${err.message}`;
+      showGiantHud('❌', '匯入失敗', err.message || '請檢查檔案格式', 'border-rose-400/90');
+    } finally {
+      if (btnConfirm) btnConfirm.disabled = false;
+    }
+  });
+
+  // Reset Built-in Demo Pack
+  safeOn('btnResetBuiltinDemo', 'click', async () => {
+    const def = createDefaultBuiltInPack();
+    const existingIdx = state.packs.findIndex(p => p.id === def.id);
+    if (existingIdx >= 0) state.packs[existingIdx] = def;
+    else state.packs.unshift(def);
+    await savePackToDB(def);
+    state.undoMergeSnapshot = null;
+    state.currentPack = def;
+    state.currentIndex = 0;
+    state.repeatCountCurrent = 1;
+    state.pausedOffsetSec = 0;
+    savePrefsSync();
+    renderMainStage();
+    modalImport?.classList.add('hidden');
+    showGiantHud('🔄', '已重置內建 20 句範例', def.name, 'border-sky-400/90');
+  });
+}
+
+function bootstrapApp() {
+  initApplication();
+  bindAllEvents();
+}
+
+if (document.readyState === 'loading') {
+  window.addEventListener('DOMContentLoaded', bootstrapApp);
+} else {
+  bootstrapApp();
+}
+
+// EOF: js/app.js
