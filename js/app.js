@@ -62,9 +62,6 @@ import {
   actionCycleSpeed,
   actionToggleInfiniteLoop,
   actionResetToFirstSentence,
-  actionMergeWithNextSentence,
-  actionUndoMergeSentence,
-  actionNormalizeCurrentPackVolume,
   triggerCopyCurrentSentence
 } from './player-engine.js';
 
@@ -235,16 +232,6 @@ function renderMainStage() {
       : '🔊 範例人聲：僅TTS語音';
   }
 
-  const aiBadge = document.getElementById('badgeAiParsed');
-  if (aiBadge) {
-    aiBadge.classList.toggle('hidden', !(item.aiNotes && item.aiNotes.trim()));
-  }
-
-  const undoBtn = document.getElementById('btnUndoMerge');
-  if (undoBtn) {
-    undoBtn.classList.toggle('hidden', !state.undoMergeSnapshot);
-  }
-
   const mergeModeBtn = document.getElementById('btnToggleMergeMode');
   if (mergeModeBtn) {
     mergeModeBtn.textContent = state.mergeSubMode === 'audio_only_shift'
@@ -342,8 +329,7 @@ function refreshKeyHints() {
 
   const titledButtons = {
     ai: ['btnAiExplain', '一鍵翻譯本句並由 AI 簡答核心單字與句型'],
-    copy: ['btnCopySentence', '點擊複製本句乾淨英文並自動原地暫停'],
-    merge: ['btnMergeNextSentence', '將本句與下一句音檔無縫合併']
+    copy: ['btnCopySentence', '點擊複製本句乾淨英文並自動原地暫停']
   };
   Object.entries(titledButtons).forEach(([action, [id, text]]) => {
     const el = document.getElementById(id);
@@ -492,7 +478,6 @@ async function initApplication() {
     state.gapMode = prefs.gapMode || '1';
     state.speedIndex = Number(prefs.speedIndex) || 0;
     state.subMode = prefs.subMode || 'both';
-    state.mergeSubMode = prefs.mergeSubMode || 'audio_only_shift';
     state.demoVoiceMode = prefs.demoVoiceMode || 'tts_and_pad';
   }
 
@@ -611,14 +596,6 @@ function bindAllEvents() {
   safeOn('btnCloseAiDrawer', 'click', () => document.getElementById('aiExplainDrawer')?.classList.add('hidden'));
 
   safeOn('btnCopySentence', 'click', triggerCopyCurrentSentence);
-  safeOn('btnNormalizeCurrentPack', 'click', actionNormalizeCurrentPackVolume);
-  safeOn('btnMergeNextSentence', 'click', actionMergeWithNextSentence);
-  safeOn('btnUndoMerge', 'click', actionUndoMergeSentence);
-  safeOn('btnToggleMergeMode', 'click', () => {
-    state.mergeSubMode = state.mergeSubMode === 'audio_only_shift' ? 'both_audio_and_text' : 'audio_only_shift';
-    savePrefsSync();
-    renderMainStage();
-  });
   safeOn('btnToggleSubMode', 'click', () => {
     const order = ['both', 'en', 'hide'];
     state.subMode = order[(order.indexOf(state.subMode) + 1) % order.length];
@@ -638,7 +615,6 @@ function bindAllEvents() {
     if (found) {
       pausePlaybackInPlace('切換教材');
       setReadyBackup(null);
-      state.undoMergeSnapshot = null;
       state.currentPack = found;
       state.currentIndex = Number(state.packProgressMap[found.id]) || 0;
       state.repeatCountCurrent = 1;
@@ -679,7 +655,6 @@ function bindAllEvents() {
     await deletePackFromDB(delId);
     state.packs = state.packs.filter(p => p.id !== delId);
     delete state.packProgressMap[delId];
-    state.undoMergeSnapshot = null;
     state.currentPack = state.packs[0];
     state.currentIndex = Number(state.packProgressMap[state.currentPack.id]) || 0;
     state.repeatCountCurrent = 1;
@@ -1039,14 +1014,13 @@ function bindAllEvents() {
   });
 
   // Global Keyboard / Bluetooth Page Turner Interceptor (Desktop + iOS PWA)
-  const KEY_ACTION_ORDER = ['prev', 'restart', 'play', 'next', 'speed', 'loop', 'merge', 'copy', 'ai'];
+  const KEY_ACTION_ORDER = ['prev', 'restart', 'play', 'next', 'speed', 'loop', 'copy', 'ai'];
   const keyActionHandlers = {
     prev: actionPrevSentence,
     restart: actionRestartCurrentSentence,
     next: actionNextSentence,
     speed: actionCycleSpeed,
     loop: actionToggleInfiniteLoop,
-    merge: actionMergeWithNextSentence,
     copy: triggerCopyCurrentSentence,
     ai: () => actionAiExplainCurrentSentence(false)
   };
@@ -1465,7 +1439,6 @@ function bindAllEvents() {
 
     const saved = await savePackToDB(newPack);
     state.packs.push(newPack);
-    state.undoMergeSnapshot = null;
     state.currentPack = newPack;
     state.currentIndex = 0;
     state.repeatCountCurrent = 1;
@@ -1527,7 +1500,6 @@ function bindAllEvents() {
       delete newPack.restoredFromBackup;
       const saved = await savePackToDB(newPack);
       state.packs.push(newPack);
-      state.undoMergeSnapshot = null;
       state.currentPack = newPack;
       state.currentIndex = 0;
       state.repeatCountCurrent = 1;
@@ -1567,7 +1539,6 @@ function bindAllEvents() {
     if (existingIdx >= 0) state.packs[existingIdx] = def;
     else state.packs.unshift(def);
     await savePackToDB(def);
-    state.undoMergeSnapshot = null;
     state.currentPack = def;
     state.currentIndex = 0;
     state.repeatCountCurrent = 1;

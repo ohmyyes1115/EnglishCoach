@@ -276,36 +276,6 @@ export function createDefaultBuiltInPack() {
   };
 }
 
-export function mergeAudioPairPCM(dataUriA, dataUriB, fallbackDurA = 2.0, fallbackDurB = 2.0) {
-  const pcmA = decodeWavDataUriToPCM(dataUriA);
-  const pcmB = decodeWavDataUriToPCM(dataUriB);
-  let mergedDataUri = dataUriA;
-  let mergedDuration = (Number(fallbackDurA) || 2.0) + (Number(fallbackDurB) || 2.0);
-
-  if (pcmA && pcmB) {
-    const sr = pcmA.sampleRate;
-    const combined = new Float32Array(pcmA.samples.length + pcmB.samples.length);
-    combined.set(pcmA.samples, 0);
-    combined.set(pcmB.samples, pcmA.samples.length);
-    mergedDataUri = encodeMonoFloat32ToWavDataUri(combined, sr, 'rms', 1.0);
-    mergedDuration = Number((combined.length / sr).toFixed(1));
-  }
-
-  return { audioDataUri: mergedDataUri, durationSec: mergedDuration };
-}
-
-export function normalizePackItemsPCM(items) {
-  let count = 0;
-  (items || []).forEach((it) => {
-    const pcm = decodeWavDataUriToPCM(it.audioDataUri);
-    if (pcm && pcm.samples.length > 0) {
-      it.audioDataUri = encodeMonoFloat32ToWavDataUri(pcm.samples, pcm.sampleRate, 'rms', 1.0);
-      count++;
-    }
-  });
-  return count;
-}
-
 // ==========================================
 // VAD SMART SPLITTER WORKBENCH
 // ==========================================

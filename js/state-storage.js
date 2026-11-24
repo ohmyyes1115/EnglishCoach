@@ -40,7 +40,6 @@ export const DEFAULT_KEYMAP = {
   next:    { label: '下一句',       codes: ['ArrowRight', 'PageDown', 'MediaTrackNext'] },
   speed:   { label: '切換語速',     codes: ['ArrowDown', 'KeyS'] },
   loop:    { label: '無限單句循環 (再按恢復原次數)', codes: ['KeyL'] },
-  merge:   { label: '動態合併下一句', codes: ['KeyM'] },
   copy:    { label: '複製本句英文並暫停', codes: ['KeyC'] },
   ai:      { label: 'AI 簡答翻譯與解析', codes: ['KeyE', 'KeyA'] }
 };
@@ -74,8 +73,6 @@ export const state = {
   gapMode: '1',
   speedIndex: 0,
   subMode: 'both', // 'both' | 'en' | 'hide'
-  mergeSubMode: 'audio_only_shift', // 'audio_only_shift' | 'both_audio_and_text'
-  undoMergeSnapshot: null,
   demoVoiceMode: 'tts_and_pad', // 'tts_and_pad' | 'tts_only'
   isPlaying: false,
   isInGap: false,
@@ -403,7 +400,6 @@ export function savePrefsSync() {
       gapMode: state.gapMode,
       speedIndex: state.speedIndex,
       subMode: state.subMode,
-      mergeSubMode: state.mergeSubMode,
       demoVoiceMode: state.demoVoiceMode
     };
     safeStorage.setItem(PREFS_LS_KEY, JSON.stringify(payload));

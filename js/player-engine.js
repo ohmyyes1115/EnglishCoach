@@ -9,8 +9,6 @@ import {
   showGiantHud,
   copyTextSynchronously,
   logKeyEvent,
-  savePackToDB,
-  showPackSaveFailedHud,
   savePrefsSync
 } from './state-storage.js';
 
@@ -21,8 +19,6 @@ import {
   dataUriToBlobUrl,
   decodeWavDataUriToPCM,
   unlockiOSAudioAndSpeechSynchronously,
-  mergeAudioPairPCM,
-  normalizePackItemsPCM
 } from './audio-processor.js';
 
 // ==========================================
@@ -756,104 +752,8 @@ export function actionResetToFirstSentence() {
 }
 
 // ==========================================
-// DYNAMIC MERGE, VOLUME NORMALIZATION & COPY
+// COPY CURRENT SENTENCE
 // ==========================================
-export async function actionMergeWithNextSentence() {
-  unlockiOSAudioAndSpeechSynchronously();
-  if (!state.currentPack || state.currentPack.items.length < 2) {
-    showGiantHud('⚠️', '無法合併', '教材內只剩 1 句，無下一句可合併', 'border-rose-400/90');
-    return;
-  }
-  const idx = state.currentIndex;
-  if (idx >= state.currentPack.items.length - 1) {
-    showGiantHud('⚠️', '已是最後一句', '最後一句無法再往後合併', 'border-rose-400/90');
-    return;
-  }
-
-  // Save deep snapshot for 1-click Undo
-  state.undoMergeSnapshot = {
-    packId: state.currentPack.id,
-    currentIndex: state.currentIndex,
-    itemsClone: JSON.parse(JSON.stringify(state.currentPack.items))
-  };
-
-  const curItem = state.currentPack.items[idx];
-  const nextItem = state.currentPack.items[idx + 1];
-
-  const merged = mergeAudioPairPCM(
-    curItem.audioDataUri,
-    nextItem.audioDataUri,
-    curItem.durationSec,
-    nextItem.durationSec
-  );
-
-  if (state.mergeSubMode === 'audio_only_shift') {
-    curItem.audioDataUri = merged.audioDataUri;
-    curItem.durationSec = merged.durationSec;
-    for (let i = idx + 1; i < state.currentPack.items.length - 1; i++) {
-      state.currentPack.items[i].audioDataUri = state.currentPack.items[i + 1].audioDataUri;
-      state.currentPack.items[i].durationSec = state.currentPack.items[i + 1].durationSec;
-    }
-    state.currentPack.items.pop();
-  } else {
-    curItem.audioDataUri = merged.audioDataUri;
-    curItem.durationSec = merged.durationSec;
-    const cleanNextEn = String(nextItem.en || '').replace(/^\d+[\.\)、\-\s]+/, '').trim();
-    curItem.en = `${curItem.en} ${cleanNextEn}`.trim();
-    if (nextItem.zh) {
-      curItem.zh = `${curItem.zh || ''} ${nextItem.zh}`.trim();
-    }
-    state.currentPack.items.splice(idx + 1, 1);
-  }
-
-  state.repeatCountCurrent = 1;
-  state.pausedOffsetSec = 0;
-  const saved = await savePackToDB(state.currentPack);
-  savePrefsSync();
-  playerCallbacks.onRenderMainStage();
-  if (saved) {
-    showGiantHud('🔗', '已合併下句並重播', `新長度 ${merged.durationSec.toFixed(1)}s (可點 ↩️ 復原)`, 'border-emerald-400/90');
-  } else {
-    showPackSaveFailedHud();
-  }
-  playCurrentSentenceClip(false, 0);
-}
-
-export async function actionUndoMergeSentence() {
-  if (!state.undoMergeSnapshot || !state.currentPack) return;
-  // A snapshot only ever applies to the pack it was taken from; never restore it onto another pack
-  if (state.undoMergeSnapshot.packId !== state.currentPack.id) {
-    state.undoMergeSnapshot = null;
-    playerCallbacks.onRenderMainStage();
-    return;
-  }
-  state.currentPack.items = state.undoMergeSnapshot.itemsClone;
-  state.currentIndex = state.undoMergeSnapshot.currentIndex;
-  state.undoMergeSnapshot = null;
-  state.repeatCountCurrent = 1;
-  state.pausedOffsetSec = 0;
-  const saved = await savePackToDB(state.currentPack);
-  savePrefsSync();
-  playerCallbacks.onRenderMainStage();
-  if (saved) {
-    showGiantHud('↩️', '已復原合併', `恢復為 ${state.currentPack.items.length} 句`, 'border-sky-400/90');
-  } else {
-    showPackSaveFailedHud();
-  }
-}
-
-export async function actionNormalizeCurrentPackVolume() {
-  if (!state.currentPack || !state.currentPack.items.length) return;
-  const count = normalizePackItemsPCM(state.currentPack.items);
-  const saved = await savePackToDB(state.currentPack);
-  playerCallbacks.onRenderMainStage();
-  if (saved) {
-    showGiantHud('🎚️', `已平衡 ${count} 句音量`, '統一校準至 -16dBFS 人聲響度並防爆音', 'border-amber-400/90');
-  } else {
-    showPackSaveFailedHud();
-  }
-}
-
 export function triggerCopyCurrentSentence() {
   if (!state.currentPack || !state.currentPack.items.length) return;
   if (state.isPlaying) {
