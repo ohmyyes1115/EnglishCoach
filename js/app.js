@@ -15,6 +15,9 @@ import {
   deletePackFromDB,
   showPackSaveFailedHud,
   copyTextSynchronously,
+  keyEventLogs,
+  logKeyEvent,
+  setKeyEventLogListener,
   savePrefsSync,
   loadPrefsSync,
   loadAiConfigSync,
@@ -326,36 +329,73 @@ function renderDiagLogList() {
   if (!box) return;
   const logs = Array.isArray(window.__diagLogs) ? window.__diagLogs : [];
   box.innerHTML = '';
-  if (logs.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'text-slate-500 font-sans py-6 text-center';
-    empty.textContent = '目前沒有任何紀錄，代表這次開啟以來沒有發生錯誤或自動修復。';
-    box.appendChild(empty);
-    return;
-  }
-  logs.forEach((entry) => {
+
+  const addHeading = (title, hint) => {
+    const head = document.createElement('div');
+    head.className = 'font-sans pt-1';
+    const titleEl = document.createElement('div');
+    titleEl.className = 'text-xs font-black text-white';
+    titleEl.textContent = title;
+    const hintEl = document.createElement('div');
+    hintEl.className = 'text-[11px] text-slate-400';
+    hintEl.textContent = hint;
+    head.append(titleEl, hintEl);
+    box.appendChild(head);
+  };
+  const addLine = (text, tone) => {
     const line = document.createElement('div');
-    const tone = entry.includes('[ERROR]')
-      ? 'text-rose-300 border-rose-500/30'
-      : entry.includes('[WARN]')
-        ? 'text-amber-200 border-amber-500/30'
-        : 'text-slate-300 border-slate-800';
     line.className = `px-2 py-1.5 rounded-lg bg-slate-950 border break-words ${tone}`;
-    line.textContent = entry;
+    line.textContent = text;
     box.appendChild(line);
-  });
+  };
+  const addEmpty = (text) => {
+    const empty = document.createElement('div');
+    empty.className = 'text-slate-500 font-sans py-3 text-center';
+    empty.textContent = text;
+    box.appendChild(empty);
+  };
+
+  addHeading(
+    `🎮 按鍵 / 遙控器事件（${keyEventLogs.length}）`,
+    '開著這個視窗按遙控器，收到的事件會即時出現在這裡。按了卻什麼都沒出現，代表遙控器送的是網頁收不到的訊號（例如音量鍵）。'
+  );
+  if (keyEventLogs.length === 0) {
+    addEmpty('還沒有收到任何按鍵、媒體鍵或觸控事件。');
+  } else {
+    keyEventLogs.forEach((entry) => addLine(entry, 'text-sky-200 border-sky-500/30'));
+  }
+
+  addHeading(`⚠️ 錯誤與自動修復（${logs.length}）`, '播放中斷、AI 呼叫失敗、教材寫入失敗等。');
+  if (logs.length === 0) {
+    addEmpty('沒有紀錄，代表這次開啟以來沒有發生錯誤或自動修復。');
+  } else {
+    logs.forEach((entry) => {
+      const tone = entry.includes('[ERROR]')
+        ? 'text-rose-300 border-rose-500/30'
+        : entry.includes('[WARN]')
+          ? 'text-amber-200 border-amber-500/30'
+          : 'text-slate-300 border-slate-800';
+      addLine(entry, tone);
+    });
+  }
 }
 
 function buildDiagReportText() {
   const logs = Array.isArray(window.__diagLogs) ? window.__diagLogs : [];
   const pack = state.currentPack;
+  const standalone = window.matchMedia?.('(display-mode: standalone)')?.matches || navigator.standalone === true;
   return [
     `車用盲操英文跟讀播放器 ${APP_VERSION} 診斷紀錄`,
     `時間：${new Date().toLocaleString()}`,
     `瀏覽器：${navigator.userAgent}`,
+    `開啟方式：${standalone ? '主畫面 App (standalone)' : '瀏覽器分頁'}`,
     `AI 引擎：${state.aiConfig?.provider || '未設定'}`,
     `目前教材：${pack ? `${pack.items?.length || 0} 句，第 ${state.currentIndex + 1} 句` : '無'}`,
-    `紀錄（新到舊，共 ${logs.length} 筆）：`,
+    '',
+    `按鍵 / 遙控器事件（新到舊，共 ${keyEventLogs.length} 筆）：`,
+    ...(keyEventLogs.length > 0 ? keyEventLogs : ['（無）']),
+    '',
+    `錯誤與自動修復（新到舊，共 ${logs.length} 筆）：`,
     ...(logs.length > 0 ? logs : ['（無）'])
   ].join('\n');
 }
@@ -680,15 +720,30 @@ function bindAllEvents() {
 
   // Modal: Diagnostic log viewer (opened from the version / changelog modal)
   const modalDiag = document.getElementById('modalDiag');
-  safeOn('btnOpenDiagLog', 'click', () => {
+  const openDiagModal = () => {
     document.getElementById('modalChangelog')?.classList.add('hidden');
+    document.getElementById('modalKeymap')?.classList.add('hidden');
+    state.listeningKeyAction = null;
     renderDiagLogList();
     modalDiag?.classList.remove('hidden');
+    // Same focus state as the main screen after tapping a control, so a remote behaves here as it does there
+    focusBtKeyCatcher();
+  };
+  safeOn('btnOpenDiagLog', 'click', openDiagModal);
+  safeOn('btnOpenDiagFromKeymap', 'click', openDiagModal);
+  safeOn('btnCloseDiagLog', 'click', () => {
+    modalDiag?.classList.add('hidden');
+    focusBtKeyCatcher();
   });
-  safeOn('btnCloseDiagLog', 'click', () => modalDiag?.classList.add('hidden'));
   safeOn('btnClearDiagLog', 'click', () => {
     if (Array.isArray(window.__diagLogs)) window.__diagLogs.length = 0;
+    keyEventLogs.length = 0;
     renderDiagLogList();
+    focusBtKeyCatcher();
+  });
+  // Live view: new events show up while the viewer is open
+  setKeyEventLogListener(() => {
+    if (modalDiag && !modalDiag.classList.contains('hidden')) renderDiagLogList();
   });
   let diagCopyResetTimerId = null;
   safeOn('btnCopyDiagLog', 'click', () => {
@@ -869,13 +924,36 @@ function bindAllEvents() {
     showGiantHud('⌨️', `已綁定 ${code}`, target.label, 'border-emerald-400/90');
   };
 
+  // --- Input event trace (shown in the diagnostics viewer) ---
+  // Typing in a real text field (API keys, subtitles) is never traced: those keystrokes are private.
+  const isTypingInRealField = () => {
+    const el = document.activeElement;
+    return el?.id !== 'btKeyCatcher' && ['INPUT', 'TEXTAREA', 'SELECT'].includes(el?.tagName);
+  };
+  const describeFocus = () => {
+    const el = document.activeElement;
+    if (!el || el === document.body) return '頁面';
+    if (el.id === 'btKeyCatcher') return '隱藏輸入框';
+    return el.id ? `${el.tagName.toLowerCase()}#${el.id}` : el.tagName.toLowerCase();
+  };
+  const describeKeyEvent = (e) =>
+    `${e.type} code="${e.code || ''}" key="${e.key === ' ' ? '(空白)' : (e.key || '')}" keyCode=${e.keyCode || 0} 焦點=${describeFocus()}`;
+
   window.addEventListener('keydown', (e) => {
     const activeEl = document.activeElement;
     const isCatcher = activeEl?.id === 'btKeyCatcher';
     if (!isCatcher && ['INPUT', 'TEXTAREA', 'SELECT'].includes(activeEl?.tagName)) return;
 
+    // A held key auto-repeats; trace only the first keydown of each press
+    const trace = (result) => {
+      if (!e.repeat) logKeyEvent(`${describeKeyEvent(e)} → ${result}`);
+    };
+
     const code = normalizeKeyCode(e.code, e.key);
-    if (!code) return;
+    if (!code) {
+      trace('無法辨識的按鍵，略過');
+      return;
+    }
 
     if (state.listeningKeyAction) {
       e.preventDefault();
@@ -883,12 +961,16 @@ function bindAllEvents() {
       lastKeydownHandledAt = Date.now();
       if (isCatcher && btCatcher) btCatcher.value = '';
       if (e.repeat) return;
+      trace(`學習綁定到「${state.keymap[state.listeningKeyAction]?.label || ''}」`);
       learnBoundKey(code);
       return;
     }
 
     const matchedAction = KEY_ACTION_ORDER.find((act) => (state.keymap[act]?.codes || []).includes(code));
-    if (!matchedAction) return;
+    if (!matchedAction) {
+      trace(`沒有綁定任何動作（可到「按鍵」視窗把 ${code} 學起來）`);
+      return;
+    }
     e.preventDefault();
     lastKeydownHandledCode = code;
     lastKeydownHandledAt = Date.now();
@@ -898,28 +980,44 @@ function bindAllEvents() {
     if (e.repeat) return;
 
     if (matchedAction === 'play') {
+      trace('播放鍵按下（放開時才切換播放；按住 0.5 秒改為切換語速）');
       // Same as the on-screen button: a short press toggles on release, holding 0.5s cycles speed instead
       clearHeldPlayKey();
       heldPlayCode = code;
       heldPlayTimerId = setTimeout(() => {
         heldPlayTimerId = null;
         heldPlayLongPressFired = true;
+        logKeyEvent('播放鍵已按住 0.5 秒 → 切換語速（如果你只是短按，代表這個遙控器沒有送出放開事件）');
         actionCycleSpeed();
       }, 500);
       return;
     }
+    trace(`執行動作：${state.keymap[matchedAction]?.label || matchedAction}`);
     keyActionHandlers[matchedAction]();
   });
 
   window.addEventListener('keyup', (e) => {
     const code = normalizeKeyCode(e.code, e.key);
-    if (heldPlayCode === null || code !== heldPlayCode) return;
+    if (heldPlayCode === null || code !== heldPlayCode) {
+      if (!isTypingInRealField()) logKeyEvent(`${describeKeyEvent(e)} → 放開（無動作）`);
+      return;
+    }
     // Also stops Space/Enter from additionally clicking whichever button currently has focus
     e.preventDefault();
     const wasLongPress = heldPlayLongPressFired;
     clearHeldPlayKey();
+    logKeyEvent(`${describeKeyEvent(e)} → ${wasLongPress ? '播放鍵放開（長按已切換過語速）' : '播放鍵放開，切換播放 / 暫停'}`);
     if (!wasLongPress) actionTogglePlayPause();
   });
+
+  // Many phone remotes are not keyboards at all: they fake a finger tap or swipe at a fixed screen position.
+  // Tracing pointer presses makes that visible (taps inside the viewer itself are left out).
+  window.addEventListener('pointerdown', (e) => {
+    const target = e.target instanceof Element ? e.target : null;
+    if (target?.closest('#modalDiag')) return;
+    const owner = target?.closest('[id]');
+    logKeyEvent(`pointerdown type=${e.pointerType || '?'} 位置=(${Math.round(e.clientX)}, ${Math.round(e.clientY)}) 目標=${owner ? `#${owner.id}` : (target?.tagName.toLowerCase() || '?')}`);
+  }, true);
 
   // If the window loses focus mid-press the keyup never arrives; drop the pending press
   window.addEventListener('blur', clearHeldPlayKey);
@@ -932,16 +1030,26 @@ function bindAllEvents() {
       if (!val) return;
       const ch = val.slice(-1);
       const code = normalizeKeyCode('', ch);
-      if (!code) return;
+      const trace = (result) => logKeyEvent(`隱藏輸入框 input 收到 "${ch === ' ' ? '(空白)' : ch}"（視為 ${code || '無法辨識'}） → ${result}`);
+      if (!code) {
+        trace('略過');
+        return;
+      }
       if (code === lastKeydownHandledCode && Date.now() - lastKeydownHandledAt < 120) {
+        trace('略過：同一下按鍵已由 keydown 處理');
         return;
       }
       if (state.listeningKeyAction) {
+        trace(`學習綁定到「${state.keymap[state.listeningKeyAction]?.label || ''}」`);
         learnBoundKey(code);
         return;
       }
       const matchedAction = KEY_ACTION_ORDER.find((act) => (state.keymap[act]?.codes || []).includes(code));
-      if (!matchedAction) return;
+      if (!matchedAction) {
+        trace('沒有綁定任何動作');
+        return;
+      }
+      trace(`執行動作：${state.keymap[matchedAction]?.label || matchedAction}`);
       if (matchedAction === 'play') {
         actionTogglePlayPause();
       } else {

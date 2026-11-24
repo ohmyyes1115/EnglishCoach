@@ -8,6 +8,7 @@ import {
   formatTimeSec,
   showGiantHud,
   copyTextSynchronously,
+  logKeyEvent,
   savePackToDB,
   showPackSaveFailedHud,
   savePrefsSync
@@ -96,7 +97,13 @@ function registerMediaSessionHandlers() {
   try {
     if (!('mediaSession' in navigator)) return;
     const safeSet = (action, handler) => {
-      try { navigator.mediaSession.setActionHandler(action, handler); } catch (e) {}
+      try {
+        navigator.mediaSession.setActionHandler(action, (details) => {
+          // Remotes that send media keys arrive here, never as keydown; trace them so that shows up
+          logKeyEvent(`媒體鍵 ${action}（來自系統：控制中心、耳機或遙控器的媒體按鍵）`);
+          handler(details);
+        });
+      } catch (e) {}
     };
     safeSet('play', () => {
       if (!state.isPlaying) {

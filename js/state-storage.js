@@ -153,6 +153,28 @@ export function showGiantHud(icon, title, sub, borderClass = 'border-sky-400/90'
   }, durationMs);
 }
 
+// ==========================================
+// INPUT EVENT TRACE (WHAT A REMOTE / KEYBOARD ACTUALLY SENDS)
+// ==========================================
+// Kept apart from window.__diagLogs so a burst of key presses cannot push real errors out of that list.
+export const keyEventLogs = [];
+let keyEventLogListener = null;
+
+export function setKeyEventLogListener(fn) {
+  keyEventLogListener = fn;
+}
+
+export function logKeyEvent(msg) {
+  const d = new Date();
+  const two = (n) => String(n).padStart(2, '0');
+  const stamp = `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`;
+  keyEventLogs.unshift(`[${stamp}] ${msg}`);
+  if (keyEventLogs.length > 80) keyEventLogs.pop();
+  if (keyEventLogListener) {
+    try { keyEventLogListener(); } catch (e) {}
+  }
+}
+
 export function copyTextSynchronously(text) {
   try {
     const ta = document.createElement('textarea');
