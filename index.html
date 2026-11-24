@@ -14,7 +14,18 @@
         if (window.__diagLogs.length > 60) window.__diagLogs.pop();
       };
       window.addEventListener('error', function (e) {
-        window.logDiag('ERROR', e.message || 'Runtime exception');
+        var el = e.target;
+        if (el && el !== window && el.nodeType === 1) {
+          // A resource (audio, script, stylesheet) failed to load. Only record it: stopping the event here,
+          // in the capture phase, would keep it from ever reaching the element's own error listener,
+          // and the player relies on masterAudio's error event to recover playback.
+          var src = String(el.currentSrc || el.src || el.href || '');
+          if (src.indexOf('data:') === 0) src = src.slice(0, 40) + '…';
+          window.logDiag('WARN', '資源載入失敗 <' + String(el.tagName || '').toLowerCase() + '> ' + src);
+          return;
+        }
+        var where = e.filename ? ' @ ' + String(e.filename).split('/').pop() + ':' + (e.lineno || 0) : '';
+        window.logDiag('ERROR', (e.message || 'Runtime exception') + where);
         e.preventDefault();
         e.stopPropagation();
         return true;
@@ -606,7 +617,7 @@
             <input type="radio" name="aiProviderSelect" value="gemini" checked class="mt-1 accent-violet-400" />
             <div>
               <div class="font-bold text-white">Google Gemini API（首推・免費額度免綁卡）</div>
-              <div class="text-slate-400 text-[11px]">使用 <code class="text-emerald-300">gemini-2.5-flash</code> 模型，免費版每日約 1,500 次額度，自動翻譯並拆解片語跟語氣。</div>
+              <div class="text-slate-400 text-[11px]">自動選用此金鑰目前可用的最新 <code class="text-emerald-300">Gemini Flash</code> 模型，有免費額度，自動翻譯並拆解片語跟語氣。</div>
             </div>
           </label>
           <label class="flex items-start gap-2.5 p-2 rounded-xl bg-slate-900 border border-slate-800 cursor-pointer">
@@ -699,6 +710,10 @@
         </button>
       </div>
       <div class="p-4 overflow-y-auto space-y-3 text-xs text-slate-300 leading-relaxed">
+        <button id="btnOpenDiagLog" type="button" class="w-full px-3 py-2 rounded-2xl bg-slate-950 hover:bg-slate-800 border border-slate-700 text-slate-200 font-bold flex items-center justify-between transition">
+          <span>🩺 診斷紀錄（播放中斷、AI 或儲存失敗時來這裡看原因）</span>
+          <i class="fa-solid fa-chevron-right text-slate-500"></i>
+        </button>
         <div class="p-3 rounded-2xl bg-violet-950/40 border border-violet-500/40 space-y-1">
           <div class="font-black text-violet-300">v2.2.1（最新穩定完整版）</div>
           <ul class="list-disc list-inside space-y-0.5">
@@ -723,6 +738,28 @@
             <li>「🎚️ 平衡音量」Active Speech RMS (-16dBFS) + Soft Limiter 消除各句音量忽大忽小。</li>
           </ul>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL 6: DIAGNOSTIC LOG VIEWER -->
+  <div id="modalDiag" class="hidden fixed inset-0 z-50 bg-slate-950/90 backdrop-blur-sm flex items-center justify-center p-2 sm:p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-3xl w-full max-w-lg max-h-[85vh] flex flex-col shadow-2xl overflow-hidden">
+      <div class="p-3.5 sm:p-4 border-b border-slate-800 flex items-center justify-between">
+        <div>
+          <h2 class="text-sm sm:text-base font-black text-white">🩺 診斷紀錄</h2>
+          <p class="text-[11px] text-slate-400">只保留這次開啟以來最近 60 筆（新的在上），重新整理頁面後會清空</p>
+        </div>
+        <button id="btnCloseDiagLog" type="button" class="w-8 h-8 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center shrink-0">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+      <div id="diagLogContainer" class="p-3.5 overflow-y-auto space-y-1.5 flex-1 text-[11px] font-mono select-text"></div>
+      <div class="p-3.5 border-t border-slate-800 flex justify-between items-center">
+        <button id="btnClearDiagLog" type="button" class="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold">
+          清空
+        </button>
+        <button id="btnCopyDiagLog" type="button" class="px-4 py-1.5 rounded-xl bg-sky-500 text-slate-950 text-xs font-black">📋 複製全部</button>
       </div>
     </div>
   </div>

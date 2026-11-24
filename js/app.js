@@ -1,6 +1,7 @@
 // Layer 3: Application Entry Point, UI Rendering, Modal Controllers & Event Bindings
 
 import {
+  APP_VERSION,
   SPEED_STEPS,
   state,
   cloneDefaultKeymap,
@@ -13,6 +14,7 @@ import {
   loadAllPacksFromDB,
   deletePackFromDB,
   showPackSaveFailedHud,
+  copyTextSynchronously,
   savePrefsSync,
   loadPrefsSync,
   loadAiConfigSync,
@@ -274,6 +276,91 @@ function openAiSettingsModal() {
 }
 
 // ==========================================
+// KEY HINTS (FOLLOW THE CURRENT KEYMAP)
+// ==========================================
+function formatKeyCodeLabel(code) {
+  const c = String(code || '');
+  const named = { ArrowLeft: 'Left', ArrowRight: 'Right', ArrowUp: 'Up', ArrowDown: 'Down', PageUp: 'PgUp', PageDown: 'PgDn', ' ': 'Space' };
+  if (named[c]) return named[c];
+  const letterOrDigit = c.match(/^(?:Key|Digit)([A-Z0-9])$/);
+  return letterOrDigit ? letterOrDigit[1] : c;
+}
+
+// The giant buttons are narrow: show the first key, plus the second one only when both stay short
+function formatKeyHintText(action) {
+  const labels = (state.keymap[action]?.codes || []).map(formatKeyCodeLabel);
+  if (labels.length === 0) return '未綁定';
+  const both = labels.slice(0, 2).join(' / ');
+  return labels.length > 1 && both.length <= 8 ? both : labels[0];
+}
+
+function refreshKeyHints() {
+  const hintIds = { prev: 'keyHintPrev', restart: 'keyHintRestart', play: 'keyHintPlay', next: 'keyHintNext', speed: 'keyHintSpeed' };
+  Object.entries(hintIds).forEach(([action, id]) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const codes = state.keymap[action]?.codes || [];
+    el.textContent = action === 'play' && codes.length > 0
+      ? `${formatKeyCodeLabel(codes[0])}(長按調速)`
+      : formatKeyHintText(action);
+  });
+
+  const titledButtons = {
+    ai: ['btnAiExplain', '一鍵翻譯本句並由 AI 簡答核心單字與句型'],
+    copy: ['btnCopySentence', '點擊複製本句乾淨英文並自動原地暫停'],
+    merge: ['btnMergeNextSentence', '將本句與下一句音檔無縫合併']
+  };
+  Object.entries(titledButtons).forEach(([action, [id, text]]) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const labels = (state.keymap[action]?.codes || []).map(formatKeyCodeLabel);
+    el.title = labels.length > 0 ? `${text} (快捷鍵 ${labels.join(' / ')})` : text;
+  });
+}
+
+// ==========================================
+// DIAGNOSTIC LOG VIEWER
+// ==========================================
+function renderDiagLogList() {
+  const box = document.getElementById('diagLogContainer');
+  if (!box) return;
+  const logs = Array.isArray(window.__diagLogs) ? window.__diagLogs : [];
+  box.innerHTML = '';
+  if (logs.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'text-slate-500 font-sans py-6 text-center';
+    empty.textContent = '目前沒有任何紀錄，代表這次開啟以來沒有發生錯誤或自動修復。';
+    box.appendChild(empty);
+    return;
+  }
+  logs.forEach((entry) => {
+    const line = document.createElement('div');
+    const tone = entry.includes('[ERROR]')
+      ? 'text-rose-300 border-rose-500/30'
+      : entry.includes('[WARN]')
+        ? 'text-amber-200 border-amber-500/30'
+        : 'text-slate-300 border-slate-800';
+    line.className = `px-2 py-1.5 rounded-lg bg-slate-950 border break-words ${tone}`;
+    line.textContent = entry;
+    box.appendChild(line);
+  });
+}
+
+function buildDiagReportText() {
+  const logs = Array.isArray(window.__diagLogs) ? window.__diagLogs : [];
+  const pack = state.currentPack;
+  return [
+    `車用盲操英文跟讀播放器 ${APP_VERSION} 診斷紀錄`,
+    `時間：${new Date().toLocaleString()}`,
+    `瀏覽器：${navigator.userAgent}`,
+    `AI 引擎：${state.aiConfig?.provider || '未設定'}`,
+    `目前教材：${pack ? `${pack.items?.length || 0} 句，第 ${state.currentIndex + 1} 句` : '無'}`,
+    `紀錄（新到舊，共 ${logs.length} 筆）：`,
+    ...(logs.length > 0 ? logs : ['（無）'])
+  ].join('\n');
+}
+
+// ==========================================
 // APPLICATION INITIALIZATION
 // ==========================================
 async function initApplication() {
@@ -289,6 +376,7 @@ async function initApplication() {
   state.aiConfig = loadAiConfigSync();
   updateAiHeaderBadgeUI();
   state.keymap = loadKeymapSync();
+  refreshKeyHints();
 
   // 1. Load default built-in pack synchronously so UI never hangs
   const builtInPack = createDefaultBuiltInPack();
@@ -590,9 +678,35 @@ function bindAllEvents() {
   safeOn('btnOpenChangelog', 'click', () => document.getElementById('modalChangelog')?.classList.remove('hidden'));
   safeOn('btnCloseChangelog', 'click', () => document.getElementById('modalChangelog')?.classList.add('hidden'));
 
+  // Modal: Diagnostic log viewer (opened from the version / changelog modal)
+  const modalDiag = document.getElementById('modalDiag');
+  safeOn('btnOpenDiagLog', 'click', () => {
+    document.getElementById('modalChangelog')?.classList.add('hidden');
+    renderDiagLogList();
+    modalDiag?.classList.remove('hidden');
+  });
+  safeOn('btnCloseDiagLog', 'click', () => modalDiag?.classList.add('hidden'));
+  safeOn('btnClearDiagLog', 'click', () => {
+    if (Array.isArray(window.__diagLogs)) window.__diagLogs.length = 0;
+    renderDiagLogList();
+  });
+  let diagCopyResetTimerId = null;
+  safeOn('btnCopyDiagLog', 'click', () => {
+    copyTextSynchronously(buildDiagReportText());
+    // The giant HUD sits behind modals, so confirm on the button itself
+    const btn = document.getElementById('btnCopyDiagLog');
+    if (!btn) return;
+    btn.textContent = '✓ 已複製';
+    if (diagCopyResetTimerId) clearTimeout(diagCopyResetTimerId);
+    diagCopyResetTimerId = setTimeout(() => {
+      btn.textContent = '📋 複製全部';
+    }, 1500);
+  });
+
   // Modal: Keymap (Bluetooth Page Turner / Keyboard) + iOS PWA Hidden Input Catcher
   const modalKeymap = document.getElementById('modalKeymap');
   const btCatcher = document.getElementById('btKeyCatcher');
+  let keymapNotice = '';
 
   const focusBtKeyCatcher = () => {
     if (!btCatcher) return;
@@ -626,23 +740,48 @@ function bindAllEvents() {
     const box = document.getElementById('keymapListContainer');
     if (!box) return;
     box.innerHTML = '';
+    if (keymapNotice) {
+      const note = document.createElement('div');
+      note.className = 'p-2.5 rounded-xl bg-amber-950/40 border border-amber-500/40 text-[11px] text-amber-200 font-bold';
+      note.textContent = keymapNotice;
+      box.appendChild(note);
+    }
     Object.entries(state.keymap).forEach(([k, info]) => {
+      const codes = info.codes || [];
+      const isListening = state.listeningKeyAction === k;
+      const chipsHtml = codes.length > 0
+        ? codes.map((code, i) => `<button type="button" data-remove-idx="${i}" title="移除這個按鍵" class="px-1.5 py-0.5 rounded-lg bg-slate-800 hover:bg-rose-950 border border-slate-700 hover:border-rose-500/60 font-mono text-[11px] text-amber-300 hover:text-rose-200 transition">${escapeHtml(code)} <span class="text-slate-500">✕</span></button>`).join('')
+        : '<span class="text-[11px] text-slate-500">尚未綁定按鍵</span>';
       const row = document.createElement('div');
-      row.className = 'p-3 rounded-2xl bg-slate-950 border border-slate-800 flex items-center justify-between gap-2';
+      row.className = `p-3 rounded-2xl bg-slate-950 border ${isListening ? 'border-sky-400' : 'border-slate-800'} flex items-center justify-between gap-2`;
       row.innerHTML = `
-        <div>
+        <div class="min-w-0">
           <div class="font-bold text-white">${escapeHtml(info.label)}</div>
-          <div class="font-mono text-[11px] text-amber-300 mt-0.5">${escapeHtml((info.codes || []).join(' / '))}</div>
+          <div class="flex flex-wrap gap-1 mt-1">${chipsHtml}</div>
         </div>
-        <button type="button" data-k="${k}" class="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-sky-500 hover:text-slate-950 font-bold text-xs transition">
-          ${state.listeningKeyAction === k ? '請按翻頁器按鍵...' : '學習按鍵'}
+        <button type="button" data-k="${k}" class="px-3 py-1.5 rounded-xl ${isListening ? 'bg-sky-500 text-slate-950' : 'bg-slate-800 hover:bg-sky-500 hover:text-slate-950'} font-bold text-xs transition shrink-0">
+          ${isListening ? '請按按鍵…(點此取消)' : '學習按鍵'}
         </button>
       `;
-      row.querySelector('button').addEventListener('click', () => {
-        state.listeningKeyAction = k;
+      row.querySelector('[data-k]').addEventListener('click', () => {
+        // Tapping the row that is already listening cancels it
+        state.listeningKeyAction = isListening ? null : k;
+        keymapNotice = '';
         renderKeymapRows();
         // Must focus synchronously inside user click so iOS PWA grants hardware keyboard focus
         focusBtKeyCatcher();
+      });
+      row.querySelectorAll('[data-remove-idx]').forEach((chip) => {
+        chip.addEventListener('click', () => {
+          const removed = codes.splice(Number(chip.dataset.removeIdx), 1)[0];
+          state.listeningKeyAction = null;
+          keymapNotice = `已移除「${info.label}」的按鍵 ${removed}`;
+          saveKeymapSync(state.keymap);
+          refreshKeyHints();
+          renderKeymapRows();
+          // The tapped chip is gone after the re-render; hand hardware-key focus back to the catcher
+          focusBtKeyCatcher();
+        });
       });
       box.appendChild(row);
     });
@@ -650,6 +789,7 @@ function bindAllEvents() {
 
   safeOn('btnOpenKeymapModal', 'click', () => {
     state.listeningKeyAction = null;
+    keymapNotice = '';
     renderKeymapRows();
     modalKeymap?.classList.remove('hidden');
     focusBtKeyCatcher();
@@ -665,7 +805,10 @@ function bindAllEvents() {
     focusBtKeyCatcher();
   });
   safeOn('btnResetDefaultKeys', 'click', () => {
+    state.listeningKeyAction = null;
+    keymapNotice = '已恢復預設按鍵';
     saveKeymapSync(cloneDefaultKeymap());
+    refreshKeyHints();
     renderKeymapRows();
     focusBtKeyCatcher();
   });
@@ -700,14 +843,30 @@ function bindAllEvents() {
 
   const learnBoundKey = (code) => {
     const act = state.listeningKeyAction;
-    if (!act || !state.keymap[act]) return;
-    if (!state.keymap[act].codes.includes(code)) {
-      state.keymap[act].codes.unshift(code);
-    }
+    const target = state.keymap[act];
+    if (!act || !target) return;
+    // One key drives one action: binding it here takes it away from wherever it was bound before,
+    // otherwise the action later in the list would silently never fire
+    const takenFrom = [];
+    Object.entries(state.keymap).forEach(([other, info]) => {
+      if (other === act || !Array.isArray(info.codes)) return;
+      const at = info.codes.indexOf(code);
+      if (at >= 0) {
+        info.codes.splice(at, 1);
+        takenFrom.push(info.label);
+      }
+    });
+    // Newest binding goes first so the on-screen hint shows the key the user actually uses
+    target.codes = [code, ...(target.codes || []).filter((c) => c !== code)];
+    keymapNotice = takenFrom.length > 0
+      ? `按鍵 ${code} 原本綁在「${takenFrom.join('、')}」，已改綁到「${target.label}」`
+      : `已將按鍵 ${code} 綁定到「${target.label}」`;
     state.listeningKeyAction = null;
+    clearHeldPlayKey();
     saveKeymapSync(state.keymap);
+    refreshKeyHints();
     renderKeymapRows();
-    showGiantHud('⌨️', `已綁定 ${code}`, state.keymap[act].label, 'border-emerald-400/90');
+    showGiantHud('⌨️', `已綁定 ${code}`, target.label, 'border-emerald-400/90');
   };
 
   window.addEventListener('keydown', (e) => {
@@ -723,6 +882,7 @@ function bindAllEvents() {
       lastKeydownHandledCode = code;
       lastKeydownHandledAt = Date.now();
       if (isCatcher && btCatcher) btCatcher.value = '';
+      if (e.repeat) return;
       learnBoundKey(code);
       return;
     }

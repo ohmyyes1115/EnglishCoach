@@ -177,31 +177,144 @@ export async function fetchFreeDictionaryEntry(word) {
   }
 }
 
+// ==========================================
+// GEMINI: MODEL DISCOVERY & generateContent
+// ==========================================
+// Google retires Gemini model ids regularly (gemini-2.0-flash is already shut down), so with a key we ask
+// the API which Flash models this key can use instead of trusting a hardcoded list (same idea as Groq below).
+// The static list is only used when that lookup fails.
+const GEMINI_STATIC_FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-3-flash-preview'];
+// Without a key the request only works inside a host page that injects one; that host expects this model id
+const GEMINI_KEYLESS_MODELS = ['gemini-3-flash-preview'];
+
+let cachedGeminiKeyFp = '';
+let cachedGeminiModelIds = null;
+let cachedGeminiWorkingModel = '';
+const geminiModelsRejectingThinkingConfig = new Set();
+
+function rankGeminiFlashModels(modelList) {
+  const excluded = /image|tts|audio|live|embedding|aqa|robotics|computer-use|learnlm|gemma|dialog/i;
+  const ids = [];
+  for (const m of modelList) {
+    const id = String(m?.name || '').replace(/^models\//, '');
+    if (!/^gemini-/.test(id) || !/flash/i.test(id) || excluded.test(id)) continue;
+    const methods = m?.supportedGenerationMethods;
+    if (Array.isArray(methods) && !methods.includes('generateContent')) continue;
+    if (!ids.includes(id)) ids.push(id);
+  }
+  const score = (id) => ({
+    stable: /preview|exp/i.test(id) ? 0 : 1,
+    version: /-latest$/.test(id) ? 999 : (parseFloat((id.match(/^gemini-(\d+(?:\.\d+)?)/) || [])[1]) || 0),
+    full: /lite/i.test(id) ? 0 : 1
+  });
+  // Stable before preview, newer before older, full Flash before Flash-Lite, plain id before dated variants
+  return ids.sort((a, b) => {
+    const x = score(a);
+    const y = score(b);
+    return (y.stable - x.stable) || (y.version - x.version) || (y.full - x.full) || (a.length - b.length);
+  });
+}
+
+async function resolveGeminiCandidateModels(cleanKey) {
+  if (!cleanKey) return GEMINI_KEYLESS_MODELS;
+  const fp = cleanKey.slice(-10);
+  if (cachedGeminiKeyFp !== fp) {
+    cachedGeminiKeyFp = fp;
+    cachedGeminiModelIds = null;
+    cachedGeminiWorkingModel = '';
+  }
+  if (!cachedGeminiModelIds) {
+    try {
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&key=${encodeURIComponent(cleanKey)}`);
+      if (res.ok) {
+        const data = await res.json();
+        const ranked = rankGeminiFlashModels(data?.models || []);
+        if (ranked.length > 0) cachedGeminiModelIds = ranked;
+      }
+    } catch (e) {}
+  }
+  const base = cachedGeminiModelIds ? cachedGeminiModelIds.slice(0, 5) : GEMINI_STATIC_FALLBACK_MODELS;
+  const ordered = [];
+  for (const m of [cachedGeminiWorkingModel, ...base]) {
+    if (m && !ordered.includes(m)) ordered.push(m);
+  }
+  return ordered;
+}
+
+// Thinking tokens count against maxOutputTokens, so an un-capped thinking model can spend the whole
+// budget before writing a single character. These short tasks need no reasoning: switch it off (2.5)
+// or down to the minimum (3 and later).
+function buildGeminiThinkingConfig(modelName) {
+  if (geminiModelsRejectingThinkingConfig.has(modelName)) return null;
+  if (/^gemini-(1\.|2\.0)/.test(modelName)) return null;
+  if (/^gemini-2\.5/.test(modelName)) return { thinkingBudget: 0 };
+  return { thinkingLevel: 'minimal' };
+}
+
+async function requestGeminiGenerateContent(modelName, cleanKey, parts, temperature, maxOutputTokens) {
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(cleanKey)}`;
+  const send = async (thinkingConfig) => {
+    const generationConfig = { temperature, maxOutputTokens };
+    if (thinkingConfig) generationConfig.thinkingConfig = thinkingConfig;
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ parts }], generationConfig })
+    });
+    const data = await res.json().catch(() => ({}));
+    return { res, data };
+  };
+
+  const thinkingConfig = buildGeminiThinkingConfig(modelName);
+  let { res, data } = await send(thinkingConfig);
+  if (!res.ok && thinkingConfig && res.status === 400 && /think/i.test(data?.error?.message || '')) {
+    // This model does not take the thinking setting we guessed; remember that and ask again without it
+    geminiModelsRejectingThinkingConfig.add(modelName);
+    ({ res, data } = await send(null));
+  }
+  if (!res.ok) {
+    throw new Error(data?.error?.message || `Gemini HTTP ${res.status}`);
+  }
+
+  const candidate = data?.candidates?.[0];
+  const text = (candidate?.content?.parts || [])
+    .filter(p => p && !p.thought && typeof p.text === 'string')
+    .map(p => p.text)
+    .join('')
+    .trim();
+  return {
+    text,
+    truncated: candidate?.finishReason === 'MAX_TOKENS',
+    finishReason: candidate?.finishReason || data?.promptFeedback?.blockReason || ''
+  };
+}
+
+// Trying further models is pointless when the key itself is refused or the network is down
+function isGeminiErrorFatalForAllModels(err) {
+  if (err instanceof TypeError) return true;
+  return /api key not valid|api key expired|API_KEY_INVALID/i.test(err?.message || '');
+}
+
 export async function callGeminiFlashConciseApi(promptText, apiKey) {
   const cleanKey = String(apiKey || '').trim();
-  const models = cleanKey ? ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-3-flash-preview'] : ['gemini-3-flash-preview'];
+  const models = await resolveGeminiCandidateModels(cleanKey);
   let lastErr = null;
   for (const modelName of models) {
     try {
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(cleanKey)}`;
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: promptText }] }],
-          generationConfig: { temperature: 0.25, maxOutputTokens: 380 }
-        })
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        lastErr = new Error(data?.error?.message || `HTTP ${res.status}`);
-        continue;
+      // The prompt itself asks for a short answer; this cap is only a safety net against a runaway reply
+      const out = await requestGeminiGenerateContent(modelName, cleanKey, [{ text: promptText }], 0.25, 2048);
+      if (out.text && !out.truncated) {
+        if (cleanKey) cachedGeminiWorkingModel = modelName;
+        return { text: out.text, modelUsed: modelName };
       }
-      const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      if (reply) return { text: reply, modelUsed: modelName };
+      lastErr = new Error(out.truncated
+        ? `${modelName} 回覆被截斷（輸出長度達上限）`
+        : `${modelName} 回覆內容為空${out.finishReason ? `（${out.finishReason}）` : ''}`);
     } catch (err) {
       lastErr = err;
+      if (isGeminiErrorFatalForAllModels(err)) break;
     }
+    if (cachedGeminiWorkingModel === modelName) cachedGeminiWorkingModel = '';
   }
   throw lastErr || new Error('Gemini API 呼叫失敗');
 }
@@ -298,7 +411,7 @@ export async function callGroqConciseApi(promptText, apiKey) {
       body: JSON.stringify({
         model: modelName,
         temperature: 0.25,
-        max_tokens: 360,
+        max_tokens: 700,
         messages: [
           { role: 'system', content: '你是一位專精台灣繁體中文的車用英文口說教練，回答務必極度精簡扼要。' },
           { role: 'user', content: promptText }
@@ -307,8 +420,17 @@ export async function callGroqConciseApi(promptText, apiKey) {
     });
     const data = await res.json().catch(() => ({}));
     if (res.ok) {
-      cachedGroqChatModel = modelName;
-      return { text: data?.choices?.[0]?.message?.content || '', modelUsed: modelName };
+      const choice = data?.choices?.[0];
+      const text = choice?.message?.content || '';
+      // An empty or cut-off reply (e.g. a reasoning model that spent the budget thinking) is a failure:
+      // move on to the next model instead of returning half an answer that would then be cached
+      if (text && choice?.finish_reason !== 'length') {
+        cachedGroqChatModel = modelName;
+        return { text, modelUsed: modelName };
+      }
+      lastErr = new Error(text ? `${modelName} 回覆被截斷（輸出長度達上限）` : `${modelName} 回覆內容為空`);
+      if (cachedGroqChatModel === modelName) cachedGroqChatModel = '';
+      continue;
     }
     const errMsg = data?.error?.message || `Groq HTTP ${res.status}`;
     lastErr = new Error(errMsg);
@@ -329,7 +451,7 @@ export async function callOpenAiMiniConciseApi(promptText, apiKey) {
     body: JSON.stringify({
       model: 'gpt-4o-mini',
       temperature: 0.25,
-      max_tokens: 360,
+      max_tokens: 700,
       messages: [
         { role: 'system', content: '你是一位專精台灣繁體中文的車用英文口說教練，回答務必極度精簡扼要。' },
         { role: 'user', content: promptText }
@@ -338,7 +460,9 @@ export async function callOpenAiMiniConciseApi(promptText, apiKey) {
   });
   const data = await res.json();
   if (!res.ok) throw new Error(data?.error?.message || `OpenAI HTTP ${res.status}`);
-  return { text: data?.choices?.[0]?.message?.content || '', modelUsed: 'gpt-4o-mini' };
+  const choice = data?.choices?.[0];
+  if (choice?.finish_reason === 'length') throw new Error('gpt-4o-mini 回覆被截斷（輸出長度達上限）');
+  return { text: choice?.message?.content || '', modelUsed: 'gpt-4o-mini' };
 }
 
 export async function queryConfiguredAiEngine(promptText) {
@@ -783,7 +907,7 @@ async function transcribeChunkViaWhisper(chunk, providerType, apiKey) {
 
 async function transcribeChunkViaGemini(chunk, apiKey) {
   const cleanKey = String(apiKey || '').trim();
-  const models = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+  const models = await resolveGeminiCandidateModels(cleanKey);
   const prompt = [
     'Transcribe all spoken English in this audio accurately with proper capitalization and punctuation.',
     'Output strictly one natural sentence per line using this exact format:',
@@ -796,27 +920,25 @@ async function transcribeChunkViaGemini(chunk, apiKey) {
 
   for (const modelName of models) {
     try {
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(cleanKey)}`;
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{
-            parts: [
-              { text: prompt },
-              { inline_data: { mime_type: 'audio/wav', data: base64Audio } }
-            ]
-          }],
-          generationConfig: { temperature: 0.1, maxOutputTokens: 4096 }
-        })
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        lastErr = new Error(data?.error?.message || `Gemini HTTP ${res.status}`);
+      const out = await requestGeminiGenerateContent(
+        modelName,
+        cleanKey,
+        [
+          { text: prompt },
+          { inline_data: { mime_type: 'audio/wav', data: base64Audio } }
+        ],
+        0.1,
+        8192
+      );
+      const reply = out.text;
+      if (!reply) {
+        lastErr = new Error(`${modelName} 聽打回覆內容為空${out.finishReason ? `（${out.finishReason}）` : ''}`);
         continue;
       }
-      const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      if (!reply) continue;
+      // A cut-off transcript is still mostly usable, so keep it, but leave a trace for the diagnostics log
+      if (out.truncated && typeof window.logDiag === 'function') {
+        window.logDiag('WARN', `Gemini 聽打 chunk#${chunk.index} 輸出達上限，這一段的結尾可能缺漏`);
+      }
 
       const entries = reply
         .split('\n')
@@ -835,6 +957,7 @@ async function transcribeChunkViaGemini(chunk, apiKey) {
       return { modelUsed: modelName, entries };
     } catch (err) {
       lastErr = err;
+      if (isGeminiErrorFatalForAllModels(err)) break;
     }
   }
   throw lastErr || new Error('Gemini 語音聽打失敗');

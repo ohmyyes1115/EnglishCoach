@@ -365,9 +365,26 @@ export function loadKeymapSync() {
     const raw = safeStorage.getItem(KEYMAP_LS_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      return { ...base, ...parsed };
+      // Only the bound keys are user data; labels and the set of actions always come from the current defaults.
+      // One key may drive one action only (the first match wins at runtime), so drop duplicates while loading.
+      const taken = new Set();
+      const actions = Object.keys(base);
+      const hasSaved = (action) => Array.isArray(parsed?.[action]?.codes);
+      actions.filter(hasSaved).forEach((action) => {
+        base[action].codes = parsed[action].codes.filter((c) => {
+          if (typeof c !== 'string' || !c || taken.has(c)) return false;
+          taken.add(c);
+          return true;
+        });
+      });
+      // Actions added in a later version keep their default keys, minus any the user already assigned elsewhere
+      actions.filter((action) => !hasSaved(action)).forEach((action) => {
+        base[action].codes = base[action].codes.filter((c) => !taken.has(c));
+      });
     }
-  } catch (e) {}
+  } catch (e) {
+    return cloneDefaultKeymap();
+  }
   return base;
 }
 
