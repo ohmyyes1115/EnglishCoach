@@ -45,6 +45,21 @@ export const DEFAULT_KEYMAP = {
   ai:      { label: 'AI 簡答翻譯與解析', codes: ['KeyE', 'KeyA'] }
 };
 
+// A binding is a key code, optionally followed by "@2" / "@3" for a double / triple click of that key.
+// Cheap remotes send key-down and key-up together the moment a button is pressed, so a long press is
+// invisible to the page; counting quick repeated presses is the only way to get more actions per button.
+export const MAX_KEY_CLICKS = 3;
+
+export function makeKeyBinding(code, clicks) {
+  return clicks > 1 ? `${code}@${clicks}` : code;
+}
+
+export function parseKeyBinding(binding) {
+  const text = String(binding || '');
+  const m = /^(.+)@([23])$/.exec(text);
+  return m ? { code: m[1], clicks: Number(m[2]) } : { code: text, clicks: 1 };
+}
+
 export function cloneDefaultKeymap() {
   return JSON.parse(JSON.stringify(DEFAULT_KEYMAP));
 }

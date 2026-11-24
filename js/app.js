@@ -18,6 +18,9 @@ import {
   keyEventLogs,
   logKeyEvent,
   setKeyEventLogListener,
+  MAX_KEY_CLICKS,
+  makeKeyBinding,
+  parseKeyBinding,
   savePrefsSync,
   loadPrefsSync,
   loadAiConfigSync,
@@ -281,12 +284,33 @@ function openAiSettingsModal() {
 // ==========================================
 // KEY HINTS (FOLLOW THE CURRENT KEYMAP)
 // ==========================================
-function formatKeyCodeLabel(code) {
-  const c = String(code || '');
+// Short form for the narrow on-screen hints: "P", "P×2" (double click), "P×3" (triple click)
+function formatKeyCodeLabel(binding) {
+  const { code: c, clicks } = parseKeyBinding(binding);
+  const suffix = clicks > 1 ? `×${clicks}` : '';
   const named = { ArrowLeft: 'Left', ArrowRight: 'Right', ArrowUp: 'Up', ArrowDown: 'Down', PageUp: 'PgUp', PageDown: 'PgDn', ' ': 'Space' };
-  if (named[c]) return named[c];
+  if (named[c]) return named[c] + suffix;
   const letterOrDigit = c.match(/^(?:Key|Digit)([A-Z0-9])$/);
-  return letterOrDigit ? letterOrDigit[1] : c;
+  return (letterOrDigit ? letterOrDigit[1] : c) + suffix;
+}
+
+// Long form for the keymap window and the diagnostics trace: "KeyP", "KeyP 雙擊", "KeyP 三擊"
+function describeKeyBinding(binding) {
+  const { code, clicks } = parseKeyBinding(binding);
+  return clicks === 2 ? `${code} 雙擊` : clicks === 3 ? `${code} 三擊` : code;
+}
+
+// Highest click count bound to this key across all actions: 0 = key unused, 1 = single click only,
+// 2 or 3 = the key has a multi-click binding, so each press must wait to see whether another follows
+function maxClicksBoundToKey(code) {
+  let max = 0;
+  Object.values(state.keymap).forEach((info) => {
+    (info.codes || []).forEach((binding) => {
+      const parsed = parseKeyBinding(binding);
+      if (parsed.code === code && parsed.clicks > max) max = parsed.clicks;
+    });
+  });
+  return max;
 }
 
 // The giant buttons are narrow: show the first key, plus the second one only when both stay short
@@ -303,7 +327,9 @@ function refreshKeyHints() {
     const el = document.getElementById(id);
     if (!el) return;
     const codes = state.keymap[action]?.codes || [];
-    el.textContent = action === 'play' && codes.length > 0
+    // Holding the play key for speed only works on a key without multi-click bindings
+    const playKeySupportsHold = action === 'play' && codes.length > 0 && maxClicksBoundToKey(parseKeyBinding(codes[0]).code) === 1;
+    el.textContent = playKeySupportsHold
       ? `${formatKeyCodeLabel(codes[0])}(長按調速)`
       : formatKeyHintText(action);
   });
@@ -805,7 +831,7 @@ function bindAllEvents() {
       const codes = info.codes || [];
       const isListening = state.listeningKeyAction === k;
       const chipsHtml = codes.length > 0
-        ? codes.map((code, i) => `<button type="button" data-remove-idx="${i}" title="移除這個按鍵" class="px-1.5 py-0.5 rounded-lg bg-slate-800 hover:bg-rose-950 border border-slate-700 hover:border-rose-500/60 font-mono text-[11px] text-amber-300 hover:text-rose-200 transition">${escapeHtml(code)} <span class="text-slate-500">✕</span></button>`).join('')
+        ? codes.map((code, i) => `<button type="button" data-remove-idx="${i}" title="移除這個按鍵" class="px-1.5 py-0.5 rounded-lg bg-slate-800 hover:bg-rose-950 border border-slate-700 hover:border-rose-500/60 font-mono text-[11px] text-amber-300 hover:text-rose-200 transition">${escapeHtml(describeKeyBinding(code))} <span class="text-slate-500">✕</span></button>`).join('')
         : '<span class="text-[11px] text-slate-500">尚未綁定按鍵</span>';
       const row = document.createElement('div');
       row.className = `p-3 rounded-2xl bg-slate-950 border ${isListening ? 'border-sky-400' : 'border-slate-800'} flex items-center justify-between gap-2`;
@@ -815,7 +841,7 @@ function bindAllEvents() {
           <div class="flex flex-wrap gap-1 mt-1">${chipsHtml}</div>
         </div>
         <button type="button" data-k="${k}" class="px-3 py-1.5 rounded-xl ${isListening ? 'bg-sky-500 text-slate-950' : 'bg-slate-800 hover:bg-sky-500 hover:text-slate-950'} font-bold text-xs transition shrink-0">
-          ${isListening ? '請按按鍵…(點此取消)' : '學習按鍵'}
+          ${isListening ? '按 1～3 下…(點此取消)' : '學習按鍵'}
         </button>
       `;
       row.querySelector('[data-k]').addEventListener('click', () => {
@@ -830,7 +856,7 @@ function bindAllEvents() {
         chip.addEventListener('click', () => {
           const removed = codes.splice(Number(chip.dataset.removeIdx), 1)[0];
           state.listeningKeyAction = null;
-          keymapNotice = `已移除「${info.label}」的按鍵 ${removed}`;
+          keymapNotice = `已移除「${info.label}」的按鍵 ${describeKeyBinding(removed)}`;
           saveKeymapSync(state.keymap);
           refreshKeyHints();
           renderKeymapRows();
@@ -886,6 +912,8 @@ function bindAllEvents() {
   let heldPlayLongPressFired = false;
   let lastKeydownHandledCode = '';
   let lastKeydownHandledAt = 0;
+  const keyupSwallowCodes = new Set();
+  const MULTI_CLICK_WINDOW_MS = 350;
 
   const clearHeldPlayKey = () => {
     if (heldPlayTimerId) {
@@ -896,6 +924,7 @@ function bindAllEvents() {
     heldPlayLongPressFired = false;
   };
 
+  // `code` is a full binding here: a key code, or "code@2" / "code@3" for a double / triple click
   const learnBoundKey = (code) => {
     const act = state.listeningKeyAction;
     const target = state.keymap[act];
@@ -913,15 +942,130 @@ function bindAllEvents() {
     });
     // Newest binding goes first so the on-screen hint shows the key the user actually uses
     target.codes = [code, ...(target.codes || []).filter((c) => c !== code)];
+    const name = describeKeyBinding(code);
     keymapNotice = takenFrom.length > 0
-      ? `按鍵 ${code} 原本綁在「${takenFrom.join('、')}」，已改綁到「${target.label}」`
-      : `已將按鍵 ${code} 綁定到「${target.label}」`;
+      ? `按鍵 ${name} 原本綁在「${takenFrom.join('、')}」，已改綁到「${target.label}」`
+      : `已將按鍵 ${name} 綁定到「${target.label}」`;
+    if (parseKeyBinding(code).clicks > 1) {
+      keymapNotice += `。這顆鍵現在有連擊，它的單擊會晚約 ${MULTI_CLICK_WINDOW_MS / 1000} 秒才反應`;
+    }
     state.listeningKeyAction = null;
     clearHeldPlayKey();
     saveKeymapSync(state.keymap);
     refreshKeyHints();
     renderKeymapRows();
-    showGiantHud('⌨️', `已綁定 ${code}`, target.label, 'border-emerald-400/90');
+    showGiantHud('⌨️', `已綁定 ${name}`, target.label, 'border-emerald-400/90');
+  };
+
+  // --- Multi-click (double / triple click) detection ---
+  // Presses of a key that has a multi-click binding are counted until no further press arrives within
+  // the window (or the highest bound count is reached); only then does the matching action run.
+  // Keys without a multi-click binding skip all of this and act at once.
+  let pendingClickCode = null;
+  let pendingClickCount = 0;
+  let pendingClickTimerId = null;
+  let pendingClickIsLearning = false;
+
+  const findActionForBinding = (binding) =>
+    KEY_ACTION_ORDER.find((act) => (state.keymap[act]?.codes || []).includes(binding));
+
+  const runKeyAction = (action) => {
+    if (action === 'play') {
+      actionTogglePlayPause();
+    } else {
+      keyActionHandlers[action]();
+    }
+  };
+
+  const resolvePendingClicks = () => {
+    if (pendingClickTimerId) {
+      clearTimeout(pendingClickTimerId);
+      pendingClickTimerId = null;
+    }
+    const code = pendingClickCode;
+    const count = pendingClickCount;
+    const wasLearning = pendingClickIsLearning;
+    pendingClickCode = null;
+    pendingClickCount = 0;
+    pendingClickIsLearning = false;
+    if (code === null) return;
+
+    const binding = makeKeyBinding(code, count);
+    const name = describeKeyBinding(binding);
+    // The keymap window may have been opened, closed or cancelled while the presses were being counted
+    if (wasLearning !== Boolean(state.listeningKeyAction)) {
+      logKeyEvent(`${name} → 略過（學習狀態在連擊計數期間改變了）`);
+      return;
+    }
+    if (wasLearning) {
+      logKeyEvent(`${name} → 學習綁定到「${state.keymap[state.listeningKeyAction]?.label || ''}」`);
+      learnBoundKey(binding);
+      return;
+    }
+    const action = findActionForBinding(binding);
+    if (!action) {
+      logKeyEvent(`${name} → 這個按法沒有綁定任何動作`);
+      return;
+    }
+    logKeyEvent(`${name} → 執行動作：${state.keymap[action]?.label || action}`);
+    runKeyAction(action);
+  };
+
+  const registerKeyClick = (code, maxClicks, isLearning) => {
+    // A press of a different key ends the count for the previous one right away
+    if (pendingClickCode !== null && (pendingClickCode !== code || pendingClickIsLearning !== isLearning)) {
+      resolvePendingClicks();
+    }
+    if (pendingClickTimerId) clearTimeout(pendingClickTimerId);
+    pendingClickTimerId = null;
+    pendingClickCode = code;
+    pendingClickCount += 1;
+    pendingClickIsLearning = isLearning;
+    if (pendingClickCount >= maxClicks) {
+      resolvePendingClicks();
+      return;
+    }
+    pendingClickTimerId = setTimeout(resolvePendingClicks, MULTI_CLICK_WINDOW_MS);
+  };
+
+  // One physical press of a key that is bound, or of any key while learning.
+  // `canHold` is true only for real keydown events, where a matching keyup will follow.
+  const handleKeyPress = (code, trace, canHold) => {
+    const isLearning = Boolean(state.listeningKeyAction);
+    const nth = (pendingClickCode === code && pendingClickIsLearning === isLearning ? pendingClickCount : 0) + 1;
+
+    if (isLearning) {
+      trace(`學習中：第 ${nth} 下（停 ${MULTI_CLICK_WINDOW_MS / 1000} 秒後綁定，連按可綁雙擊 / 三擊）`);
+      registerKeyClick(code, MAX_KEY_CLICKS, true);
+      return;
+    }
+
+    const maxClicks = maxClicksBoundToKey(code);
+    if (maxClicks > 1) {
+      trace(`第 ${nth} 下（這顆鍵設有連擊，停 ${MULTI_CLICK_WINDOW_MS / 1000} 秒後才執行）`);
+      registerKeyClick(code, maxClicks, false);
+      return;
+    }
+
+    // Single-click-only key: act at once
+    if (pendingClickCode !== null) resolvePendingClicks();
+    const action = findActionForBinding(code);
+    if (!action) return;
+    if (action === 'play' && canHold) {
+      trace('播放鍵按下（放開時才切換播放；按住 0.5 秒改為切換語速）');
+      // Same as the on-screen button: a short press toggles on release, holding 0.5s cycles speed instead
+      clearHeldPlayKey();
+      heldPlayCode = code;
+      heldPlayTimerId = setTimeout(() => {
+        heldPlayTimerId = null;
+        heldPlayLongPressFired = true;
+        logKeyEvent('播放鍵已按住 0.5 秒 → 切換語速（如果你只是短按，代表這個遙控器沒有送出放開事件）');
+        actionCycleSpeed();
+      }, 500);
+      return;
+    }
+    trace(`執行動作：${state.keymap[action]?.label || action}`);
+    runKeyAction(action);
   };
 
   // --- Input event trace (shown in the diagnostics viewer) ---
@@ -955,49 +1099,25 @@ function bindAllEvents() {
       return;
     }
 
-    if (state.listeningKeyAction) {
-      e.preventDefault();
-      lastKeydownHandledCode = code;
-      lastKeydownHandledAt = Date.now();
-      if (isCatcher && btCatcher) btCatcher.value = '';
-      if (e.repeat) return;
-      trace(`學習綁定到「${state.keymap[state.listeningKeyAction]?.label || ''}」`);
-      learnBoundKey(code);
-      return;
-    }
-
-    const matchedAction = KEY_ACTION_ORDER.find((act) => (state.keymap[act]?.codes || []).includes(code));
-    if (!matchedAction) {
+    if (!state.listeningKeyAction && maxClicksBoundToKey(code) === 0) {
       trace(`沒有綁定任何動作（可到「按鍵」視窗把 ${code} 學起來）`);
       return;
     }
     e.preventDefault();
     lastKeydownHandledCode = code;
     lastKeydownHandledAt = Date.now();
+    keyupSwallowCodes.add(code);
     if (isCatcher && btCatcher) btCatcher.value = '';
 
-    // A held key auto-repeats keydown; one physical press must fire its action only once
+    // A held key auto-repeats keydown; one physical press must count only once
     if (e.repeat) return;
-
-    if (matchedAction === 'play') {
-      trace('播放鍵按下（放開時才切換播放；按住 0.5 秒改為切換語速）');
-      // Same as the on-screen button: a short press toggles on release, holding 0.5s cycles speed instead
-      clearHeldPlayKey();
-      heldPlayCode = code;
-      heldPlayTimerId = setTimeout(() => {
-        heldPlayTimerId = null;
-        heldPlayLongPressFired = true;
-        logKeyEvent('播放鍵已按住 0.5 秒 → 切換語速（如果你只是短按，代表這個遙控器沒有送出放開事件）');
-        actionCycleSpeed();
-      }, 500);
-      return;
-    }
-    trace(`執行動作：${state.keymap[matchedAction]?.label || matchedAction}`);
-    keyActionHandlers[matchedAction]();
+    handleKeyPress(code, trace, true);
   });
 
   window.addEventListener('keyup', (e) => {
     const code = normalizeKeyCode(e.code, e.key);
+    // The release of a key we acted on must not additionally click whichever button has focus (Space does that on keyup)
+    if (keyupSwallowCodes.delete(code)) e.preventDefault();
     if (heldPlayCode === null || code !== heldPlayCode) {
       if (!isTypingInRealField()) logKeyEvent(`${describeKeyEvent(e)} → 放開（無動作）`);
       return;
@@ -1039,22 +1159,12 @@ function bindAllEvents() {
         trace('略過：同一下按鍵已由 keydown 處理');
         return;
       }
-      if (state.listeningKeyAction) {
-        trace(`學習綁定到「${state.keymap[state.listeningKeyAction]?.label || ''}」`);
-        learnBoundKey(code);
-        return;
-      }
-      const matchedAction = KEY_ACTION_ORDER.find((act) => (state.keymap[act]?.codes || []).includes(code));
-      if (!matchedAction) {
+      if (!state.listeningKeyAction && maxClicksBoundToKey(code) === 0) {
         trace('沒有綁定任何動作');
         return;
       }
-      trace(`執行動作：${state.keymap[matchedAction]?.label || matchedAction}`);
-      if (matchedAction === 'play') {
-        actionTogglePlayPause();
-      } else {
-        keyActionHandlers[matchedAction]();
-      }
+      // No keyup follows an `input` event, so the play key toggles at once instead of waiting for a release
+      handleKeyPress(code, trace, false);
     });
   }
 
