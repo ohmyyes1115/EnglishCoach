@@ -50,6 +50,7 @@
   <audio id="masterAudio" playsinline preload="auto" class="hidden"></audio>
   <audio id="previewAudio" playsinline preload="auto" class="hidden"></audio>
   <audio id="keepAliveAudio" loop playsinline preload="auto" class="hidden"></audio>
+  <audio id="gptLiveRemoteAudio" autoplay playsinline class="hidden"></audio>
 
   <!-- Hidden Bluetooth HID Key Catcher for iOS Safari / Home Screen PWA -->
   <input
@@ -201,6 +202,9 @@
         <div class="flex items-center gap-1.5 flex-wrap ml-auto">
           <button id="btnAiExplain" type="button" title="一鍵翻譯本句並由 AI 簡答核心單字與句型 (快捷鍵 E / A)" class="px-2.5 py-1 rounded-lg bg-violet-500/20 hover:bg-violet-500/30 border border-violet-400/60 text-violet-200 font-sans font-extrabold transition flex items-center gap-1 shadow-sm">
             <span>💡 AI 簡答</span>
+          </button>
+          <button id="btnOpenGptLive" type="button" title="開啟 GPT-Live 全雙工即時語音口說對話面板" class="px-2.5 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/60 text-emerald-200 font-sans font-extrabold transition flex items-center gap-1 shadow-sm">
+            <span>🎙️ GPT-Live</span>
           </button>
           <button id="btnCopySentence" type="button" title="點擊複製本句乾淨英文並自動原地暫停 (快捷鍵 C)" class="px-2.5 py-1 rounded-lg bg-sky-500/15 hover:bg-sky-500/25 border border-sky-400/50 text-sky-300 font-sans font-bold transition flex items-center gap-1">
             <span>📋 複製</span>
@@ -757,6 +761,144 @@
           清空
         </button>
         <button id="btnCopyDiagLog" type="button" class="px-4 py-1.5 rounded-xl bg-sky-500 text-slate-950 text-xs font-black">📋 複製全部</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL 7: GPT-LIVE VOICE CONVERSATION PANEL -->
+  <div id="modalGptLive" class="hidden fixed inset-0 z-50 bg-slate-950/90 backdrop-blur-sm flex items-center justify-center p-2 sm:p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-3xl w-full max-w-2xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
+      <div class="p-3.5 sm:p-4 border-b border-slate-800 flex items-center justify-between gap-2 shrink-0">
+        <div class="flex items-center gap-2.5 min-w-0">
+          <span class="w-9 h-9 rounded-2xl bg-emerald-500/20 border border-emerald-400/50 flex items-center justify-center text-emerald-300 shrink-0">
+            <i class="fa-solid fa-headset"></i>
+          </span>
+          <div class="min-w-0">
+            <h2 class="text-sm sm:text-base font-black text-white truncate">🎙️ GPT-Live 即時口說對話 (WebRTC)</h2>
+            <p class="text-[11px] text-slate-400 truncate">全雙工即時語音對話（支援隨時插話、Standby 省費與即時雙向逐字稿）</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-1.5 shrink-0">
+          <button id="btnGptLiveOpenKey" type="button" title="設定 OpenAI API Key" class="px-2.5 py-1.5 rounded-xl bg-violet-500/20 hover:bg-violet-500/30 border border-violet-400/50 text-violet-200 text-xs font-bold transition">
+            🔑 金鑰
+          </button>
+          <button id="btnCloseGptLiveModal" type="button" class="w-8 h-8 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+      </div>
+
+      <div class="p-3.5 sm:p-4 overflow-y-auto space-y-3 flex-1 text-xs">
+        <!-- Connection Status & Usage Bar -->
+        <div class="p-3 rounded-2xl bg-slate-950/90 border border-slate-800 flex flex-wrap items-center justify-between gap-2">
+          <div class="flex items-center gap-2 min-w-0">
+            <span id="gptLiveStatusDot" class="w-2.5 h-2.5 rounded-full bg-slate-500 shrink-0"></span>
+            <span id="gptLiveStatusText" class="font-extrabold text-slate-300 truncate">待命就緒</span>
+            <span id="gptLiveSessionIdBadge" class="hidden px-1.5 py-0.5 rounded bg-slate-800 font-mono text-[10px] text-slate-400"></span>
+          </div>
+          <div class="flex items-center gap-2 font-mono text-[11px] text-slate-300">
+            <span id="gptLiveTimerText">00:00</span>
+            <span class="text-slate-600">|</span>
+            <span id="gptLiveCostText" class="text-amber-300">Active $0.05/分｜Standby $0.02/分</span>
+          </div>
+        </div>
+
+        <!-- Current Practice Sentence Context -->
+        <div id="gptLiveCurrentSentenceBox" class="p-2.5 rounded-2xl bg-sky-950/30 border border-sky-500/30 space-y-1.5">
+          <div class="flex items-center justify-between gap-2">
+            <label class="flex items-center gap-1.5 text-[11px] font-bold text-sky-300 cursor-pointer">
+              <input id="chkGptLiveUseCurrentSentence" type="checkbox" checked class="accent-emerald-400" />
+              <span>帶入目前跟讀句子作為對話練習主題</span>
+            </label>
+            <button id="btnGptLiveInjectSentence" type="button" class="hidden px-2 py-0.5 rounded-lg bg-sky-500/20 hover:bg-sky-500/30 border border-sky-400/50 text-sky-200 text-[11px] font-bold transition shrink-0">
+              📌 送入本句
+            </button>
+          </div>
+          <div id="gptLiveCurrentSentencePreview" class="text-xs font-bold text-white truncate">尚未載入句子</div>
+        </div>
+
+        <!-- Model / Voice / Standby Selectors -->
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 bg-slate-950/80 border border-slate-800 rounded-2xl p-3">
+          <div>
+            <label class="block text-[11px] font-bold text-slate-400 mb-1">模型 (Model)</label>
+            <select id="selectGptLiveModel" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs text-white font-bold">
+              <option value="gpt-live-1.1" selected>gpt-live-1.1（最新推薦）</option>
+              <option value="gpt-live-1">gpt-live-1</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-[11px] font-bold text-slate-400 mb-1">語音 (Voice)</label>
+            <select id="selectGptLiveVoice" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs text-white font-bold">
+              <option value="marin" selected>marin（預設自然）</option>
+              <option value="cedar">cedar</option>
+              <option value="alloy">alloy</option>
+              <option value="ash">ash</option>
+              <option value="ballad">ballad</option>
+              <option value="coral">coral</option>
+              <option value="sage">sage</option>
+              <option value="shimmer">shimmer</option>
+              <option value="verse">verse</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-[11px] font-bold text-slate-400 mb-1">Standby 閒置省費</label>
+            <select id="selectGptLiveStandby" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs text-amber-300 font-bold">
+              <option value="20" selected>靜音 20 秒省費（推薦）</option>
+              <option value="15">靜音 15 秒省費</option>
+              <option value="30">靜音 30 秒省費</option>
+              <option value="60">靜音 60 秒省費</option>
+              <option value="0">關閉（連線即 Active）</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Collapsible Advanced Settings -->
+        <details class="bg-slate-950/80 border border-slate-800 rounded-2xl p-3">
+          <summary class="cursor-pointer font-extrabold text-slate-300 select-none">⚙️ 進階設定（系統提示詞 / Proxy 端點 URL）</summary>
+          <div class="space-y-2.5 mt-2.5 pt-2.5 border-t border-slate-800">
+            <div>
+              <label class="block text-[11px] font-bold text-slate-400 mb-1">口說教練系統指令 (Instructions)：</label>
+              <textarea id="textareaGptLiveInstructions" rows="3" class="w-full bg-slate-900 border border-slate-700 rounded-xl p-2 text-xs text-white font-mono focus:outline-none focus:border-emerald-400"></textarea>
+            </div>
+            <div>
+              <label class="block text-[11px] font-bold text-slate-400 mb-1">Live Sessions API 端點（預設直連 OpenAI；若遇瀏覽器 CORS 阻擋請填 Proxy URL）：</label>
+              <input id="inputGptLiveEndpoint" type="url" placeholder="https://api.openai.com/v1/live/sessions" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs text-sky-300 font-mono focus:outline-none focus:border-sky-400" />
+            </div>
+          </div>
+        </details>
+
+        <!-- Error / Warning Banner -->
+        <div id="gptLiveAlertBox" class="hidden p-2.5 rounded-xl bg-rose-950/40 border border-rose-500/40 text-[11px] text-rose-200 leading-relaxed"></div>
+
+        <!-- Live Transcript Box -->
+        <div class="bg-slate-950 border border-slate-800 rounded-2xl p-3 space-y-2">
+          <div class="flex items-center justify-between gap-2">
+            <span class="font-extrabold text-slate-300">💬 即時雙向逐字稿</span>
+            <button id="btnGptLiveClearTranscript" type="button" class="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 text-[11px] font-bold">
+              清空紀錄
+            </button>
+          </div>
+          <div id="gptLiveTranscriptList" data-empty="1" class="space-y-2 min-h-[160px] max-h-[260px] overflow-y-auto pr-1 text-xs">
+            <div class="text-center py-8 text-slate-500">點擊下方「🎙️ 開始即時對話」建立 WebRTC 語音連線（需授權麥克風與 OpenAI Paid Tier 金鑰）</div>
+          </div>
+          <div class="flex items-center gap-1.5 pt-1 border-t border-slate-800">
+            <input id="inputGptLiveTextPrompt" type="text" disabled placeholder="通話中可輸入文字指令（例：請放慢語速、幫我糾正剛才的文法）..." class="flex-1 bg-slate-900 border border-slate-700 rounded-xl px-3 py-1.5 text-xs text-white focus:outline-none focus:border-emerald-400 disabled:opacity-50" />
+            <button id="btnGptLiveSendText" type="button" disabled class="px-3 py-1.5 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/50 text-emerald-200 font-bold text-xs transition disabled:opacity-40 shrink-0">
+              送出
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="p-3.5 border-t border-slate-800 bg-slate-900 flex flex-wrap items-center justify-between gap-2 shrink-0">
+        <button id="btnGptLiveMute" type="button" disabled class="px-3.5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-extrabold transition disabled:opacity-40 flex items-center gap-1.5">
+          <i id="iconGptLiveMute" class="fa-solid fa-microphone"></i>
+          <span id="labelGptLiveMute">麥克風開啟</span>
+        </button>
+        <button id="btnGptLiveToggleCall" type="button" class="flex-1 sm:flex-none px-6 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs sm:text-sm font-black shadow-lg shadow-emerald-500/25 transition flex items-center justify-center gap-2">
+          <i id="iconGptLiveCall" class="fa-solid fa-phone"></i>
+          <span id="labelGptLiveCall">🎙️ 開始即時對話</span>
+        </button>
       </div>
     </div>
   </div>

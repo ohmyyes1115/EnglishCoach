@@ -79,6 +79,11 @@ import {
   transcribeLongAudioWithAi
 } from './ai-lookup.js';
 
+import {
+  initGptLiveModule,
+  openGptLiveModal
+} from './gpt-live.js';
+
 // ==========================================
 // UI RENDERING & INTERACTIVE WORD TOKENS
 // ==========================================
@@ -1295,6 +1300,17 @@ function bindAllEvents() {
   safeOn('btnOpenImportModal', 'click', blurBtKeyCatcher);
   safeOn('btnOpenAiSettings', 'click', blurBtKeyCatcher);
   safeOn('btnDrawerOpenAiKey', 'click', blurBtKeyCatcher);
+
+  // Modal: GPT-Live Real-Time Voice Conversation
+  initGptLiveModule({
+    onOpenAiSettings: openAiSettingsModal,
+    onBlurBtCatcher: blurBtKeyCatcher,
+    onFocusBtCatcher: focusBtKeyCatcher
+  });
+  safeOn('btnOpenGptLive', 'click', () => {
+    blurBtKeyCatcher();
+    openGptLiveModal();
+  });
 
   // Modal: Import & Smart VAD Splitter Workbench (Tab A + Tab B)
   const modalImport = document.getElementById('modalImport');
