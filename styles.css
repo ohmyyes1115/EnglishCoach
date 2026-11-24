@@ -45,6 +45,14 @@ body {
   animation: btn-delete-armed-pulse 0.8s ease-in-out infinite;
 }
 
+/* Backup ZIP is built and waiting for one more tap to hand it to the system share sheet */
+.btn-export-ready {
+  background-color: #059669 !important;
+  border-color: #6ee7b7 !important;
+  color: #ffffff !important;
+  animation: btn-delete-armed-pulse 0.8s ease-in-out infinite;
+}
+
 @keyframes btn-delete-armed-pulse {
   50% {
     opacity: 0.6;

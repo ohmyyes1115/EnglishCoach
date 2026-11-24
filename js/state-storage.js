@@ -336,6 +336,58 @@ export async function deletePackFromDB(packId) {
 }
 
 // ==========================================
+// STORAGE PROTECTION (PERSISTENT STORAGE)
+// ==========================================
+// By default a browser may wipe a site's IndexedDB when the device runs low on space.
+// Persistent storage asks it to keep the course packs until the user removes them.
+// 'granted' | 'denied' | 'unsupported' | 'unknown' (not asked yet)
+export const storageProtection = { status: 'unknown', usageBytes: null, quotaBytes: null };
+
+export async function requestPersistentStorage() {
+  try {
+    const sm = navigator.storage;
+    if (!sm || typeof sm.persist !== 'function') {
+      storageProtection.status = 'unsupported';
+    } else if (typeof sm.persisted === 'function' && await sm.persisted()) {
+      storageProtection.status = 'granted';
+    } else {
+      storageProtection.status = (await sm.persist()) ? 'granted' : 'denied';
+    }
+  } catch (e) {
+    storageProtection.status = 'unsupported';
+  }
+  await refreshStorageUsage();
+  return storageProtection.status;
+}
+
+export async function refreshStorageUsage() {
+  try {
+    if (typeof navigator.storage?.estimate !== 'function') return;
+    const est = await navigator.storage.estimate();
+    storageProtection.usageBytes = Number.isFinite(est?.usage) ? est.usage : null;
+    storageProtection.quotaBytes = Number.isFinite(est?.quota) ? est.quota : null;
+  } catch (e) {}
+}
+
+export function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return '未知';
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+export function describeStorageProtection() {
+  const { status, usageBytes, quotaBytes } = storageProtection;
+  const usage = usageBytes === null
+    ? ''
+    : `，已用 ${formatBytes(usageBytes)}${quotaBytes ? ` / 可用上限約 ${formatBytes(quotaBytes)}` : ''}`;
+  if (status === 'granted') return `✅ 教材已受保護：瀏覽器不會自動清除${usage}`;
+  if (status === 'denied') return `⚠️ 教材未受保護：裝置空間不足時瀏覽器可能自動清除，建議把 App 加到主畫面並定期匯出備份${usage}`;
+  if (status === 'unsupported') return `⚠️ 這個瀏覽器不支援儲存保護，建議定期匯出備份${usage}`;
+  return `儲存保護狀態確認中…${usage}`;
+}
+
+// ==========================================
 // PREFS, AI CONFIG & KEYMAP PERSISTENCE
 // ==========================================
 export function savePrefsSync() {

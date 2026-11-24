@@ -89,6 +89,11 @@
         </select>
       </div>
 
+      <!-- Export Current Pack As Backup ZIP -->
+      <button id="btnExportPack" type="button" title="把此教材包匯出成備份 ZIP（含音檔、中譯與 AI 筆記），可存到檔案或搬到另一台裝置" class="p-2 rounded-xl bg-slate-800/80 hover:bg-emerald-950/80 border border-slate-700 hover:border-emerald-500/50 text-slate-400 hover:text-emerald-300 transition shrink-0 disabled:opacity-50">
+        <i class="fa-solid fa-file-export text-sm"></i>
+      </button>
+
       <!-- Delete Current Pack -->
       <button id="btnDeletePack" type="button" title="刪除此教材包" class="p-2 rounded-xl bg-slate-800/80 hover:bg-rose-950/80 border border-slate-700 hover:border-rose-500/50 text-slate-400 hover:text-rose-300 transition shrink-0">
         <i class="fa-regular fa-trash-can text-sm"></i>
@@ -371,6 +376,8 @@
 
       <!-- Scrollable Modal Body -->
       <div id="importModalScrollBody" class="p-3.5 sm:p-4 overflow-y-auto space-y-4 flex-1 text-xs">
+        <!-- Whether the browser promised not to wipe the saved packs, plus how much space they take -->
+        <div id="storageStatusLine" class="px-3 py-2 rounded-xl bg-slate-950/90 border border-slate-800 text-[11px] text-slate-400 font-bold">儲存保護狀態確認中…</div>
 
         <!-- TAB A: LONG AUDIO SMART VAD SPLITTER -->
         <div id="panelLongAudio" class="space-y-4">
@@ -510,6 +517,7 @@
               <div>
                 <div class="font-extrabold text-sky-300 text-sm">匯入 Pack_01.zip 懶人包或多檔獨立音訊</div>
                 <div class="text-[11px] text-slate-400">支援內含 01.mp3 ~ 20.mp3 + sentences.txt (或 01.txt ~ 20.txt) 的 ZIP 壓縮檔</div>
+                <div class="text-[11px] text-emerald-300/90">也可以選本 App 匯出的「備份 ZIP」（主畫面教材選單旁的匯出鍵）：會原樣還原音檔、中譯與 AI 筆記，並新增為另一個教材包</div>
               </div>
               <button id="btnDownloadDemoZip" type="button" class="px-3 py-1.5 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/50 text-emerald-300 font-bold text-xs transition">
                 ⬇ 下載測試 Pack_01.zip

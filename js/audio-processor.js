@@ -2,6 +2,7 @@
 // Soft Limiter, VAD Smart Audio Splitter & ZIP/Multi-File Importer
 
 import {
+  APP_VERSION,
   DEFAULT_SENTENCES,
   state,
   escapeHtml,
@@ -839,6 +840,164 @@ export async function generateAndDownloadDemoZip() {
   showGiantHud('⬇️', '已產生測試 Pack_01.zip', '內含 10 句 WAV 音檔與 sentences.txt', 'border-emerald-400/90');
 }
 
+// ==========================================
+// PACK BACKUP: EXPORT TO ZIP & RESTORE
+// ==========================================
+// A backup ZIP holds the manifest below plus one audio file per sentence under audio/.
+// Unlike a plain audio ZIP, restoring it brings back translations, AI notes and word lookups,
+// and the audio is stored as-is (no re-encoding, no second volume normalization).
+export const PACK_BACKUP_MANIFEST_NAME = 'pack-backup.json';
+const PACK_BACKUP_FORMAT = 'car-shadowing-pack-backup';
+const PACK_BACKUP_FORMAT_VERSION = 1;
+
+const BACKUP_AUDIO_EXT_BY_MIME = {
+  'audio/wav': 'wav',
+  'audio/x-wav': 'wav',
+  'audio/wave': 'wav',
+  'audio/mpeg': 'mp3',
+  'audio/mp3': 'mp3',
+  'audio/mp4': 'm4a',
+  'audio/aac': 'aac',
+  'audio/ogg': 'ogg',
+  'audio/webm': 'webm'
+};
+
+function splitBase64DataUri(dataUri) {
+  const m = /^data:([^;,]*)(?:;[^;,]*)*;base64,(.*)$/s.exec(String(dataUri || ''));
+  return m ? { mime: (m[1] || 'application/octet-stream').toLowerCase(), base64: m[2] } : null;
+}
+
+function buildBackupFileName(packName) {
+  const d = new Date();
+  const two = (n) => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}${two(d.getMonth() + 1)}${two(d.getDate())}`;
+  const safe = String(packName || '')
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 60) || 'pack';
+  return `${safe}_備份_${stamp}.zip`;
+}
+
+// Returns { file, fileName, sizeBytes, itemCount, skippedAudioCount }
+export async function buildPackBackupZip(pack, onProgress = () => {}) {
+  if (typeof window.JSZip === 'undefined') {
+    throw new Error('JSZip 元件未載入，請確認網路連線後重新整理頁面');
+  }
+  const items = Array.isArray(pack?.items) ? pack.items : [];
+  if (!items.length) throw new Error('這個教材包沒有任何句子');
+
+  const zip = new window.JSZip();
+  const digits = Math.max(3, String(items.length).length);
+  let skippedAudioCount = 0;
+
+  const manifestItems = items.map((it, idx) => {
+    const entry = {
+      en: it.en || '',
+      zh: it.zh || '',
+      aiNotes: it.aiNotes || '',
+      aiGrammarNote: it.aiGrammarNote || '',
+      wordNotes: (it.wordNotes && typeof it.wordNotes === 'object') ? it.wordNotes : {},
+      durationSec: Number(it.durationSec) || 2.8,
+      audioFile: null,
+      audioMime: null
+    };
+    if (it.audioDataUri) {
+      const audio = splitBase64DataUri(it.audioDataUri);
+      if (audio) {
+        const ext = BACKUP_AUDIO_EXT_BY_MIME[audio.mime] || 'bin';
+        entry.audioFile = `audio/${String(idx + 1).padStart(digits, '0')}.${ext}`;
+        entry.audioMime = audio.mime;
+        zip.file(entry.audioFile, audio.base64, { base64: true });
+      } else {
+        skippedAudioCount += 1;
+      }
+    }
+    return entry;
+  });
+
+  const manifest = {
+    format: PACK_BACKUP_FORMAT,
+    formatVersion: PACK_BACKUP_FORMAT_VERSION,
+    appVersion: APP_VERSION,
+    exportedAt: new Date().toISOString(),
+    pack: {
+      name: pack.name || '未命名教材',
+      createdAt: pack.createdAt || Date.now(),
+      audioModeLabel: pack.audioModeLabel || 'WAV 獨立音檔',
+      isDemoTTS: Boolean(pack.isDemoTTS)
+    },
+    items: manifestItems
+  };
+  zip.file(PACK_BACKUP_MANIFEST_NAME, JSON.stringify(manifest, null, 1));
+
+  const blob = await zip.generateAsync(
+    { type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 3 } },
+    (meta) => onProgress(Math.round(meta.percent || 0))
+  );
+  const fileName = buildBackupFileName(pack.name);
+  let file = blob;
+  try {
+    file = new File([blob], fileName, { type: 'application/zip' });
+  } catch (e) {}
+  return { file, fileName, sizeBytes: blob.size, itemCount: items.length, skippedAudioCount };
+}
+
+// Returns a restored pack when `zip` is one of our backups, or null when it is an ordinary audio ZIP
+async function restorePackFromBackupZip(zip, onStatusUpdate) {
+  const manifestEntry = zip.file(PACK_BACKUP_MANIFEST_NAME);
+  if (!manifestEntry) return null;
+  let manifest;
+  try {
+    manifest = JSON.parse((await manifestEntry.async('string')).replace(/^﻿/, ''));
+  } catch (e) {
+    return null;
+  }
+  if (manifest?.format !== PACK_BACKUP_FORMAT) return null;
+  if (Number(manifest.formatVersion) > PACK_BACKUP_FORMAT_VERSION) {
+    throw new Error('這個備份是由較新版本的 App 匯出的，請先更新 App 再匯入');
+  }
+  const srcItems = Array.isArray(manifest.items) ? manifest.items : [];
+  if (!srcItems.length) throw new Error('備份檔裡沒有任何句子');
+
+  const asText = (v) => (typeof v === 'string' ? v : '');
+  const items = [];
+  for (let i = 0; i < srcItems.length; i++) {
+    const src = srcItems[i] || {};
+    if (i % 10 === 0) onStatusUpdate(`♻️ 正在還原備份 (${i + 1}/${srcItems.length})...`);
+    let audioDataUri = null;
+    if (typeof src.audioFile === 'string' && src.audioFile) {
+      const audioEntry = zip.file(src.audioFile);
+      if (!audioEntry) throw new Error(`備份檔不完整：缺少音檔 ${src.audioFile}`);
+      const mime = /^audio\/[\w.+-]+$/.test(asText(src.audioMime)) ? src.audioMime : guessAudioMimeFromName(src.audioFile);
+      audioDataUri = `data:${mime};base64,${await audioEntry.async('base64')}`;
+    }
+    const wordNotes = (src.wordNotes && typeof src.wordNotes === 'object' && !Array.isArray(src.wordNotes)) ? src.wordNotes : {};
+    items.push({
+      index: i,
+      en: asText(src.en) || `${i + 1}. Sentence #${i + 1}`,
+      zh: asText(src.zh),
+      aiNotes: asText(src.aiNotes),
+      aiGrammarNote: asText(src.aiGrammarNote),
+      wordNotes,
+      audioDataUri,
+      durationSec: Number(src.durationSec) > 0 ? Number(src.durationSec) : 2.8
+    });
+  }
+
+  const meta = manifest.pack || {};
+  return {
+    // Always a new id: restoring never overwrites a pack that is already on this device
+    id: 'pack_' + Date.now(),
+    name: asText(meta.name).trim() || `還原的教材 (${items.length}句)`,
+    createdAt: Number(meta.createdAt) || Date.now(),
+    audioModeLabel: asText(meta.audioModeLabel) || 'WAV 獨立音檔',
+    isDemoTTS: Boolean(meta.isDemoTTS),
+    restoredFromBackup: true,
+    items
+  };
+}
+
 export async function importZipOrMultiFiles(fileList, packNameInput, onStatusUpdate = () => {}) {
   const files = Array.from(fileList || []);
   if (!files.length) {
@@ -860,6 +1019,9 @@ export async function importZipOrMultiFiles(fileList, packNameInput, onStatusUpd
       }
       onStatusUpdate(`📦 正在解壓縮 ${name}...`);
       const zip = await window.JSZip.loadAsync(file);
+      // A backup exported by this app is restored exactly as it was, notes included
+      const restored = await restorePackFromBackupZip(zip, onStatusUpdate);
+      if (restored) return restored;
       const entryNames = Object.keys(zip.files).sort(naturalCompareNames);
 
       for (const path of entryNames) {

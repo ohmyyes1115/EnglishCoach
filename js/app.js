@@ -21,6 +21,11 @@ import {
   MAX_KEY_CLICKS,
   makeKeyBinding,
   parseKeyBinding,
+  storageProtection,
+  requestPersistentStorage,
+  refreshStorageUsage,
+  describeStorageProtection,
+  formatBytes,
   savePrefsSync,
   loadPrefsSync,
   loadAiConfigSync,
@@ -40,7 +45,8 @@ import {
   generateSimulatedGpt10SentenceLongAudio,
   buildSplitPackFromVad,
   generateAndDownloadDemoZip,
-  importZipOrMultiFiles
+  importZipOrMultiFiles,
+  buildPackBackupZip
 } from './audio-processor.js';
 
 import {
@@ -348,6 +354,34 @@ function refreshKeyHints() {
 }
 
 // ==========================================
+// STORAGE PROTECTION STATUS
+// ==========================================
+function renderStorageStatusLine() {
+  const el = document.getElementById('storageStatusLine');
+  if (!el) return;
+  const tone = storageProtection.status === 'granted'
+    ? 'border-emerald-500/40 text-emerald-300'
+    : storageProtection.status === 'unknown'
+      ? 'border-slate-800 text-slate-400'
+      : 'border-amber-500/40 text-amber-200';
+  el.className = `px-3 py-2 rounded-xl bg-slate-950/90 border text-[11px] font-bold ${tone}`;
+  el.textContent = describeStorageProtection();
+}
+
+// Asks the browser not to wipe the saved packs. Safe to call repeatedly: browsers that refused at
+// startup often agree later, once the site has been used more or was added to the home screen.
+async function ensureStorageProtection() {
+  const before = storageProtection.status;
+  const status = await requestPersistentStorage();
+  if (status !== before && status !== 'granted' && typeof window.logDiag === 'function') {
+    window.logDiag('WARN', status === 'denied'
+      ? '瀏覽器未同意儲存保護：裝置空間不足時教材可能被自動清除，建議匯出備份'
+      : '這個瀏覽器不支援儲存保護，建議匯出備份');
+  }
+  renderStorageStatusLine();
+}
+
+// ==========================================
 // DIAGNOSTIC LOG VIEWER
 // ==========================================
 function renderDiagLogList() {
@@ -417,6 +451,7 @@ function buildDiagReportText() {
     `開啟方式：${standalone ? '主畫面 App (standalone)' : '瀏覽器分頁'}`,
     `AI 引擎：${state.aiConfig?.provider || '未設定'}`,
     `目前教材：${pack ? `${pack.items?.length || 0} 句，第 ${state.currentIndex + 1} 句` : '無'}`,
+    `儲存：${describeStorageProtection()}`,
     '',
     `按鍵 / 遙控器事件（新到舊，共 ${keyEventLogs.length} 筆）：`,
     ...(keyEventLogs.length > 0 ? keyEventLogs : ['（無）']),
@@ -494,6 +529,9 @@ async function initApplication() {
 
   renderMainStage();
   setupWatchdogTimer();
+
+  // Not awaited: the answer only affects the status line and the diagnostics report
+  ensureStorageProtection();
 }
 
 // ==========================================
@@ -599,6 +637,7 @@ function bindAllEvents() {
     const found = state.packs.find(p => p.id === id);
     if (found) {
       pausePlaybackInPlace('切換教材');
+      setReadyBackup(null);
       state.undoMergeSnapshot = null;
       state.currentPack = found;
       state.currentIndex = Number(state.packProgressMap[found.id]) || 0;
@@ -648,6 +687,111 @@ function bindAllEvents() {
     savePrefsSync();
     renderMainStage();
     showGiantHud('🗑️', '已刪除教材包', state.currentPack.name);
+  });
+
+  // Export the current pack as a backup ZIP.
+  // Desktop and Android save it through a normal download. iOS has no reliable download for a home-screen
+  // app, so there the file goes to the system share sheet ("Save to Files", AirDrop). The share sheet may
+  // only be opened straight from a tap, and packing a large pack takes longer than iOS allows, so the
+  // packed file is kept and the button turns green: the next tap opens the share sheet at once.
+  const btnExportPack = document.getElementById('btnExportPack');
+  let readyBackup = null;
+  let readyBackupTimerId = null;
+  let isBuildingBackup = false;
+
+  const setReadyBackup = (backup) => {
+    readyBackup = backup;
+    if (readyBackupTimerId) clearTimeout(readyBackupTimerId);
+    // The packed copy goes stale once notes change, and holds the whole pack in memory: drop it after 2 minutes
+    readyBackupTimerId = backup ? setTimeout(() => setReadyBackup(null), 120000) : null;
+    btnExportPack?.classList.toggle('btn-export-ready', Boolean(backup));
+  };
+
+  const isAppleTouchDevice = () =>
+    /iPad|iPhone|iPod/.test(navigator.userAgent || '') || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+  const canShareBackupFile = (file) => {
+    try {
+      return typeof File !== 'undefined' && file instanceof File
+        && typeof navigator.share === 'function' && typeof navigator.canShare === 'function'
+        && navigator.canShare({ files: [file] });
+    } catch (e) {
+      return false;
+    }
+  };
+
+  const downloadBackupViaLink = (backup) => {
+    const url = URL.createObjectURL(backup.file);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = backup.fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  };
+
+  // Must start synchronously inside the tap handler: navigator.share() is refused otherwise
+  const deliverBackup = async (backup) => {
+    const sizeText = formatBytes(backup.sizeBytes);
+    if (isAppleTouchDevice() && canShareBackupFile(backup.file)) {
+      try {
+        await navigator.share({ files: [backup.file] });
+        setReadyBackup(null);
+        showGiantHud('📦', '備份已匯出', `${backup.fileName}（${sizeText}）`, 'border-emerald-400/90', 2500);
+        return;
+      } catch (err) {
+        if (err?.name === 'AbortError') {
+          setReadyBackup(backup);
+          showGiantHud('📦', '尚未儲存備份', '已關閉分享選單；再按一次綠色匯出鍵可重新選擇', 'border-amber-400/90', 3000);
+          return;
+        }
+        if (err?.name === 'NotAllowedError') {
+          setReadyBackup(backup);
+          showGiantHud('📦', '備份已打包好', `再按一次綠色匯出鍵，選「儲存到檔案」（${sizeText}）`, 'border-emerald-400/90', 5000);
+          return;
+        }
+        if (typeof window.logDiag === 'function') {
+          window.logDiag('WARN', `分享選單無法開啟 (${err?.name || 'Error'})，改用下載連結匯出備份`);
+        }
+      }
+    }
+    downloadBackupViaLink(backup);
+    setReadyBackup(null);
+    showGiantHud('⬇️', '已匯出備份 ZIP', `${backup.fileName}（${sizeText}）`, 'border-emerald-400/90', 2500);
+  };
+
+  safeOn('btnExportPack', 'click', async () => {
+    // Keep hardware-key focus on the hidden catcher (iOS only grants it inside a tap)
+    focusBtKeyCatcher();
+    const pack = state.currentPack;
+    if (!pack || isBuildingBackup) return;
+    if (readyBackup && readyBackup.packId === pack.id) {
+      await deliverBackup(readyBackup);
+      return;
+    }
+    setReadyBackup(null);
+    isBuildingBackup = true;
+    if (btnExportPack) btnExportPack.disabled = true;
+    showGiantHud('📦', '正在打包備份…', pack.name, 'border-sky-400/90', 60000);
+    try {
+      const built = await buildPackBackupZip(pack, (percent) => {
+        const sub = document.getElementById('giantHudSub');
+        if (sub) sub.textContent = `${pack.name}（${percent}%）`;
+      });
+      if (built.skippedAudioCount > 0 && typeof window.logDiag === 'function') {
+        window.logDiag('WARN', `匯出備份時有 ${built.skippedAudioCount} 句的音檔格式無法寫入 ZIP，已略過音檔（文字仍保留）`);
+      }
+      await deliverBackup({ packId: pack.id, file: built.file, fileName: built.fileName, sizeBytes: built.sizeBytes });
+    } catch (err) {
+      if (typeof window.logDiag === 'function') {
+        window.logDiag('ERROR', `匯出備份失敗：${err?.message || err}`);
+      }
+      showGiantHud('❌', '匯出備份失敗', err?.message || '請稍後再試', 'border-rose-400/90', 4000);
+    } finally {
+      isBuildingBackup = false;
+      if (btnExportPack) btnExportPack.disabled = false;
+    }
   });
 
   // Modal: AI Settings
@@ -1203,6 +1347,8 @@ function bindAllEvents() {
   safeOn('btnOpenImportModal', 'click', () => {
     pausePlaybackInPlace('開啟匯入工作台');
     modalImport?.classList.remove('hidden');
+    renderStorageStatusLine();
+    refreshStorageUsage().then(renderStorageStatusLine);
   });
   safeOn('btnCloseImportModal', 'click', () => modalImport?.classList.add('hidden'));
   safeOn('btnCancelImport', 'click', () => modalImport?.classList.add('hidden'));
@@ -1329,6 +1475,7 @@ function bindAllEvents() {
     modalImport?.classList.add('hidden');
     if (saved) {
       showGiantHud('💾', `已儲存 ${newPack.items.length} 句教材`, newPack.name, 'border-emerald-400/90');
+      ensureStorageProtection();
     } else {
       showPackSaveFailedHud();
     }
@@ -1376,6 +1523,8 @@ function bindAllEvents() {
       const newPack = await importZipOrMultiFiles(files, packName, (msg) => {
         if (statusEl) statusEl.textContent = msg;
       });
+      const wasRestored = Boolean(newPack.restoredFromBackup);
+      delete newPack.restoredFromBackup;
       const saved = await savePackToDB(newPack);
       state.packs.push(newPack);
       state.undoMergeSnapshot = null;
@@ -1387,13 +1536,19 @@ function bindAllEvents() {
       renderMainStage();
       if (statusEl) {
         statusEl.textContent = saved
-          ? `✅ 已成功匯入 ${newPack.items.length} 句教材！`
+          ? `✅ 已成功${wasRestored ? '還原備份' : '匯入'} ${newPack.items.length} 句教材！`
           : `⚠️ 已載入 ${newPack.items.length} 句，但未能寫入裝置（重新整理後會遺失）`;
       }
       if (fileInput) fileInput.value = '';
       modalImport?.classList.add('hidden');
       if (saved) {
-        showGiantHud('📦', `已匯入 ${newPack.items.length} 句教材`, newPack.name, 'border-emerald-400/90');
+        showGiantHud(
+          wasRestored ? '♻️' : '📦',
+          wasRestored ? `已還原備份 ${newPack.items.length} 句` : `已匯入 ${newPack.items.length} 句教材`,
+          wasRestored ? `${newPack.name}（含中譯與 AI 筆記）` : newPack.name,
+          'border-emerald-400/90'
+        );
+        ensureStorageProtection();
       } else {
         showPackSaveFailedHud();
       }
