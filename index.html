@@ -789,17 +789,69 @@
       </div>
 
       <div class="p-3.5 sm:p-4 overflow-y-auto space-y-3 flex-1 text-xs">
-        <!-- Connection Status & Usage Bar -->
-        <div class="p-3 rounded-2xl bg-slate-950/90 border border-slate-800 flex flex-wrap items-center justify-between gap-2">
-          <div class="flex items-center gap-2 min-w-0">
-            <span id="gptLiveStatusDot" class="w-2.5 h-2.5 rounded-full bg-slate-500 shrink-0"></span>
-            <span id="gptLiveStatusText" class="font-extrabold text-slate-300 truncate">待命就緒</span>
-            <span id="gptLiveSessionIdBadge" class="hidden px-1.5 py-0.5 rounded bg-slate-800 font-mono text-[10px] text-slate-400"></span>
+        <!-- Connection Status, Live Cost & Local Balance Bar -->
+        <div class="p-3 rounded-2xl bg-slate-950/90 border border-slate-800 space-y-2.5">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="flex items-center gap-2 min-w-0">
+              <span id="gptLiveStatusDot" class="w-2.5 h-2.5 rounded-full bg-slate-500 shrink-0"></span>
+              <span id="gptLiveStatusText" class="font-extrabold text-slate-300 truncate">待命就緒</span>
+              <span id="gptLiveSessionIdBadge" class="hidden px-1.5 py-0.5 rounded bg-slate-800 font-mono text-[10px] text-slate-400"></span>
+            </div>
+            <div class="flex items-center gap-2 font-mono text-[11px] text-slate-300">
+              <span id="gptLiveTimerText">00:00</span>
+              <span class="text-slate-600">|</span>
+              <span id="gptLiveCostText" class="text-amber-300">Active $0.05/分｜Standby $0.02/分</span>
+            </div>
           </div>
-          <div class="flex items-center gap-2 font-mono text-[11px] text-slate-300">
-            <span id="gptLiveTimerText">00:00</span>
-            <span class="text-slate-600">|</span>
-            <span id="gptLiveCostText" class="text-amber-300">Active $0.05/分｜Standby $0.02/分</span>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-2 border-t border-slate-800/80">
+            <!-- Current Call Real-Time Cost -->
+            <div class="p-2.5 rounded-xl bg-slate-900/90 border border-slate-800 flex flex-col justify-between gap-1">
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-[11px] font-bold text-slate-400">💰 本通即時花費</span>
+                <div class="font-mono text-xs font-black text-amber-300">
+                  <span id="gptLiveLiveCostUsd">$0.0000</span>
+                  <span id="gptLiveLiveCostTwd" class="text-[10px] text-slate-400 font-semibold ml-1">約 NT$0.0</span>
+                </div>
+              </div>
+              <div id="gptLivePhaseBreakdown" class="font-mono text-[10px] text-slate-400 truncate">
+                Active 00:00｜Standby 00:00（建立最低計 15s）
+              </div>
+            </div>
+
+            <!-- Local Prepaid Balance Tracker -->
+            <div class="p-2.5 rounded-xl bg-slate-900/90 border border-slate-800 flex flex-col justify-between gap-1">
+              <div class="flex items-center justify-between gap-1.5">
+                <span class="text-[11px] font-bold text-slate-400">🏦 預估帳戶餘額</span>
+                <span id="gptLiveBalanceText" class="font-mono text-xs font-black text-emerald-300">未設定</span>
+              </div>
+              <div class="flex items-center justify-between gap-1.5 flex-wrap">
+                <span id="gptLiveCumulativeText" class="font-mono text-[10px] text-slate-400">累計 0 通・$0.000</span>
+                <div class="flex items-center gap-1">
+                  <button id="btnGptLiveToggleBalanceEditor" type="button" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-sky-300 text-[10px] font-bold transition">
+                    ✏️ 設餘額
+                  </button>
+                  <a href="https://platform.openai.com/settings/organization/billing/overview" target="_blank" rel="noopener noreferrer" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 text-[10px] font-bold transition">
+                    ↗ 官方帳單
+                  </a>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Inline Balance Editor (Avoids iOS PWA prompt() issues) -->
+          <div id="gptLiveBalanceEditor" class="hidden p-2.5 rounded-xl bg-slate-900 border border-sky-500/40 flex flex-wrap items-center gap-2">
+            <label for="inputGptLiveBalanceUsd" class="text-[11px] font-bold text-sky-300 shrink-0">目前餘額 (USD $)：</label>
+            <input id="inputGptLiveBalanceUsd" type="number" step="0.01" min="0" placeholder="例如 10.00" class="w-28 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-white font-mono focus:outline-none focus:border-sky-400" />
+            <button id="btnGptLiveSaveBalance" type="button" class="px-2.5 py-1 rounded-lg bg-sky-500 hover:bg-sky-400 text-slate-950 text-[11px] font-black transition">
+              套用
+            </button>
+            <button id="btnGptLiveResetSpent" type="button" title="將本裝置累計通話次數與花費歸零（不影響餘額）" class="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] font-bold transition">
+              歸零累計
+            </button>
+            <button id="btnGptLiveCancelBalance" type="button" class="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 text-[11px] font-bold transition ml-auto">
+              取消
+            </button>
           </div>
         </div>
 

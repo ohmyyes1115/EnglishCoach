@@ -1,17 +1,24 @@
 // Layer 2: OpenAI GPT-Live Full-Duplex Voice Session (WebRTC + oai-events DataChannel)
+// Includes real-time Active/Standby cost tracking, call settlement summary & local balance ledger
 
 import {
   state,
   safeStorage,
   safeOn,
-  escapeHtml,
   formatIdx,
   showGiantHud
 } from './state-storage.js';
 import { pausePlaybackInPlace } from './player-engine.js';
 
 const GPT_LIVE_CONFIG_LS_KEY = 'car_shadow_gpt_live_config_v1';
+const GPT_LIVE_LEDGER_LS_KEY = 'car_shadow_gpt_live_ledger_v1';
 const DEFAULT_LIVE_ENDPOINT = 'https://api.openai.com/v1/live/sessions';
+
+const ACTIVE_RATE_PER_MIN = 0.05;
+const STANDBY_RATE_PER_MIN = 0.02;
+const MIN_INITIAL_ACTIVE_SEC = 15;
+const USD_TO_TWD_ESTIMATE = 32.5;
+
 const DEFAULT_LIVE_INSTRUCTIONS = [
   'You are a friendly, concise English speaking coach for a B2-level learner.',
   'Speak natural, clear English at a moderate pace, keeping each turn short (1-3 sentences) so the user gets plenty of speaking practice.',
@@ -27,8 +34,18 @@ const liveState = {
   sessionId: '',
   startedAtMs: 0,
   timerId: null,
+  // Real-time billing trackers
+  hasEstablishedWebRtc: false,
+  sessionSettled: false,
+  activeMs: 0,
+  standbyMs: 0,
+  currentPhase: null, // 'active' | 'standby' | null
+  phaseStartedAtMs: 0,
   reportedSeconds: null,
+  serverActiveSec: null,
+  serverStandbySec: null,
   contextRatio: null,
+  // Transcript DOM state
   lastSpeaker: '',
   lastBubbleEl: null,
   closeResolve: null,
@@ -42,7 +59,7 @@ let liveCallbacks = {
 };
 
 // ==========================================
-// PERSISTED PREFERENCES
+// PERSISTED CONFIG & LOCAL BALANCE LEDGER
 // ==========================================
 function loadGptLiveConfig() {
   const defaults = {
@@ -106,6 +123,155 @@ function applyConfigToUI(cfg) {
   if (endEl) endEl.value = cfg.endpoint;
 }
 
+function loadBillingLedger() {
+  const defaults = {
+    balanceUsd: null,
+    totalSpentUsd: 0,
+    sessionCount: 0,
+    lastCallCostUsd: null,
+    updatedAt: 0
+  };
+  try {
+    const raw = safeStorage.getItem(GPT_LIVE_LEDGER_LS_KEY);
+    if (!raw) return defaults;
+    const p = JSON.parse(raw);
+    return {
+      balanceUsd: (p.balanceUsd === null || p.balanceUsd === undefined || !Number.isFinite(Number(p.balanceUsd)))
+        ? null
+        : Math.max(0, Number(p.balanceUsd)),
+      totalSpentUsd: Number.isFinite(Number(p.totalSpentUsd)) ? Math.max(0, Number(p.totalSpentUsd)) : 0,
+      sessionCount: Number.isFinite(Number(p.sessionCount)) ? Math.max(0, Math.floor(Number(p.sessionCount))) : 0,
+      lastCallCostUsd: Number.isFinite(Number(p.lastCallCostUsd)) ? Math.max(0, Number(p.lastCallCostUsd)) : null,
+      updatedAt: Number(p.updatedAt) || 0
+    };
+  } catch (e) {
+    return defaults;
+  }
+}
+
+function saveBillingLedger(ledger) {
+  ledger.updatedAt = Date.now();
+  safeStorage.setItem(GPT_LIVE_LEDGER_LS_KEY, JSON.stringify(ledger));
+}
+
+// ==========================================
+// REAL-TIME BILLING CALCULATOR
+// ==========================================
+function resetBillingTrackers() {
+  liveState.hasEstablishedWebRtc = false;
+  liveState.sessionSettled = false;
+  liveState.activeMs = 0;
+  liveState.standbyMs = 0;
+  liveState.currentPhase = null;
+  liveState.phaseStartedAtMs = 0;
+  liveState.reportedSeconds = null;
+  liveState.serverActiveSec = null;
+  liveState.serverStandbySec = null;
+  liveState.contextRatio = null;
+}
+
+function flushCurrentBillingPhase(nowMs = Date.now()) {
+  if (!liveState.currentPhase || liveState.phaseStartedAtMs <= 0) return;
+  const delta = Math.max(0, nowMs - liveState.phaseStartedAtMs);
+  if (liveState.currentPhase === 'active') liveState.activeMs += delta;
+  else if (liveState.currentPhase === 'standby') liveState.standbyMs += delta;
+  liveState.phaseStartedAtMs = nowMs;
+}
+
+function switchBillingPhase(nextPhase, nowMs = Date.now()) {
+  if (liveState.currentPhase === nextPhase) return;
+  flushCurrentBillingPhase(nowMs);
+  liveState.currentPhase = nextPhase;
+  liveState.phaseStartedAtMs = nowMs;
+}
+
+function applyServerUsagePayload(usage) {
+  if (!usage || typeof usage !== 'object') return;
+  const totalSecs = Number(usage.seconds);
+  if (Number.isFinite(totalSecs) && totalSecs >= 0) {
+    liveState.reportedSeconds = totalSecs;
+  }
+  const activeSecs = Number(usage.active_seconds);
+  if (Number.isFinite(activeSecs) && activeSecs >= 0) {
+    liveState.serverActiveSec = activeSecs;
+  }
+  const standbySecs = Number(usage.standby_seconds);
+  if (Number.isFinite(standbySecs) && standbySecs >= 0) {
+    liveState.serverStandbySec = standbySecs;
+  }
+}
+
+function computeLiveBillingSnapshot(nowMs = Date.now()) {
+  let actMs = liveState.activeMs;
+  let stbyMs = liveState.standbyMs;
+  if (liveState.currentPhase && liveState.phaseStartedAtMs > 0) {
+    const delta = Math.max(0, nowMs - liveState.phaseStartedAtMs);
+    if (liveState.currentPhase === 'active') actMs += delta;
+    else if (liveState.currentPhase === 'standby') stbyMs += delta;
+  }
+
+  const localActiveSec = actMs / 1000;
+  const localStandbySec = stbyMs / 1000;
+  let activeSec = Number.isFinite(liveState.serverActiveSec) ? liveState.serverActiveSec : localActiveSec;
+  const standbySec = Number.isFinite(liveState.serverStandbySec) ? liveState.serverStandbySec : localStandbySec;
+
+  // If server reported total active seconds without breakdown and no standby occurred, calibrate to server
+  if (
+    Number.isFinite(liveState.reportedSeconds) &&
+    !Number.isFinite(liveState.serverActiveSec) &&
+    standbySec < 0.5
+  ) {
+    activeSec = Math.max(activeSec, liveState.reportedSeconds);
+  }
+
+  // WebRTC sessions pre-bill 15s of active audio duration (credited against usage, not added on top)
+  const billableActiveSec = liveState.hasEstablishedWebRtc
+    ? Math.max(MIN_INITIAL_ACTIVE_SEC, activeSec)
+    : activeSec;
+
+  const costUsd = (billableActiveSec / 60) * ACTIVE_RATE_PER_MIN + (standbySec / 60) * STANDBY_RATE_PER_MIN;
+  const withoutStandbyUsd = (Math.max(liveState.hasEstablishedWebRtc ? MIN_INITIAL_ACTIVE_SEC : 0, activeSec + standbySec) / 60) * ACTIVE_RATE_PER_MIN;
+  const savedUsd = Math.max(0, withoutStandbyUsd - costUsd);
+  const elapsedSec = liveState.startedAtMs > 0 ? Math.max(0, (nowMs - liveState.startedAtMs) / 1000) : 0;
+
+  return {
+    elapsedSec,
+    activeSec,
+    standbySec,
+    billableActiveSec,
+    reportedSeconds: liveState.reportedSeconds,
+    costUsd,
+    costTwd: costUsd * USD_TO_TWD_ESTIMATE,
+    savedUsd
+  };
+}
+
+function finalizeLiveSessionBilling(reason = 'closed') {
+  if (liveState.sessionSettled || !liveState.hasEstablishedWebRtc) return;
+  liveState.sessionSettled = true;
+  flushCurrentBillingPhase();
+  liveState.currentPhase = null;
+
+  const snap = computeLiveBillingSnapshot();
+  const ledger = loadBillingLedger();
+  ledger.totalSpentUsd = Number((ledger.totalSpentUsd + snap.costUsd).toFixed(6));
+  ledger.sessionCount += 1;
+  ledger.lastCallCostUsd = snap.costUsd;
+  if (ledger.balanceUsd !== null) {
+    ledger.balanceUsd = Math.max(0, Number((ledger.balanceUsd - snap.costUsd).toFixed(6)));
+  }
+  saveBillingLedger(ledger);
+  renderBalanceLedgerUI();
+
+  appendSettlementCard(snap, ledger, reason);
+  if (typeof window.logDiag === 'function') {
+    window.logDiag(
+      'INFO',
+      `GPT-Live 結算 (${reason})：Active ${Math.round(snap.activeSec)}s / Standby ${Math.round(snap.standbySec)}s，預估 $${snap.costUsd.toFixed(4)}`
+    );
+  }
+}
+
 // ==========================================
 // CURRENT SENTENCE CONTEXT & UI HELPERS
 // ==========================================
@@ -162,28 +328,81 @@ function formatDurationMMSS(totalSec) {
   return `${mm}:${ss}`;
 }
 
+function renderBalanceLedgerUI() {
+  const balEl = document.getElementById('gptLiveBalanceText');
+  const cumEl = document.getElementById('gptLiveCumulativeText');
+  const ledger = loadBillingLedger();
+
+  if (balEl) {
+    if (ledger.balanceUsd === null) {
+      balEl.textContent = '未設定（可點設餘額）';
+      balEl.className = 'font-mono text-xs font-bold text-slate-400';
+    } else {
+      // Subtract current in-flight call cost for live preview without mutating saved ledger yet
+      const liveDelta = (liveState.hasEstablishedWebRtc && !liveState.sessionSettled)
+        ? computeLiveBillingSnapshot().costUsd
+        : 0;
+      const previewBal = Math.max(0, ledger.balanceUsd - liveDelta);
+      balEl.textContent = `$${previewBal.toFixed(4)}`;
+      if (previewBal < 0.5) {
+        balEl.className = 'font-mono text-xs font-black text-rose-400';
+      } else if (previewBal < 2.0) {
+        balEl.className = 'font-mono text-xs font-black text-amber-300';
+      } else {
+        balEl.className = 'font-mono text-xs font-black text-emerald-300';
+      }
+    }
+  }
+
+  if (cumEl) {
+    cumEl.textContent = `累計 ${ledger.sessionCount} 通・$${ledger.totalSpentUsd.toFixed(3)}`;
+  }
+}
+
 function updateLiveTimerAndCostUI() {
   const timerEl = document.getElementById('gptLiveTimerText');
   const costEl = document.getElementById('gptLiveCostText');
-  if (!timerEl || !costEl) return;
+  const liveUsdEl = document.getElementById('gptLiveLiveCostUsd');
+  const liveTwdEl = document.getElementById('gptLiveLiveCostTwd');
+  const breakdownEl = document.getElementById('gptLivePhaseBreakdown');
 
   if (liveState.status === 'idle') {
-    timerEl.textContent = '00:00';
-    costEl.textContent = 'Active $0.05/分｜Standby $0.02/分';
+    const ledger = loadBillingLedger();
+    if (timerEl) timerEl.textContent = '00:00';
+    if (costEl) costEl.textContent = 'Active $0.05/分｜Standby $0.02/分';
+    if (liveUsdEl) {
+      liveUsdEl.textContent = ledger.lastCallCostUsd !== null
+        ? `$${ledger.lastCallCostUsd.toFixed(4)}`
+        : '$0.0000';
+    }
+    if (liveTwdEl) {
+      liveTwdEl.textContent = ledger.lastCallCostUsd !== null
+        ? `上通約 NT$${(ledger.lastCallCostUsd * USD_TO_TWD_ESTIMATE).toFixed(1)}`
+        : '約 NT$0.0';
+    }
+    if (breakdownEl) {
+      breakdownEl.textContent = 'Active 00:00｜Standby 00:00（建立最低計 15s）';
+    }
+    renderBalanceLedgerUI();
     return;
   }
 
-  const elapsedSec = liveState.startedAtMs > 0
-    ? Math.floor((Date.now() - liveState.startedAtMs) / 1000)
-    : 0;
-  const billSec = liveState.reportedSeconds !== null ? liveState.reportedSeconds : elapsedSec;
-  timerEl.textContent = formatDurationMMSS(elapsedSec);
-
-  const estUsd = ((Math.max(15, billSec) / 60) * 0.05).toFixed(3);
-  const ratioText = Number.isFinite(liveState.contextRatio)
-    ? `｜上下文 ${Math.round(liveState.contextRatio * 100)}%`
-    : '';
-  costEl.textContent = `估計 ≤ $${estUsd}${ratioText}`;
+  const snap = computeLiveBillingSnapshot();
+  if (timerEl) timerEl.textContent = formatDurationMMSS(snap.elapsedSec);
+  if (costEl) {
+    const ratioText = Number.isFinite(liveState.contextRatio)
+      ? `上下文 ${Math.round(liveState.contextRatio * 100)}%`
+      : (liveState.status === 'standby' ? 'Standby $0.02/分' : 'Active $0.05/分');
+    const serverNote = Number.isFinite(snap.reportedSeconds) ? `｜官方 ${snap.reportedSeconds}s` : '';
+    costEl.textContent = `${ratioText}${serverNote}`;
+  }
+  if (liveUsdEl) liveUsdEl.textContent = `$${snap.costUsd.toFixed(4)}`;
+  if (liveTwdEl) liveTwdEl.textContent = `約 NT$${snap.costTwd.toFixed(1)}`;
+  if (breakdownEl) {
+    const savedPart = snap.savedUsd >= 0.0005 ? `｜已省 $${snap.savedUsd.toFixed(4)}` : '';
+    breakdownEl.textContent = `Active ${formatDurationMMSS(snap.activeSec)}｜Standby ${formatDurationMMSS(snap.standbySec)}${savedPart}`;
+  }
+  renderBalanceLedgerUI();
 }
 
 function updateLiveStatusUI() {
@@ -270,7 +489,7 @@ function updateLiveStatusUI() {
 }
 
 // ==========================================
-// TRANSCRIPT STREAM RENDERING
+// TRANSCRIPT & SETTLEMENT CARD RENDERING
 // ==========================================
 function ensureTranscriptReady() {
   const list = document.getElementById('gptLiveTranscriptList');
@@ -298,6 +517,47 @@ function appendSystemTranscriptNote(text, tone = 'slate') {
   row.className = `text-center text-[11px] font-bold px-2.5 py-1 rounded-xl border ${toneCls}`;
   row.textContent = text;
   list.appendChild(row);
+  list.scrollTop = list.scrollHeight;
+}
+
+function appendSettlementCard(snap, ledger, reason) {
+  const list = ensureTranscriptReady();
+  if (!list) return;
+  liveState.lastSpeaker = '';
+  liveState.lastBubbleEl = null;
+
+  const card = document.createElement('div');
+  card.className = 'p-3 rounded-2xl bg-amber-950/30 border border-amber-500/40 text-[11px] space-y-1.5 select-text';
+
+  const header = document.createElement('div');
+  header.className = 'flex items-center justify-between gap-2 font-black text-amber-300';
+  header.innerHTML = `<span>🧾 本通通話費用結算</span><span class="font-mono">$${snap.costUsd.toFixed(4)}（約 NT$${snap.costTwd.toFixed(1)}）</span>`;
+
+  const lines = [
+    `總時長 ${formatDurationMMSS(snap.elapsedSec)} ｜ Active ${formatDurationMMSS(snap.activeSec)}（計費 ${Math.round(snap.billableActiveSec)}s）｜ Standby ${formatDurationMMSS(snap.standbySec)}`
+  ];
+  if (Number.isFinite(snap.reportedSeconds)) {
+    lines.push(`OpenAI 回報計費秒數：${snap.reportedSeconds} 秒（結束原因：${reason}）`);
+  } else {
+    lines.push(`結束原因：${reason}（依本機 Active/Standby 秒數估算）`);
+  }
+  if (snap.savedUsd >= 0.0005) {
+    lines.push(`Standby 省費模式本次約省下 $${snap.savedUsd.toFixed(4)}`);
+  }
+  if (ledger.balanceUsd !== null) {
+    lines.push(`已自動從預估餘額扣款，剩餘約 $${ledger.balanceUsd.toFixed(4)}`);
+  }
+
+  const body = document.createElement('div');
+  body.className = 'text-slate-300 font-mono text-[10px] space-y-0.5 leading-relaxed';
+  lines.forEach((line) => {
+    const p = document.createElement('div');
+    p.textContent = line;
+    body.appendChild(p);
+  });
+
+  card.append(header, body);
+  list.appendChild(card);
   list.scrollTop = list.scrollHeight;
 }
 
@@ -384,7 +644,10 @@ function setAudioSessionTypeSafe(type) {
   } catch (e) {}
 }
 
-function cleanupLiveResources() {
+function cleanupLiveResources(settleReason = '') {
+  if (settleReason && liveState.hasEstablishedWebRtc && !liveState.sessionSettled) {
+    finalizeLiveSessionBilling(settleReason);
+  }
   if (liveState.timerId) {
     clearInterval(liveState.timerId);
     liveState.timerId = null;
@@ -416,8 +679,7 @@ function cleanupLiveResources() {
   liveState.isMuted = false;
   liveState.sessionId = '';
   liveState.startedAtMs = 0;
-  liveState.reportedSeconds = null;
-  liveState.contextRatio = null;
+  resetBillingTrackers();
   liveState.status = 'idle';
   liveState.closeResolve = null;
   updateLiveStatusUI();
@@ -430,8 +692,12 @@ function handleServerEvent(ev) {
   if (type === 'session.started') {
     if (ev.session?.id) liveState.sessionId = ev.session.id;
     const cfg = readConfigFromUI();
-    liveState.status = cfg.standbySec > 0 ? 'standby' : 'active';
     if (!liveState.startedAtMs) liveState.startedAtMs = Date.now();
+    if (!liveState.currentPhase) {
+      const initialPhase = cfg.standbySec > 0 ? 'standby' : 'active';
+      liveState.status = initialPhase;
+      switchBillingPhase(initialPhase);
+    }
     updateLiveStatusUI();
     const modelLabel = ev.session?.model || cfg.model;
     const voiceLabel = ev.session?.audio?.output?.voice || cfg.voice;
@@ -444,12 +710,14 @@ function handleServerEvent(ev) {
 
   if (type === 'session.resumed') {
     liveState.status = 'active';
+    switchBillingPhase('active');
     updateLiveStatusUI();
     return;
   }
 
   if (type === 'session.paused') {
     liveState.status = 'standby';
+    switchBillingPhase('standby');
     updateLiveStatusUI();
     return;
   }
@@ -477,8 +745,7 @@ function handleServerEvent(ev) {
   }
 
   if (type === 'session.usage.updated') {
-    const secs = Number(ev.usage?.seconds);
-    if (Number.isFinite(secs)) liveState.reportedSeconds = secs;
+    applyServerUsagePayload(ev.usage);
     const ratio = Number(ev.context_window?.usage_ratio);
     if (Number.isFinite(ratio)) liveState.contextRatio = ratio;
     updateLiveTimerAndCostUI();
@@ -486,21 +753,15 @@ function handleServerEvent(ev) {
   }
 
   if (type === 'session.closed') {
-    const finalSec = Number(ev.usage?.seconds);
+    applyServerUsagePayload(ev.usage);
     const reason = ev.reason || 'closed';
-    const summary = Number.isFinite(finalSec)
-      ? `☎️ 通話已結束（計費時長 ${finalSec} 秒，原因：${reason}）`
-      : `☎️ 通話已結束（原因：${reason}）`;
-    appendSystemTranscriptNote(summary, 'slate');
-    if (typeof window.logDiag === 'function') {
-      window.logDiag('INFO', `GPT-Live session.closed: ${summary}`);
-    }
+    finalizeLiveSessionBilling(reason);
     if (liveState.closeResolve) {
       const resolve = liveState.closeResolve;
       liveState.closeResolve = null;
       resolve();
     } else {
-      cleanupLiveResources();
+      cleanupLiveResources('');
     }
     return;
   }
@@ -524,7 +785,7 @@ export async function startGptLiveSession() {
   const isDefaultOpenAi = /^https:\/\/api\.openai\.com\//i.test(cfg.endpoint);
 
   if (isDefaultOpenAi && !apiKey) {
-    showLiveAlert('🔑 尚未設定 OpenAI API Key。請先點右上角「🔑 設定金鑰」填入 OpenAI Paid Tier 的 sk-... 金鑰（GPT-Live 需付費等級帳號）。');
+    showLiveAlert('🔑 尚未設定 OpenAI API Key。請先點右上角「🔑 金鑰」填入 OpenAI Paid Tier 的 sk-... 金鑰（GPT-Live 需付費等級帳號）。');
     return;
   }
 
@@ -537,10 +798,9 @@ export async function startGptLiveSession() {
     pausePlaybackInPlace('GPT-Live 對話中');
   }
 
+  resetBillingTrackers();
   liveState.status = 'connecting';
   liveState.isMuted = false;
-  liveState.reportedSeconds = null;
-  liveState.contextRatio = null;
   updateLiveStatusUI();
 
   try {
@@ -573,7 +833,7 @@ export async function startGptLiveSession() {
       if (st === 'failed' || st === 'disconnected' || st === 'closed') {
         if (liveState.status !== 'idle' && liveState.status !== 'closing') {
           appendSystemTranscriptNote(`⚠️ WebRTC 連線中斷 (${st})`, 'rose');
-          cleanupLiveResources();
+          cleanupLiveResources(`webrtc_${st}`);
         }
       }
     };
@@ -590,7 +850,7 @@ export async function startGptLiveSession() {
     };
     dc.onclose = () => {
       if (liveState.status !== 'idle' && liveState.status !== 'closing') {
-        cleanupLiveResources();
+        cleanupLiveResources('datachannel_closed');
       }
     };
 
@@ -645,8 +905,13 @@ export async function startGptLiveSession() {
     liveState.sessionId = data?.session?.id || '';
     await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
 
-    liveState.startedAtMs = Date.now();
-    liveState.status = cfg.standbySec > 0 ? 'standby' : 'active';
+    const nowMs = Date.now();
+    const initialPhase = cfg.standbySec > 0 ? 'standby' : 'active';
+    liveState.hasEstablishedWebRtc = true;
+    liveState.startedAtMs = nowMs;
+    liveState.status = initialPhase;
+    switchBillingPhase(initialPhase, nowMs);
+
     if (liveState.timerId) clearInterval(liveState.timerId);
     liveState.timerId = setInterval(updateLiveTimerAndCostUI, 1000);
     updateLiveStatusUI();
@@ -654,7 +919,7 @@ export async function startGptLiveSession() {
     const rawMsg = String(err?.message || err || '未知錯誤');
     let friendly = `❌ 無法建立 GPT-Live 連線：${rawMsg}`;
     if (err instanceof TypeError || /failed to fetch|load failed|networkerror/i.test(rawMsg)) {
-      friendly = `❌ 連線遭瀏覽器阻擋（CORS 或網路失敗）。OpenAI /v1/live/sessions 若不允許網頁直連，請展開上方「⚙️ 進階設定」填入 Cloudflare Worker / Proxy 中繼網址後再試。`;
+      friendly = '❌ 連線遭瀏覽器阻擋（CORS 或網路失敗）。OpenAI /v1/live/sessions 若不允許網頁直連，請展開上方「⚙️ 進階設定」填入 Cloudflare Worker / Proxy 中繼網址後再試。';
     } else if (/NotAllowedError|Permission denied/i.test(rawMsg) || err?.name === 'NotAllowedError') {
       friendly = '❌ 麥克風權限被拒絕，請在瀏覽器網址列或 iOS 設定中允許麥克風權限。';
     }
@@ -662,7 +927,7 @@ export async function startGptLiveSession() {
     if (typeof window.logDiag === 'function') {
       window.logDiag('WARN', `GPT-Live 啟動失敗：${rawMsg}`);
     }
-    cleanupLiveResources();
+    cleanupLiveResources('');
   }
 }
 
@@ -682,11 +947,11 @@ export async function stopGptLiveSession() {
           liveState.closeResolve = null;
           resolve();
         }
-      }, 1200);
+      }, 1500);
     });
   }
 
-  cleanupLiveResources();
+  cleanupLiveResources('user_hangup');
 }
 
 function toggleGptLiveMute() {
@@ -725,6 +990,49 @@ function sendMidCallTextPrompt(rawText) {
 }
 
 // ==========================================
+// BALANCE EDITOR CONTROLS
+// ==========================================
+function openBalanceEditor() {
+  const editor = document.getElementById('gptLiveBalanceEditor');
+  const input = document.getElementById('inputGptLiveBalanceUsd');
+  if (!editor || !input) return;
+  const ledger = loadBillingLedger();
+  input.value = ledger.balanceUsd !== null ? ledger.balanceUsd.toFixed(2) : '';
+  editor.classList.remove('hidden');
+  try { input.focus(); input.select(); } catch (e) {}
+}
+
+function closeBalanceEditor() {
+  document.getElementById('gptLiveBalanceEditor')?.classList.add('hidden');
+}
+
+function saveBalanceFromEditor() {
+  const input = document.getElementById('inputGptLiveBalanceUsd');
+  if (!input) return;
+  const raw = String(input.value || '').trim();
+  const ledger = loadBillingLedger();
+  if (raw === '') {
+    ledger.balanceUsd = null;
+  } else {
+    const val = Number(raw);
+    if (!Number.isFinite(val) || val < 0) {
+      showLiveAlert('⚠️ 請輸入有效的非負美金金額（例如 10.00）。');
+      return;
+    }
+    ledger.balanceUsd = Number(val.toFixed(4));
+  }
+  saveBillingLedger(ledger);
+  closeBalanceEditor();
+  renderBalanceLedgerUI();
+  showGiantHud(
+    '🏦',
+    ledger.balanceUsd !== null ? `預估餘額已設為 $${ledger.balanceUsd.toFixed(2)}` : '已清除預估餘額',
+    '往後每次 GPT-Live 通話結束將自動扣款記帳',
+    'border-emerald-400/90'
+  );
+}
+
+// ==========================================
 // PUBLIC MODAL CONTROLS & INITIALIZATION
 // ==========================================
 export function openGptLiveModal() {
@@ -736,6 +1044,7 @@ export function openGptLiveModal() {
   const cfg = loadGptLiveConfig();
   applyConfigToUI(cfg);
   renderCurrentSentencePreview();
+  closeBalanceEditor();
   showLiveAlert('');
   updateLiveStatusUI();
   modal.classList.remove('hidden');
@@ -746,6 +1055,7 @@ export async function closeGptLiveModal() {
   if (liveState.status !== 'idle') {
     await stopGptLiveSession();
   }
+  closeBalanceEditor();
   modal?.classList.add('hidden');
   liveCallbacks.onFocusBtCatcher();
 }
@@ -777,6 +1087,30 @@ export function initGptLiveModule(cbs = {}) {
 
   safeOn('btnGptLiveMute', 'click', toggleGptLiveMute);
   safeOn('btnGptLiveClearTranscript', 'click', clearTranscriptUI);
+
+  // Balance ledger editor bindings
+  safeOn('btnGptLiveToggleBalanceEditor', 'click', () => {
+    const editor = document.getElementById('gptLiveBalanceEditor');
+    if (editor && !editor.classList.contains('hidden')) closeBalanceEditor();
+    else openBalanceEditor();
+  });
+  safeOn('btnGptLiveSaveBalance', 'click', saveBalanceFromEditor);
+  safeOn('btnGptLiveCancelBalance', 'click', closeBalanceEditor);
+  safeOn('inputGptLiveBalanceUsd', 'keydown', (e) => {
+    if (e.key === 'Enter' && !e.isComposing) {
+      e.preventDefault();
+      saveBalanceFromEditor();
+    }
+  });
+  safeOn('btnGptLiveResetSpent', 'click', () => {
+    const ledger = loadBillingLedger();
+    ledger.totalSpentUsd = 0;
+    ledger.sessionCount = 0;
+    ledger.lastCallCostUsd = null;
+    saveBillingLedger(ledger);
+    updateLiveTimerAndCostUI();
+    showGiantHud('🔄', '已歸零累計花費', '僅重置本機統計，不影響餘額設定', 'border-sky-400/90');
+  });
 
   safeOn('btnGptLiveInjectSentence', 'click', () => {
     const snap = getCurrentSentenceSnapshot();
@@ -820,8 +1154,11 @@ export function initGptLiveModule(cbs = {}) {
     safeOn(id, 'change', saveGptLiveConfigFromUI);
   });
 
-  // Ensure active WebRTC session is closed cleanly if page/PWA is closed
+  // Ensure active WebRTC session is closed & settled cleanly if page/PWA is closed
   window.addEventListener('beforeunload', () => {
+    if (liveState.hasEstablishedWebRtc && !liveState.sessionSettled) {
+      finalizeLiveSessionBilling('page_unload');
+    }
     if (liveState.dc && liveState.dc.readyState === 'open') {
       try { liveState.dc.send(JSON.stringify({ type: 'session.close' })); } catch (e) {}
     }
