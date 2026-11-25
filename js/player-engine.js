@@ -127,6 +127,86 @@ function registerMediaSessionHandlers() {
 }
 
 // ==========================================
+// SCREEN WAKE LOCK (KEEP THE DISPLAY ON WHILE PRACTISING)
+// ==========================================
+// Held while playing (gaps included). After a pause it is kept for a few more minutes, because a locked
+// phone cannot receive the Bluetooth remote's keys, so resuming would mean unlocking the phone by hand.
+// The browser drops the lock by itself whenever the page is hidden (app switch, power button); it is
+// taken again when the page comes back. Audio keeps playing with the screen off exactly as before.
+const WAKE_LOCK_PAUSE_GRACE_MS = 5 * 60 * 1000;
+let wakeLockSentinel = null;
+let wakeLockWanted = false;
+let wakeLockRequestPending = false;
+let wakeLockReleaseTimerId = null;
+let wakeLockLastErrorName = '';
+
+async function acquireScreenWakeLock() {
+  if (!wakeLockWanted || wakeLockSentinel || wakeLockRequestPending) return;
+  if (!navigator.wakeLock || typeof navigator.wakeLock.request !== 'function') return;
+  // A request made while the page is hidden is always refused
+  if (document.visibilityState !== 'visible') return;
+  wakeLockRequestPending = true;
+  try {
+    const sentinel = await navigator.wakeLock.request('screen');
+    if (!wakeLockWanted) {
+      // Playback ended and the grace period ran out while the request was in flight
+      sentinel.release().catch(() => {});
+      return;
+    }
+    wakeLockSentinel = sentinel;
+    wakeLockLastErrorName = '';
+    sentinel.addEventListener('release', () => {
+      if (wakeLockSentinel === sentinel) wakeLockSentinel = null;
+    });
+  } catch (e) {
+    // Typically NotAllowedError: Low Power Mode / battery saver, or the page lost visibility meanwhile
+    const errName = e?.name || 'Error';
+    if (errName !== wakeLockLastErrorName && typeof window.logDiag === 'function') {
+      window.logDiag('WARN', `螢幕恆亮未能啟用 (${errName})：可能是省電模式，或系統版本不支援`);
+    }
+    wakeLockLastErrorName = errName;
+  } finally {
+    wakeLockRequestPending = false;
+  }
+}
+
+function releaseScreenWakeLock() {
+  wakeLockWanted = false;
+  const sentinel = wakeLockSentinel;
+  wakeLockSentinel = null;
+  if (sentinel) sentinel.release().catch(() => {});
+}
+
+// Call after every change of state.isPlaying
+function syncScreenWakeLock() {
+  if (state.isPlaying) {
+    if (wakeLockReleaseTimerId) {
+      clearTimeout(wakeLockReleaseTimerId);
+      wakeLockReleaseTimerId = null;
+    }
+    wakeLockWanted = true;
+    acquireScreenWakeLock();
+    return;
+  }
+  // Paused: the grace period counts from the first pause, repeated pause calls do not extend it
+  if (wakeLockWanted && !wakeLockReleaseTimerId) {
+    wakeLockReleaseTimerId = setTimeout(() => {
+      wakeLockReleaseTimerId = null;
+      if (!state.isPlaying) releaseScreenWakeLock();
+    }, WAKE_LOCK_PAUSE_GRACE_MS);
+  }
+}
+
+export function describeScreenWakeLock() {
+  if (!navigator.wakeLock || typeof navigator.wakeLock.request !== 'function') {
+    return '這個瀏覽器不支援（iPhone 需 iOS 16.4 以上；主畫面 App 需 iOS 18.4 以上）';
+  }
+  if (wakeLockSentinel) return state.isPlaying ? '已啟用（播放中）' : '已啟用（暫停後保留 5 分鐘）';
+  if (wakeLockLastErrorName) return `未能啟用 (${wakeLockLastErrorName})，可能是省電模式`;
+  return wakeLockWanted ? '等待頁面回到前景後重新啟用' : '未啟用（開始播放時才會啟用）';
+}
+
+// ==========================================
 // BLOB URL & GAP KEEP-ALIVE HELPERS
 // ==========================================
 function ensureMasterAudioSource(audio, targetDataUri) {
@@ -208,6 +288,7 @@ export function pausePlaybackInPlace(reasonLabel = '原地暫停') {
   stopGapKeepAlive();
   state.isPlaying = false;
   state.isInGap = false;
+  syncScreenWakeLock();
 
   if (audio) {
     ignoreMasterPauseUntil = Date.now() + 350;
@@ -455,6 +536,7 @@ export function playCurrentSentenceClip(isFastSameSentenceRepeat = false, resume
 
   state.isPlaying = true;
   state.isInGap = false;
+  syncScreenWakeLock();
   const item = state.currentPack.items[state.currentIndex];
   const audio = document.getElementById('masterAudio');
   const speed = SPEED_STEPS[state.speedIndex] || 1.0;
@@ -563,6 +645,7 @@ export function setupWatchdogTimer() {
 
         state.isPlaying = true;
         state.isInGap = false;
+        syncScreenWakeLock();
         state.pausedOffsetSec = 0;
         watchdogRetryCount = 0;
         lastObservedAudioTime = Number(audio.currentTime) || 0;
@@ -597,6 +680,8 @@ export function setupWatchdogTimer() {
     }
 
     document.addEventListener('visibilitychange', () => {
+      // The browser released the wake lock when the page was hidden; take it again now that it is back
+      if (document.visibilityState === 'visible') acquireScreenWakeLock();
       if (document.visibilityState === 'visible' && state.isPlaying && !state.isInGap) {
         const cur = getLivePlaybackTimeSec();
         if (Math.abs(cur - lastObservedAudioTime) > 0.02) {

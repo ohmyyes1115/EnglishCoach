@@ -62,7 +62,8 @@ import {
   actionCycleSpeed,
   actionToggleInfiniteLoop,
   actionResetToFirstSentence,
-  triggerCopyCurrentSentence
+  triggerCopyCurrentSentence,
+  describeScreenWakeLock
 } from './player-engine.js';
 
 import {
@@ -442,6 +443,7 @@ function buildDiagReportText() {
     `AI 引擎：${state.aiConfig?.provider || '未設定'}`,
     `目前教材：${pack ? `${pack.items?.length || 0} 句，第 ${state.currentIndex + 1} 句` : '無'}`,
     `儲存：${describeStorageProtection()}`,
+    `螢幕恆亮：${describeScreenWakeLock()}`,
     '',
     `按鍵 / 遙控器事件（新到舊，共 ${keyEventLogs.length} 筆）：`,
     ...(keyEventLogs.length > 0 ? keyEventLogs : ['（無）']),
