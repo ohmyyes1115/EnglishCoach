@@ -135,19 +135,37 @@ function loadBillingLedger() {
     totalSpentUsd: 0,
     sessionCount: 0,
     lastCallCostUsd: null,
+    lastCallSummary: null,
     updatedAt: 0
   };
   try {
     const raw = safeStorage.getItem(GPT_LIVE_LEDGER_LS_KEY);
     if (!raw) return defaults;
     const p = JSON.parse(raw);
+    let lastCallSummary = null;
+    if (p.lastCallSummary && typeof p.lastCallSummary === 'object') {
+      const s = p.lastCallSummary;
+      lastCallSummary = {
+        elapsedSec: Number.isFinite(Number(s.elapsedSec)) ? Math.max(0, Number(s.elapsedSec)) : 0,
+        activeSec: Number.isFinite(Number(s.activeSec)) ? Math.max(0, Number(s.activeSec)) : 0,
+        standbySec: Number.isFinite(Number(s.standbySec)) ? Math.max(0, Number(s.standbySec)) : 0,
+        billableActiveSec: Number.isFinite(Number(s.billableActiveSec)) ? Math.max(0, Number(s.billableActiveSec)) : 0,
+        reportedSeconds: (s.reportedSeconds !== null && s.reportedSeconds !== undefined && Number.isFinite(Number(s.reportedSeconds)))
+          ? Math.max(0, Number(s.reportedSeconds))
+          : null,
+        savedUsd: Number.isFinite(Number(s.savedUsd)) ? Math.max(0, Number(s.savedUsd)) : 0
+      };
+    }
     return {
       balanceUsd: (p.balanceUsd === null || p.balanceUsd === undefined || !Number.isFinite(Number(p.balanceUsd)))
         ? null
         : Math.max(0, Number(p.balanceUsd)),
       totalSpentUsd: Number.isFinite(Number(p.totalSpentUsd)) ? Math.max(0, Number(p.totalSpentUsd)) : 0,
       sessionCount: Number.isFinite(Number(p.sessionCount)) ? Math.max(0, Math.floor(Number(p.sessionCount))) : 0,
-      lastCallCostUsd: Number.isFinite(Number(p.lastCallCostUsd)) ? Math.max(0, Number(p.lastCallCostUsd)) : null,
+      lastCallCostUsd: (p.lastCallCostUsd === null || p.lastCallCostUsd === undefined || !Number.isFinite(Number(p.lastCallCostUsd)))
+        ? null
+        : Math.max(0, Number(p.lastCallCostUsd)),
+      lastCallSummary,
       updatedAt: Number(p.updatedAt) || 0
     };
   } catch (e) {
@@ -261,6 +279,14 @@ function finalizeLiveSessionBilling(reason = 'closed') {
   ledger.totalSpentUsd = Number((ledger.totalSpentUsd + snap.costUsd).toFixed(6));
   ledger.sessionCount += 1;
   ledger.lastCallCostUsd = snap.costUsd;
+  ledger.lastCallSummary = {
+    elapsedSec: snap.elapsedSec,
+    activeSec: snap.activeSec,
+    standbySec: snap.standbySec,
+    billableActiveSec: snap.billableActiveSec,
+    reportedSeconds: Number.isFinite(snap.reportedSeconds) ? snap.reportedSeconds : null,
+    savedUsd: snap.savedUsd
+  };
   if (ledger.balanceUsd !== null) {
     ledger.balanceUsd = Math.max(0, Number((ledger.balanceUsd - snap.costUsd).toFixed(6)));
   }
@@ -382,8 +408,17 @@ function updateLiveTimerAndCostUI() {
 
   if (liveState.status === 'idle') {
     const ledger = loadBillingLedger();
-    if (timerEl) timerEl.textContent = '00:00';
-    if (costEl) costEl.textContent = 'Active $0.05/分｜Standby $0.02/分';
+    const last = ledger.lastCallSummary;
+    if (timerEl) {
+      timerEl.textContent = last ? formatDurationMMSS(last.elapsedSec) : '00:00';
+    }
+    if (costEl) {
+      if (last && Number.isFinite(last.reportedSeconds)) {
+        costEl.textContent = `上通計費 ${last.reportedSeconds}s｜Active $0.05/分`;
+      } else {
+        costEl.textContent = 'Active $0.05/分｜Standby $0.02/分';
+      }
+    }
     if (liveUsdEl) {
       liveUsdEl.textContent = ledger.lastCallCostUsd !== null
         ? `$${ledger.lastCallCostUsd.toFixed(4)}`
@@ -395,7 +430,14 @@ function updateLiveTimerAndCostUI() {
         : '約 NT$0.0';
     }
     if (breakdownEl) {
-      breakdownEl.textContent = 'Active 00:00｜Standby 00:00（建立最低計 15s）';
+      if (last) {
+        const billNote = Number.isFinite(last.reportedSeconds)
+          ? `（官方 ${last.reportedSeconds}s）`
+          : `（計費 ${Math.round(last.billableActiveSec)}s）`;
+        breakdownEl.textContent = `上通 Active ${formatDurationMMSS(last.activeSec)}｜Standby ${formatDurationMMSS(last.standbySec)}${billNote}`;
+      } else {
+        breakdownEl.textContent = 'Active 00:00｜Standby 00:00（建立最低計 15s）';
+      }
     }
     renderBalanceLedgerUI();
     return;
@@ -1200,6 +1242,7 @@ export function initGptLiveModule(cbs = {}) {
     ledger.totalSpentUsd = 0;
     ledger.sessionCount = 0;
     ledger.lastCallCostUsd = null;
+    ledger.lastCallSummary = null;
     saveBillingLedger(ledger);
     updateLiveTimerAndCostUI();
     showGiantHud('🔄', '已歸零累計花費', '僅重置本機統計，不影響餘額設定', 'border-sky-400/90');
