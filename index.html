@@ -476,11 +476,14 @@
                 </button>
                 <label class="flex items-start gap-1.5 text-[11px] text-slate-300 cursor-pointer px-1">
                   <input id="chkAutoTranslateAfterTranscribe" type="checkbox" checked class="accent-emerald-400 mt-0.5" />
-                  <span>
-                    聽打完自動翻譯成中文（會多等一下）
-                    <span id="autoTranslateModelHint" class="block text-[10px] text-slate-500"></span>
-                  </span>
+                  <span>聽打完自動翻譯成中文（會多等一下）</span>
                 </label>
+                <div class="flex items-center gap-2 px-1">
+                  <label for="selectAutoTranslateModel" class="text-[11px] text-slate-400 shrink-0">翻譯模型</label>
+                  <select id="selectAutoTranslateModel" disabled class="min-w-0 flex-1 bg-slate-900 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs text-emerald-200 font-bold disabled:opacity-60">
+                    <option value="">開啟後會查詢你的金鑰可用的模型</option>
+                  </select>
+                </div>
                 <div id="aiTranscribeStatus" class="hidden text-[11px] font-mono text-emerald-300 bg-slate-900/90 border border-emerald-500/30 rounded-xl px-2.5 py-1.5 whitespace-pre-line break-words"></div>
                 <button id="btnCancelTranscribeTranslate" type="button" class="hidden w-full py-1.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 text-[11px] font-bold transition">中止翻譯（保留已完成的部分）</button>
                 <button id="btnAutoFindDbThreshold" type="button" class="w-full py-2 px-3 rounded-xl bg-violet-500/20 hover:bg-violet-500/30 border border-violet-400/60 text-violet-200 font-extrabold transition flex items-center justify-center gap-1.5">

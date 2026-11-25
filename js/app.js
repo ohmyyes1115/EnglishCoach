@@ -78,6 +78,7 @@ import {
   rememberPreferredEngine,
   findPreferredEngine,
   getRememberedModelName,
+  pickAutoTranslationEngine,
   translateTranscriptLines
 } from './pack-translate.js';
 
@@ -809,6 +810,8 @@ function bindAllEvents() {
     const openaiKey = document.getElementById('inputOpenAiApiKey').value;
     saveAiConfigSync({ provider, geminiKey, groqKey, openaiKey });
     updateAiHeaderBadgeUI();
+    // The import workbench may be open underneath (the transcribe button sends the user here for a key)
+    if (!document.getElementById('modalImport')?.classList.contains('hidden')) loadAutoTranslateEngines();
     modalAi?.classList.add('hidden');
     showGiantHud('🔑', '已儲存 AI 設定', '可點擊單字或「💡 AI 簡答」立即體驗', 'border-violet-400/90');
   });
@@ -818,6 +821,7 @@ function bindAllEvents() {
     document.getElementById('inputOpenAiApiKey').value = '';
     saveAiConfigSync({ provider: 'free_builtin', geminiKey: '', groqKey: '', openaiKey: '' });
     updateAiHeaderBadgeUI();
+    if (!document.getElementById('modalImport')?.classList.contains('hidden')) loadAutoTranslateEngines();
     document.getElementById('aiTestStatusText').textContent = '已清除金鑰，切換為免金鑰模式';
   });
   safeOn('btnTestAiConnection', 'click', async () => {
@@ -889,15 +893,51 @@ function bindAllEvents() {
 
   const packTranslateEl = (id) => document.getElementById(id);
 
-  // Under the "translate after transcription" checkbox: which model that pass will use
-  function refreshAutoTranslateModelHint() {
-    const hintEl = document.getElementById('autoTranslateModelHint');
-    if (!hintEl) return;
-    const model = getRememberedModelName();
-    hintEl.textContent = model
-      ? `翻譯模型：${model}（你上次在「整包翻譯」用的；要換就到那裡用別的模型翻一次）`
-      : '翻譯模型：你金鑰裡最強的那個（在「整包翻譯」用過某個模型後，會改用那個）';
+  // Model picker under the "translate after transcription" checkbox. It shows and changes the same
+  // remembered choice the pack translation window uses, so the two always agree.
+  let autoTranslateEngines = [];
+  let autoTranslateLoadToken = 0;
+
+  function renderAutoTranslateModelSelect(emptyText) {
+    const selectEl = document.getElementById('selectAutoTranslateModel');
+    if (!selectEl) return;
+    const engines = autoTranslateEngines;
+    if (engines.length === 0) {
+      selectEl.innerHTML = `<option value="">${escapeHtml(emptyText || '沒有可用的翻譯模型（需要 OpenAI 或 Gemini 金鑰）')}</option>`;
+      selectEl.disabled = true;
+      return;
+    }
+    // The model the translation pass would use right now: the remembered one, otherwise the strongest
+    const chosen = pickAutoTranslationEngine(engines);
+    const providers = [...new Set(engines.map((e) => e.provider))];
+    const groups = providers.map((provider) => {
+      const group = engines.filter((e) => e.provider === provider);
+      const options = group.map((e) => `<option value="${escapeHtml(e.id)}" ${e === chosen ? 'selected' : ''}>${escapeHtml(`${e.model}｜${e.tierLabel}${e === engines[0] ? '・建議' : ''}`)}</option>`).join('');
+      return `<optgroup label="${escapeHtml(group[0].providerLabel)}">${options}</optgroup>`;
+    }).join('');
+    // Nothing is picked on the user's behalf when only an open-source model is available
+    selectEl.innerHTML = (chosen ? '' : '<option value="" selected>不自動翻譯（只有開源模型可用，中文較弱；要用請自己選）</option>') + groups;
+    selectEl.disabled = !document.getElementById('chkAutoTranslateAfterTranscribe')?.checked;
   }
+
+  async function loadAutoTranslateEngines() {
+    const token = ++autoTranslateLoadToken;
+    if (autoTranslateEngines.length === 0) {
+      renderAutoTranslateModelSelect(`${getRememberedModelName() || '最強的模型'}（正在查詢可用的模型…）`);
+    }
+    const { engines, problems } = await listPackTranslationEngines().catch((err) => ({
+      engines: [],
+      problems: [`查詢模型清單失敗：${err?.message || '未知錯誤'}`]
+    }));
+    if (token !== autoTranslateLoadToken) return;
+    autoTranslateEngines = engines;
+    renderAutoTranslateModelSelect(problems[0] || '');
+  }
+
+  safeOn('selectAutoTranslateModel', 'change', (e) => {
+    const engine = autoTranslateEngines.find((x) => x.id === e.target.value);
+    if (engine) rememberPreferredEngine(engine);
+  });
   const selectedPackTranslateEngine = () => {
     const id = document.querySelector('input[name="packTranslateEngine"]:checked')?.value;
     return packTranslateEngines.find((e) => e.id === id) || null;
@@ -1054,7 +1094,7 @@ function bindAllEvents() {
     // A model that worked is what the next run (and the translation after transcription) starts from
     if (result.translated > 0 && !result.error) {
       rememberPreferredEngine(engine);
-      refreshAutoTranslateModelHint();
+      renderAutoTranslateModelSelect();
     }
 
     const lines = [];
@@ -1573,6 +1613,8 @@ function bindAllEvents() {
     modalImport?.classList.remove('hidden');
     renderStorageStatusLine();
     refreshStorageUsage().then(renderStorageStatusLine);
+    // Asked again on every open: the keys or the providers' model lists may have changed since
+    loadAutoTranslateEngines();
   });
   safeOn('btnCloseImportModal', 'click', () => modalImport?.classList.add('hidden'));
   safeOn('btnCancelImport', 'click', () => modalImport?.classList.add('hidden'));
@@ -1596,7 +1638,7 @@ function bindAllEvents() {
     });
   }
   let transcribeTranslateCancelRequested = false;
-  refreshAutoTranslateModelHint();
+  safeOn('chkAutoTranslateAfterTranscribe', 'change', () => renderAutoTranslateModelSelect());
 
   safeOn('btnAiTranscribeLongAudio', 'click', async () => {
     if (!state.vadAudioBuffer) {
