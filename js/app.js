@@ -927,17 +927,33 @@ function bindAllEvents() {
     // Starts on the model the user ran last time; the best one stays labelled as the suggestion
     const preselected = findPreferredEngine(engines) || engines[0];
     if (listEl) {
-      listEl.innerHTML = engines.length > 0
-        ? engines.map((e, i) => `
+      // One block per provider, each listed strongest first. The providers keep the order in which they
+      // first appear in the overall ranking, so the block holding the suggested model comes first.
+      const providers = [...new Set(engines.map((e) => e.provider))];
+      const blockStyle = {
+        openai: { border: 'border-emerald-500/40', title: 'text-emerald-300' },
+        gemini: { border: 'border-sky-500/40', title: 'text-sky-300' },
+        groq: { border: 'border-amber-500/40', title: 'text-amber-300' }
+      };
+      const renderEngineRow = (e) => `
           <label class="flex items-center gap-2 p-2.5 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer">
             <input type="radio" name="packTranslateEngine" value="${escapeHtml(e.id)}" class="accent-violet-400" ${e === preselected ? 'checked' : ''} />
             <span class="min-w-0 flex-1">
               <span class="font-mono font-bold text-white break-all">${escapeHtml(e.model)}</span>
-              <span class="text-slate-400">｜${escapeHtml(e.providerLabel)}</span>
               ${e.priceText ? `<span class="block text-[10px] text-slate-500 font-mono">${escapeHtml(e.priceText)}</span>` : ''}
             </span>
-            <span class="px-1.5 py-0.5 rounded-lg text-[10px] font-bold shrink-0 ${e.tier === 1 ? 'bg-emerald-500/20 text-emerald-300' : e.tier === 2 ? 'bg-sky-500/20 text-sky-300' : 'bg-slate-800 text-slate-400'}">${escapeHtml(e.tierLabel)}${i === 0 ? '・建議' : ''}</span>
-          </label>`).join('')
+            <span class="px-1.5 py-0.5 rounded-lg text-[10px] font-bold shrink-0 ${e.tier === 1 ? 'bg-emerald-500/20 text-emerald-300' : e.tier === 2 ? 'bg-sky-500/20 text-sky-300' : 'bg-slate-800 text-slate-400'}">${escapeHtml(e.tierLabel)}${e === engines[0] ? '・建議' : ''}</span>
+          </label>`;
+      listEl.innerHTML = engines.length > 0
+        ? providers.map((provider) => {
+          const group = engines.filter((e) => e.provider === provider);
+          const style = blockStyle[provider] || { border: 'border-slate-700', title: 'text-slate-300' };
+          return `
+          <div class="rounded-2xl border ${style.border} p-2 space-y-1.5">
+            <div class="px-1 text-[11px] font-extrabold ${style.title}">${escapeHtml(group[0].providerLabel)}${group.length > 1 ? '<span class="font-normal text-slate-500">｜由強到弱</span>' : ''}</div>
+            ${group.map(renderEngineRow).join('')}
+          </div>`;
+        }).join('')
         : '<div class="p-2.5 rounded-xl bg-slate-950 border border-slate-800 text-slate-400">沒有可用的翻譯模型。整包翻譯需要 OpenAI 或 Google Gemini（也可用 Groq）的 API 金鑰；免金鑰的機器翻譯品質不夠，這裡不提供。</div>';
       listEl.querySelectorAll('input').forEach((el) => el.addEventListener('change', refreshPackTranslateControls));
     }
