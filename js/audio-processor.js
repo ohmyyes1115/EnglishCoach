@@ -865,6 +865,7 @@ export async function buildPackBackupZip(pack, onProgress = () => {}) {
     const entry = {
       en: it.en || '',
       zh: it.zh || '',
+      zhSource: typeof it.zhSource === 'string' ? it.zhSource : '',
       aiNotes: it.aiNotes || '',
       aiGrammarNote: it.aiGrammarNote || '',
       wordNotes: (it.wordNotes && typeof it.wordNotes === 'object') ? it.wordNotes : {},
@@ -947,6 +948,7 @@ async function restorePackFromBackupZip(zip, onStatusUpdate) {
       index: i,
       en: asText(src.en) || `${i + 1}. Sentence #${i + 1}`,
       zh: asText(src.zh),
+      zhSource: asText(src.zhSource),
       aiNotes: asText(src.aiNotes),
       aiGrammarNote: asText(src.aiGrammarNote),
       wordNotes,

@@ -229,6 +229,16 @@ export function openDatabase() {
   });
 }
 
+// item.zhSource records where a sentence's Chinese came from. Only whole-pack translation sets it
+// ("pack-translate:<model id>"); such a translation was made with the strongest model and the whole
+// lesson as context, so the quick single-sentence lookups must not overwrite it.
+export const PACK_TRANSLATE_ZH_SOURCE_PREFIX = 'pack-translate:';
+
+export function isPackTranslatedZh(item) {
+  return Boolean(item && typeof item.zh === 'string' && item.zh.trim()
+    && typeof item.zhSource === 'string' && item.zhSource.startsWith(PACK_TRANSLATE_ZH_SOURCE_PREFIX));
+}
+
 export function sanitizePackForIndexedDB(pack) {
   return {
     id: pack.id,
@@ -240,6 +250,7 @@ export function sanitizePackForIndexedDB(pack) {
       index: idx,
       en: it.en || '',
       zh: it.zh || '',
+      zhSource: typeof it.zhSource === 'string' ? it.zhSource : '',
       aiNotes: it.aiNotes || '',
       aiGrammarNote: it.aiGrammarNote || '',
       wordNotes: (it.wordNotes && typeof it.wordNotes === 'object') ? it.wordNotes : {},

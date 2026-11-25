@@ -63,8 +63,16 @@ import {
   actionToggleInfiniteLoop,
   actionResetToFirstSentence,
   triggerCopyCurrentSentence,
-  describeScreenWakeLock
+  describeScreenWakeLock,
+  setScreenWakeLockHold
 } from './player-engine.js';
+
+import {
+  listPackTranslationEngines,
+  translatePack,
+  describeTranslateError,
+  cleanSentenceText
+} from './pack-translate.js';
 
 import {
   registerAiCallbacks,
@@ -863,6 +871,181 @@ function bindAllEvents() {
   safeOn('btnModalResetFirst', 'click', () => {
     modalList?.classList.add('hidden');
     actionResetToFirstSentence();
+  });
+
+  // Modal: Whole-pack Chinese translation
+  const modalPackTranslate = document.getElementById('modalPackTranslate');
+  let packTranslateEngines = [];
+  let packTranslateRunning = false;
+  let packTranslateCancelRequested = false;
+  let packTranslateOpenToken = 0;
+
+  const packTranslateEl = (id) => document.getElementById(id);
+  const selectedPackTranslateEngine = () => {
+    const id = document.querySelector('input[name="packTranslateEngine"]:checked')?.value;
+    return packTranslateEngines.find((e) => e.id === id) || null;
+  };
+  const countSentencesWithoutZh = (pack) =>
+    (pack?.items || []).filter((it) => cleanSentenceText(it.en) && !(it.zh && it.zh.trim())).length;
+
+  const refreshPackTranslateControls = () => {
+    const pack = state.currentPack;
+    const total = pack?.items?.length || 0;
+    const missing = countSentencesWithoutZh(pack);
+    const summary = packTranslateEl('packTranslateSummary');
+    if (summary) summary.textContent = pack ? `${pack.name}｜共 ${total} 句，其中 ${missing} 句還沒有中譯` : '';
+    const missingLabel = packTranslateEl('packTranslateScopeMissingLabel');
+    const allLabel = packTranslateEl('packTranslateScopeAllLabel');
+    if (missingLabel) missingLabel.textContent = `只翻譯還沒有中譯的 ${missing} 句`;
+    if (allLabel) allLabel.textContent = `全部 ${total} 句重新翻譯（覆蓋現有中譯）`;
+    const missingRadio = document.querySelector('input[name="packTranslateScope"][value="missing"]');
+    const allRadio = document.querySelector('input[name="packTranslateScope"][value="all"]');
+    if (missingRadio && allRadio) {
+      missingRadio.disabled = packTranslateRunning || missing === 0;
+      allRadio.disabled = packTranslateRunning;
+      if (missing === 0 && missingRadio.checked) allRadio.checked = true;
+    }
+    document.querySelectorAll('input[name="packTranslateEngine"]').forEach((el) => { el.disabled = packTranslateRunning; });
+    const startBtn = packTranslateEl('btnPackTranslateStart');
+    if (startBtn) {
+      startBtn.disabled = packTranslateRunning || !selectedPackTranslateEngine() || total === 0;
+      startBtn.textContent = packTranslateRunning ? '翻譯中…' : '開始翻譯';
+    }
+    packTranslateEl('btnPackTranslateCancel')?.classList.toggle('hidden', !packTranslateRunning);
+  };
+
+  const renderPackTranslateEngines = (engines, problems) => {
+    packTranslateEngines = engines;
+    const listEl = packTranslateEl('packTranslateEngineList');
+    const problemsEl = packTranslateEl('packTranslateProblems');
+    if (listEl) {
+      listEl.innerHTML = engines.length > 0
+        ? engines.map((e, i) => `
+          <label class="flex items-center gap-2 p-2.5 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer">
+            <input type="radio" name="packTranslateEngine" value="${escapeHtml(e.id)}" class="accent-violet-400" ${i === 0 ? 'checked' : ''} />
+            <span class="min-w-0 flex-1">
+              <span class="font-mono font-bold text-white break-all">${escapeHtml(e.model)}</span>
+              <span class="text-slate-400">｜${escapeHtml(e.providerLabel)}</span>
+            </span>
+            <span class="px-1.5 py-0.5 rounded-lg text-[10px] font-bold shrink-0 ${e.tier === 1 ? 'bg-emerald-500/20 text-emerald-300' : e.tier === 2 ? 'bg-sky-500/20 text-sky-300' : 'bg-slate-800 text-slate-400'}">${escapeHtml(e.tierLabel)}${i === 0 ? '・建議' : ''}</span>
+          </label>`).join('')
+        : '<div class="p-2.5 rounded-xl bg-slate-950 border border-slate-800 text-slate-400">沒有可用的翻譯模型。整包翻譯需要 OpenAI 或 Google Gemini（也可用 Groq）的 API 金鑰；免金鑰的機器翻譯品質不夠，這裡不提供。</div>';
+      listEl.querySelectorAll('input').forEach((el) => el.addEventListener('change', refreshPackTranslateControls));
+    }
+    if (problemsEl) {
+      problemsEl.innerHTML = problems.map((p) => `<div>⚠️ ${escapeHtml(p)}</div>`).join('');
+      problemsEl.classList.toggle('hidden', problems.length === 0);
+    }
+    packTranslateEl('btnPackTranslateOpenAiSettings')?.classList.toggle('hidden', engines.length > 0 && problems.length === 0);
+    refreshPackTranslateControls();
+  };
+
+  const closePackTranslateModal = () => {
+    modalPackTranslate?.classList.add('hidden');
+    focusBtKeyCatcher();
+  };
+
+  safeOn('btnOpenPackTranslate', 'click', async () => {
+    modalList?.classList.add('hidden');
+    modalPackTranslate?.classList.remove('hidden');
+    if (packTranslateRunning) return; // Re-opened while a run is in progress: keep showing that run
+    packTranslateEl('packTranslateProgressBox')?.classList.add('hidden');
+    packTranslateEl('packTranslateResult')?.classList.add('hidden');
+    packTranslateEngines = [];
+    const listEl = packTranslateEl('packTranslateEngineList');
+    if (listEl) listEl.innerHTML = '<div class="p-2.5 rounded-xl bg-slate-950 border border-slate-800 text-slate-400"><i class="fa-solid fa-spinner animate-spin"></i> 正在查詢你的金鑰目前可用的模型…</div>';
+    packTranslateEl('packTranslateProblems')?.classList.add('hidden');
+    packTranslateEl('btnPackTranslateOpenAiSettings')?.classList.add('hidden');
+    refreshPackTranslateControls();
+    const token = ++packTranslateOpenToken;
+    const { engines, problems } = await listPackTranslationEngines().catch((err) => ({
+      engines: [],
+      problems: [`查詢模型清單失敗：${err?.message || '未知錯誤'}`]
+    }));
+    if (token !== packTranslateOpenToken || packTranslateRunning) return;
+    renderPackTranslateEngines(engines, problems);
+  });
+
+  safeOn('btnClosePackTranslate', 'click', closePackTranslateModal);
+  safeOn('btnPackTranslateOpenAiSettings', 'click', () => {
+    modalPackTranslate?.classList.add('hidden');
+    openAiSettingsModal();
+  });
+  safeOn('btnPackTranslateCancel', 'click', () => {
+    if (!packTranslateRunning) return;
+    packTranslateCancelRequested = true;
+    const text = packTranslateEl('packTranslateProgressText');
+    if (text) text.textContent = '中止中…（等目前這一批回來就停）';
+  });
+
+  safeOn('btnPackTranslateStart', 'click', async () => {
+    const pack = state.currentPack;
+    const engine = selectedPackTranslateEngine();
+    if (packTranslateRunning || !pack || !engine) return;
+    const scope = document.querySelector('input[name="packTranslateScope"]:checked')?.value === 'all' ? 'all' : 'missing';
+
+    packTranslateRunning = true;
+    packTranslateCancelRequested = false;
+    const progressBox = packTranslateEl('packTranslateProgressBox');
+    const progressFill = packTranslateEl('packTranslateProgressFill');
+    const progressText = packTranslateEl('packTranslateProgressText');
+    const resultEl = packTranslateEl('packTranslateResult');
+    progressBox?.classList.remove('hidden');
+    resultEl?.classList.add('hidden');
+    if (progressFill) progressFill.style.width = '0%';
+    if (progressText) progressText.textContent = '準備中…';
+    refreshPackTranslateControls();
+    // A locked phone suspends the page and the run with it
+    setScreenWakeLockHold('pack-translate', true);
+
+    let result;
+    try {
+      result = await translatePack(pack, engine, scope, {
+        shouldCancel: () => packTranslateCancelRequested,
+        onProgress: ({ done, total, note }) => {
+          if (progressFill) progressFill.style.width = `${total > 0 ? Math.round((done / total) * 100) : 0}%`;
+          if (progressText && !packTranslateCancelRequested) progressText.textContent = `已完成 ${done} / ${total} 句｜${note}`;
+        },
+        onBatchApplied: () => {
+          if (state.currentPack === pack) renderMainStage();
+        }
+      });
+    } catch (err) {
+      result = { total: 0, translated: 0, failedIds: [], cancelled: false, saveFailed: false, error: err };
+    }
+    setScreenWakeLockHold('pack-translate', false);
+    packTranslateRunning = false;
+
+    const lines = [];
+    if (result.total === 0 && !result.error) {
+      lines.push('<div class="text-slate-300">沒有需要翻譯的句子。</div>');
+    } else {
+      lines.push(`<div class="${result.translated > 0 ? 'text-emerald-300' : 'text-slate-300'} font-bold">${result.translated > 0 ? '✅' : 'ℹ️'} 已用 ${escapeHtml(engine.model)} 翻譯 ${result.translated} / ${result.total} 句${result.translated > 0 ? '，已存入教材' : ''}</div>`);
+    }
+    if (result.failedIds.length > 0) {
+      lines.push(`<div class="text-amber-200">⚠️ 第 ${result.failedIds.join('、')} 句沒有取得合格的翻譯，維持原狀。再按一次「開始翻譯」可以只補這些句子。</div>`);
+    }
+    if (result.cancelled) {
+      lines.push('<div class="text-slate-300">已中止，前面完成的部分已保留。</div>');
+    }
+    if (result.error) {
+      const reason = describeTranslateError(result.error, engine);
+      lines.push(`<div class="text-rose-300">❌ ${escapeHtml(reason)}</div>`);
+      lines.push('<div class="text-slate-400">已停止，沒有自動改用其他模型；前面完成的部分已保留。你可以稍後重試，或在上方改選另一個模型。</div>');
+      if (typeof window.logDiag === 'function') {
+        window.logDiag('WARN', `整包翻譯中斷（${engine.model}，完成 ${result.translated}/${result.total}）：${result.error?.message || result.error}`);
+      }
+    }
+    if (result.saveFailed) {
+      lines.push('<div class="text-rose-300">⚠️ 翻譯結果未能寫入裝置，重新整理後會遺失（詳見診斷紀錄）。</div>');
+    }
+    if (resultEl) {
+      resultEl.innerHTML = lines.join('');
+      resultEl.classList.remove('hidden');
+    }
+    if (!result.error && !result.cancelled) progressBox?.classList.add('hidden');
+    refreshPackTranslateControls();
+    if (state.currentPack === pack) renderMainStage();
   });
 
   // Modal: Changelog

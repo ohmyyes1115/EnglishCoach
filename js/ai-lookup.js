@@ -7,7 +7,8 @@ import {
   formatIdx,
   showGiantHud,
   copyTextSynchronously,
-  savePackToDB
+  savePackToDB,
+  isPackTranslatedZh
 } from './state-storage.js';
 
 import {
@@ -251,10 +252,14 @@ function buildGeminiThinkingConfig(modelName) {
   return { thinkingLevel: 'minimal' };
 }
 
-async function requestGeminiGenerateContent(modelName, cleanKey, parts, temperature, maxOutputTokens) {
+// options.keepDefaultThinking: leave the model's own reasoning on (whole-pack translation wants the quality;
+//   the caller must then allow a generous maxOutputTokens, because reasoning counts against it)
+// options.responseMimeType: e.g. 'application/json'
+export async function requestGeminiGenerateContent(modelName, cleanKey, parts, temperature, maxOutputTokens, options = {}) {
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(cleanKey)}`;
   const send = async (thinkingConfig) => {
     const generationConfig = { temperature, maxOutputTokens };
+    if (options.responseMimeType) generationConfig.responseMimeType = options.responseMimeType;
     if (thinkingConfig) generationConfig.thinkingConfig = thinkingConfig;
     const res = await fetch(endpoint, {
       method: 'POST',
@@ -265,7 +270,7 @@ async function requestGeminiGenerateContent(modelName, cleanKey, parts, temperat
     return { res, data };
   };
 
-  const thinkingConfig = buildGeminiThinkingConfig(modelName);
+  const thinkingConfig = options.keepDefaultThinking ? null : buildGeminiThinkingConfig(modelName);
   let { res, data } = await send(thinkingConfig);
   if (!res.ok && thinkingConfig && res.status === 400 && /think/i.test(data?.error?.message || '')) {
     // This model does not take the thinking setting we guessed; remember that and ask again without it
@@ -324,7 +329,7 @@ let cachedGroqModelIds = null;
 let cachedGroqChatModel = '';
 let cachedGroqWhisperModel = '';
 
-async function fetchGroqAvailableModelIds(apiKey) {
+export async function fetchGroqAvailableModelIds(apiKey) {
   const cleanKey = String(apiKey || '').trim();
   const fp = cleanKey.slice(-10);
   if (cachedGroqModelIds && cachedGroqKeyFp === fp) {
@@ -353,7 +358,7 @@ async function fetchGroqAvailableModelIds(apiKey) {
   }
 }
 
-function rankGroqChatModels(availableIds) {
+export function rankGroqChatModels(availableIds) {
   const excluded = /whisper|guard|tts|playai|orpheus|moderation|embed|safeguard|prompt-guard/i;
   const chatIds = availableIds.filter(id => !excluded.test(id));
   const priority = [
@@ -704,11 +709,13 @@ export async function actionAiExplainCurrentSentence(forceRefresh = false) {
     const parsed = parseAiStructuredResponse(res.text);
     if (!parsed.zh && !parsed.notes) throw new Error('AI 回覆內容為空');
     badge.textContent = `🤖 ${res.modelUsed}`;
-    if (parsed.zh) item.zh = parsed.zh;
+    // A whole-pack translation (strongest model, whole lesson as context) outranks this quick one-sentence reply
+    const keepPackZh = isPackTranslatedZh(item);
+    if (parsed.zh && !keepPackZh) item.zh = parsed.zh;
     // Drop the key-less placeholder so a real analysis without a grammar line is not mistaken for a fallback
     if (item.aiGrammarNote === FREE_FALLBACK_GRAMMAR_HINT) item.aiGrammarNote = '';
     await persistZhAndNotesToCurrentItem(parsed.zh, parsed.notes, parsed.grammar);
-    renderAiDrawerBodyHtml(bodyEl, formatSavedAiNotesHtml(parsed.zh || item.zh, parsed.notes, parsed.grammar, false));
+    renderAiDrawerBodyHtml(bodyEl, formatSavedAiNotesHtml(keepPackZh ? item.zh : (parsed.zh || item.zh), parsed.notes, parsed.grammar, false));
     return;
   } catch (e) {
     aiError = e;
@@ -731,7 +738,8 @@ export async function actionAiExplainCurrentSentence(forceRefresh = false) {
   }
 
   badge.textContent = failedEngine ? `⚠️ ${failedEngine} 失敗・暫用免金鑰翻譯` : '⚡ 免金鑰智慧翻譯';
-  const translatedZh = ((forceRefresh && !failedEngine) ? '' : item.zh) || (await fetchFreeGoogleTranslateZhTW(cleanSentence));
+  // forceRefresh re-fetches the key-less translation, except over a whole-pack translation, which is better than it
+  const translatedZh = ((forceRefresh && !failedEngine && !isPackTranslatedZh(item)) ? '' : item.zh) || (await fetchFreeGoogleTranslateZhTW(cleanSentence));
   const words = (cleanSentence.match(/[A-Za-z]{5,}/g) || [])
     .map(w => w.toLowerCase())
     .filter((w, i, arr) => arr.indexOf(w) === i)
