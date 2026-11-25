@@ -9,7 +9,7 @@ import {
   formatIdx,
   showGiantHud
 } from './state-storage.js';
-import { pausePlaybackInPlace } from './player-engine.js';
+import { pausePlaybackInPlace, setScreenWakeLockHold } from './player-engine.js';
 
 const GPT_LIVE_CONFIG_LS_KEY = 'car_shadow_gpt_live_config_v1';
 const GPT_LIVE_LEDGER_LS_KEY = 'car_shadow_gpt_live_ledger_v1';
@@ -462,6 +462,8 @@ function updateLiveTimerAndCostUI() {
 }
 
 function updateLiveStatusUI() {
+  // Every status change passes through here: keep the screen on from dialing until the call has ended
+  setScreenWakeLockHold('gpt-live', liveState.status !== 'idle');
   const dot = document.getElementById('gptLiveStatusDot');
   const text = document.getElementById('gptLiveStatusText');
   const sidBadge = document.getElementById('gptLiveSessionIdBadge');

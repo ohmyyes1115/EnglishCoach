@@ -177,9 +177,24 @@ function releaseScreenWakeLock() {
   if (sentinel) sentinel.release().catch(() => {});
 }
 
-// Call after every change of state.isPlaying
+// Other features that need the screen on while they run (e.g. a GPT-Live voice call)
+const wakeLockHolds = new Set();
+
+function isScreenNeeded() {
+  return state.isPlaying || wakeLockHolds.size > 0;
+}
+
+export function setScreenWakeLockHold(reason, isActive) {
+  const had = wakeLockHolds.has(reason);
+  if (Boolean(isActive) === had) return;
+  if (isActive) wakeLockHolds.add(reason);
+  else wakeLockHolds.delete(reason);
+  syncScreenWakeLock();
+}
+
+// Call after every change of state.isPlaying or of the holds above
 function syncScreenWakeLock() {
-  if (state.isPlaying) {
+  if (isScreenNeeded()) {
     if (wakeLockReleaseTimerId) {
       clearTimeout(wakeLockReleaseTimerId);
       wakeLockReleaseTimerId = null;
@@ -188,11 +203,11 @@ function syncScreenWakeLock() {
     acquireScreenWakeLock();
     return;
   }
-  // Paused: the grace period counts from the first pause, repeated pause calls do not extend it
+  // Paused / call ended: the grace period counts from that moment, repeated pause calls do not extend it
   if (wakeLockWanted && !wakeLockReleaseTimerId) {
     wakeLockReleaseTimerId = setTimeout(() => {
       wakeLockReleaseTimerId = null;
-      if (!state.isPlaying) releaseScreenWakeLock();
+      if (!isScreenNeeded()) releaseScreenWakeLock();
     }, WAKE_LOCK_PAUSE_GRACE_MS);
   }
 }
@@ -201,7 +216,11 @@ export function describeScreenWakeLock() {
   if (!navigator.wakeLock || typeof navigator.wakeLock.request !== 'function') {
     return '這個瀏覽器不支援（iPhone 需 iOS 16.4 以上；主畫面 App 需 iOS 18.4 以上）';
   }
-  if (wakeLockSentinel) return state.isPlaying ? '已啟用（播放中）' : '已啟用（暫停後保留 5 分鐘）';
+  if (wakeLockSentinel) {
+    if (state.isPlaying) return '已啟用（播放中）';
+    if (wakeLockHolds.has('gpt-live')) return '已啟用（GPT-Live 通話中）';
+    return '已啟用（暫停或通話結束後保留 5 分鐘）';
+  }
   if (wakeLockLastErrorName) return `未能啟用 (${wakeLockLastErrorName})，可能是省電模式`;
   return wakeLockWanted ? '等待頁面回到前景後重新啟用' : '未啟用（開始播放時才會啟用）';
 }
