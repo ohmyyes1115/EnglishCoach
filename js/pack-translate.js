@@ -188,6 +188,21 @@ export function findPreferredEngine(engines) {
   }
 }
 
+// The remembered choice in words, for display only; '' when nothing was chosen yet.
+// A choice saved before model ids were stored is described by its provider and tier.
+export function getRememberedModelName() {
+  try {
+    const pref = JSON.parse(safeStorage.getItem(PREFERRED_ENGINE_LS_KEY) || 'null');
+    if (!pref) return '';
+    if (typeof pref.model === 'string' && pref.model) return pref.model;
+    const provider = { openai: 'OpenAI', gemini: 'Gemini', groq: 'Groq' }[pref.provider];
+    if (!provider) return '';
+    return `${provider} 的${pref.tier === 1 ? '最強' : pref.tier === 2 ? '第二級' : '開源'}模型`;
+  } catch (e) {
+    return '';
+  }
+}
+
 // The engine a run nobody is choosing for (translation right after transcription) may use:
 // the one the user picked last time, otherwise the best one on the list. A tier-3 model is never
 // picked on the user's behalf; it only runs when the user chose it themself.

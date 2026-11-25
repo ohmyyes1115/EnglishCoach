@@ -77,6 +77,7 @@ import {
   cleanSentenceText,
   rememberPreferredEngine,
   findPreferredEngine,
+  getRememberedModelName,
   translateTranscriptLines
 } from './pack-translate.js';
 
@@ -887,6 +888,16 @@ function bindAllEvents() {
   let packTranslateOpenToken = 0;
 
   const packTranslateEl = (id) => document.getElementById(id);
+
+  // Under the "translate after transcription" checkbox: which model that pass will use
+  function refreshAutoTranslateModelHint() {
+    const hintEl = document.getElementById('autoTranslateModelHint');
+    if (!hintEl) return;
+    const model = getRememberedModelName();
+    hintEl.textContent = model
+      ? `翻譯模型：${model}（你上次在「整包翻譯」用的；要換就到那裡用別的模型翻一次）`
+      : '翻譯模型：你金鑰裡最強的那個（在「整包翻譯」用過某個模型後，會改用那個）';
+  }
   const selectedPackTranslateEngine = () => {
     const id = document.querySelector('input[name="packTranslateEngine"]:checked')?.value;
     return packTranslateEngines.find((e) => e.id === id) || null;
@@ -1041,7 +1052,10 @@ function bindAllEvents() {
     setScreenWakeLockHold('pack-translate', false);
     packTranslateRunning = false;
     // A model that worked is what the next run (and the translation after transcription) starts from
-    if (result.translated > 0 && !result.error) rememberPreferredEngine(engine);
+    if (result.translated > 0 && !result.error) {
+      rememberPreferredEngine(engine);
+      refreshAutoTranslateModelHint();
+    }
 
     const lines = [];
     if (result.total === 0 && !result.error) {
@@ -1582,6 +1596,7 @@ function bindAllEvents() {
     });
   }
   let transcribeTranslateCancelRequested = false;
+  refreshAutoTranslateModelHint();
 
   safeOn('btnAiTranscribeLongAudio', 'click', async () => {
     if (!state.vadAudioBuffer) {
