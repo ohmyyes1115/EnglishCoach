@@ -8,7 +8,8 @@ import {
   showGiantHud,
   copyTextSynchronously,
   savePackToDB,
-  isPackTranslatedZh
+  isPackTranslatedZh,
+  stripLineNumber
 } from './state-storage.js';
 
 import {
@@ -287,10 +288,19 @@ export async function requestGeminiGenerateContent(modelName, cleanKey, parts, t
     .map(p => p.text)
     .join('')
     .trim();
+  // Thinking tokens are billed as output, so they are counted with it
+  const meta = data?.usageMetadata;
+  const usage = meta && Number.isFinite(meta.promptTokenCount)
+    ? {
+      inputTokens: meta.promptTokenCount,
+      outputTokens: (Number(meta.candidatesTokenCount) || 0) + (Number(meta.thoughtsTokenCount) || 0)
+    }
+    : null;
   return {
     text,
     truncated: candidate?.finishReason === 'MAX_TOKENS',
-    finishReason: candidate?.finishReason || data?.promptFeedback?.blockReason || ''
+    finishReason: candidate?.finishReason || data?.promptFeedback?.blockReason || '',
+    usage
   };
 }
 
@@ -916,11 +926,13 @@ async function transcribeChunkViaWhisper(chunk, providerType, apiKey) {
 async function transcribeChunkViaGemini(chunk, apiKey) {
   const cleanKey = String(apiKey || '').trim();
   const models = await resolveGeminiCandidateModels(cleanKey);
+  // English only: listening and translating in one call gave a weaker Chinese line than the dedicated
+  // translation pass (pack-translate.js), which runs on the finished transcript afterwards
   const prompt = [
     'Transcribe all spoken English in this audio accurately with proper capitalization and punctuation.',
-    'Output strictly one natural sentence per line using this exact format:',
-    'English sentence || 自然流暢的台灣繁體中文翻譯',
-    'Rules: Do NOT include line numbers, timestamps, speaker labels, markdown bullets, or any extra explanation.'
+    'Write exactly what is said: do not paraphrase, summarize, correct grammar, or translate.',
+    'Output strictly one natural sentence per line, in English only.',
+    'Rules: Do NOT include line numbers, timestamps, speaker labels, markdown bullets, translations, or any extra explanation.'
   ].join('\n');
 
   const base64Audio = chunk.toBase64();
@@ -950,16 +962,11 @@ async function transcribeChunkViaGemini(chunk, apiKey) {
 
       const entries = reply
         .split('\n')
-        .map(line => line.replace(/^[\-\*•\s]+/, '').replace(/^\d+[\.\)、\-\s]+/, '').trim())
+        .map(line => stripLineNumber(line.replace(/^[\-\*•\s]+/, '')))
         .filter(Boolean)
         .filter(line => !/^```/.test(line))
-        .map(line => {
-          const parts = line.split('||');
-          return {
-            en: (parts[0] || '').trim(),
-            zh: (parts[1] || '').trim()
-          };
-        })
+        // A model that adds "|| 中文" anyway is tolerated: only the English part is kept
+        .map(line => ({ en: (line.split('||')[0] || '').trim(), zh: '' }))
         .filter(item => item.en);
 
       return { modelUsed: modelName, entries };
@@ -1053,7 +1060,7 @@ export async function transcribeLongAudioWithAi(audioBuffer, onProgress = () => 
     const chunk = chunks[i];
     const label = isWhisper
       ? (engine.type === 'groq' ? 'Groq Whisper' : 'OpenAI Whisper')
-      : 'Gemini 雙語聽打';
+      : 'Gemini 聽打';
     const trimNote = trimmedHeadSec > 0.2 ? `｜已裁去開頭 ${trimmedHeadSec.toFixed(1)}s 靜音` : '';
     onProgress(`🎙️ ${label} 辨識中 (${i + 1}/${chunks.length} 段${trimNote})...`);
 

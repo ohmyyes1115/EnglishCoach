@@ -474,7 +474,12 @@
                   <i class="fa-solid fa-microphone-lines"></i>
                   <span>🎙️ AI 自動聽打英文字幕（無字幕時使用）</span>
                 </button>
-                <div id="aiTranscribeStatus" class="hidden text-[11px] font-mono text-emerald-300 bg-slate-900/90 border border-emerald-500/30 rounded-xl px-2.5 py-1.5"></div>
+                <label class="flex items-start gap-1.5 text-[11px] text-slate-300 cursor-pointer px-1">
+                  <input id="chkAutoTranslateAfterTranscribe" type="checkbox" checked class="accent-emerald-400 mt-0.5" />
+                  <span>聽打完自動翻譯成中文（另外用你金鑰裡品質最好的模型，會多等一下）</span>
+                </label>
+                <div id="aiTranscribeStatus" class="hidden text-[11px] font-mono text-emerald-300 bg-slate-900/90 border border-emerald-500/30 rounded-xl px-2.5 py-1.5 whitespace-pre-line break-words"></div>
+                <button id="btnCancelTranscribeTranslate" type="button" class="hidden w-full py-1.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 text-[11px] font-bold transition">中止翻譯（保留已完成的部分）</button>
                 <button id="btnAutoFindDbThreshold" type="button" class="w-full py-2 px-3 rounded-xl bg-violet-500/20 hover:bg-violet-500/30 border border-violet-400/60 text-violet-200 font-extrabold transition flex items-center justify-center gap-1.5">
                   <i class="fa-solid fa-wand-magic-sparkles"></i>
                   <span>智慧自動尋找符合字幕行數的 dB 門檻</span>

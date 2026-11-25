@@ -7,7 +7,8 @@ import {
   state,
   escapeHtml,
   formatIdx,
-  showGiantHud
+  showGiantHud,
+  stripLineNumber
 } from './state-storage.js';
 
 let sharedAudioCtx = null;
@@ -351,7 +352,7 @@ export function parsePlainTextLines() {
     let en = parts[0].trim();
     const zh = (parts[1] || '').trim();
     if (!keepNumbers) {
-      en = en.replace(/^\d+[\.\)、\-\s]+/, '').trim();
+      en = stripLineNumber(en);
     } else if (!/^\d+[\.\)、]/.test(en)) {
       en = `${idx + 1}. ${en}`;
     }
@@ -611,6 +612,7 @@ export function buildSplitPackFromVad(packName, normMode = 'rms') {
   if (!state.vadAudioBuffer || !state.vadSegments.length) return null;
 
   const subs = parsePlainTextLines();
+  const translated = state.vadTranslatedZh;
   const sr = state.vadAudioBuffer.sampleRate;
   const raw = state.vadAudioBuffer.getChannelData(0);
 
@@ -630,10 +632,13 @@ export function buildSplitPackFromVad(packName, normMode = 'rms') {
     const slice = raw.subarray(s0, s1);
     const wavUri = encodeMonoFloat32ToWavDataUri(slice, sr, normMode, globalGain);
     const sub = subs[idx] || { en: `${idx + 1}. Sentence #${idx + 1}`, zh: '' };
+    // A line still exactly as the translation pass wrote it keeps that pass's mark; an edited one does not
+    const fromTranslationPass = Boolean(sub.zh) && Boolean(translated?.pairs?.has(`${stripLineNumber(sub.en)}\n${sub.zh}`));
     return {
       index: idx,
       en: sub.en,
       zh: sub.zh,
+      zhSource: fromTranslationPass ? translated.zhSource : '',
       aiNotes: '',
       aiGrammarNote: '',
       wordNotes: {},

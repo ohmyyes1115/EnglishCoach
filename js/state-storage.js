@@ -88,8 +88,17 @@ export const state = {
   vadSampleRate: 16000,
   vadHopSamples: 160,
   vadSegments: [],
+  // Chinese lines the translation pass wrote into the subtitle box after transcription:
+  // { zhSource, pairs: Set("<english>\n<chinese>") }. Lets the pack builder mark exactly those lines.
+  vadTranslatedZh: null,
   memoryPacksFallback: new Map()
 };
+
+// Removes a leading line number such as "12. " / "12) " / "12、". A sentence that merely starts with
+// a number ("20 years ago…", "3.5 million…") is left alone.
+export function stripLineNumber(text) {
+  return String(text || '').replace(/^\s*\d+[\.\)、](?!\d)\s*/, '').trim();
+}
 
 // ==========================================
 // SAFE STORAGE (localStorage + Memory Fallback)

@@ -6,6 +6,8 @@
 
 import {
   state,
+  safeStorage,
+  stripLineNumber,
   savePackToDB,
   PACK_TRANSLATE_ZH_SOURCE_PREFIX
 } from './state-storage.js';
@@ -32,20 +34,32 @@ const TIER_LABELS = {
 // Model ids change every few months, so nothing is hardcoded: each provider is asked which models this
 // key can use, and the newest general-purpose text model of each family is picked from that answer.
 
+// OpenAI ids come in two shapes: "gpt-<version>" / "gpt-<version>-mini" (through the GPT-5 line) and
+// "gpt-<version>-<codename>" (GPT-6 line: "astra" is the frontier model, "sol" the efficient everyday one).
+// The model list says nothing about quality, so the codenames are ranked here by hand; an id with any other
+// suffix (dated snapshots, pro / nano / codex / audio / realtime / image variants, a codename not known yet)
+// is left out rather than guessed at.
+const OPENAI_FLAGSHIP_SUFFIXES = ['', '-astra'];
+const OPENAI_SECOND_SUFFIXES = ['-mini', '-sol'];
+
 export function rankOpenAiTextModels(ids) {
-  const versionOf = (id, suffix) => {
-    if (id === `gpt-4o${suffix}`) return 4.05;
-    const m = new RegExp(`^gpt-(\\d+(?:\\.\\d+)?)${suffix}$`).exec(id);
-    return m ? parseFloat(m[1]) : 0;
+  const parse = (id) => {
+    const m = /^gpt-(\d+(?:\.\d+)?|4o)(-[a-z]+)?$/.exec(id);
+    if (!m) return null;
+    return { version: m[1] === '4o' ? 4.05 : parseFloat(m[1]), suffix: m[2] || '' };
   };
-  const pick = (suffix, minVersion) => ids
-    .map((id) => ({ id, v: versionOf(id, suffix) }))
-    .filter((x) => x.v >= minVersion)
-    .sort((a, b) => b.v - a.v)
+  const pick = (suffixes) => ids
+    .map((id) => ({ id, parsed: parse(id) }))
+    .filter((x) => x.parsed && x.parsed.version >= 4.05 && suffixes.includes(x.parsed.suffix))
+    .sort((a, b) => b.parsed.version - a.parsed.version)
     .map((x) => x.id);
-  // Plain "gpt-<version>" ids only: dated snapshots, audio / realtime / image / search / codex variants never match
-  return { flagship: pick('', 4.05), mini: pick('-mini', 4.05) };
+  return { flagship: pick(OPENAI_FLAGSHIP_SUFFIXES), mini: pick(OPENAI_SECOND_SUFFIXES) };
 }
+
+// Gemini 4 dropped the Pro / Flash names for codenames. Google's model page calls Carbon "our strongest
+// reasoning model" and Hydrogen the everyday, efficient one (the only Gemini 4 model with a free tier), so
+// those two stand in for the old families. Neon and Argon are not ranked against Carbon there and are left out.
+const GEMINI_FAMILY_NAMES = { pro: 'pro|carbon', flash: 'flash|hydrogen' };
 
 export function rankGeminiTextModels(modelList, family) {
   const excluded = /image|tts|audio|live|embedding|aqa|robotics|computer-use|learnlm|gemma|dialog|lite|vision|customtools/i;
@@ -53,13 +67,14 @@ export function rankGeminiTextModels(modelList, family) {
   for (const m of modelList || []) {
     const id = String(m?.name || '').replace(/^models\//, '');
     if (!/^gemini-/.test(id) || excluded.test(id)) continue;
-    if (!new RegExp(`(^|-)${family}(-|$)`, 'i').test(id)) continue;
+    if (!new RegExp(`(^|-)(${GEMINI_FAMILY_NAMES[family] || family})(-|$)`, 'i').test(id)) continue;
     const methods = m?.supportedGenerationMethods;
     if (Array.isArray(methods) && !methods.includes('generateContent')) continue;
     if (!ids.includes(id)) ids.push(id);
   }
   const score = (id) => ({
-    version: /-latest$/.test(id) ? 999 : (parseFloat((id.match(/^gemini-(\d+(?:\.\d+)?)/) || [])[1]) || 0),
+    // An alias such as "gemini-pro-latest" does not say which model answers, so it only serves as a last resort
+    version: parseFloat((id.match(/^gemini-(\d+(?:\.\d+)?)/) || [])[1]) || 0,
     stable: /preview|exp/i.test(id) ? 0 : 1
   });
   // Newest generation first (a newer preview usually translates better than an older stable model),
@@ -83,7 +98,8 @@ async function fetchJsonWithKey(url, bearerKey) {
 }
 
 // Returns { engines, problems }.
-// engines: [{ id, provider, providerLabel, model, tier, tierLabel }] best first.
+// engines: [{ id, provider, providerLabel, model, tier, tierLabel, priceText }] best first.
+// Each provider contributes its strongest few models, so the user can trade quality against cost per run.
 // problems: human-readable reasons why a configured key produced no engine.
 export async function listPackTranslationEngines() {
   const cfg = state.aiConfig || {};
@@ -92,9 +108,9 @@ export async function listPackTranslationEngines() {
   const groqKey = String(cfg.groqKey || '').trim();
   const engines = [];
   const problems = [];
-  const add = (provider, providerLabel, model, tier) => {
+  const add = (provider, providerLabel, model, tier, tierLabel = TIER_LABELS[tier]) => {
     if (!model) return;
-    engines.push({ id: `${provider}:${model}`, provider, providerLabel, model, tier, tierLabel: TIER_LABELS[tier] });
+    engines.push({ id: `${provider}:${model}`, provider, providerLabel, model, tier, tierLabel, priceText: describeModelPrice(model) });
   };
 
   const jobs = [];
@@ -119,6 +135,10 @@ export async function listPackTranslationEngines() {
         const pro = rankGeminiTextModels(data?.models, 'pro');
         const flash = rankGeminiTextModels(data?.models, 'flash');
         add('gemini', 'Google Gemini', pro[0], 1);
+        // The other two Gemini 4 frontier models, labelled the way Google's model page describes them.
+        // That page does not rank them against Carbon, so they are offered after it, never ahead of it.
+        add('gemini', 'Google Gemini', rankGeminiTextModels(data?.models, 'neon')[0], 1, '前沿等級、速度快');
+        add('gemini', 'Google Gemini', rankGeminiTextModels(data?.models, 'argon')[0], 1, '前沿推理、較省 token');
         add('gemini', 'Google Gemini', flash[0], 2);
         if (!pro[0] && !flash[0]) problems.push('Gemini：這把金鑰的模型清單裡找不到可用的文字模型');
       } catch (e) {
@@ -144,6 +164,38 @@ export async function listPackTranslationEngines() {
 }
 
 // ==========================================
+// REMEMBERED ENGINE CHOICE
+// ==========================================
+// The exact model is remembered, together with its provider + tier: model ids change every few months, and
+// when the remembered one is gone the user's intent ("OpenAI's best", "Gemini's fast one") still picks its successor.
+const PREFERRED_ENGINE_LS_KEY = 'car_shadowing_pack_translate_engine_v1';
+
+export function rememberPreferredEngine(engine) {
+  if (!engine) return;
+  safeStorage.setItem(PREFERRED_ENGINE_LS_KEY, JSON.stringify({ provider: engine.provider, tier: engine.tier, model: engine.model }));
+}
+
+export function findPreferredEngine(engines) {
+  try {
+    const pref = JSON.parse(safeStorage.getItem(PREFERRED_ENGINE_LS_KEY) || 'null');
+    if (!pref) return null;
+    const list = engines || [];
+    return list.find((e) => e.provider === pref.provider && e.model === pref.model)
+      || list.find((e) => e.provider === pref.provider && e.tier === pref.tier)
+      || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// The engine a run nobody is choosing for (translation right after transcription) may use:
+// the one the user picked last time, otherwise the best one on the list. A tier-3 model is never
+// picked on the user's behalf; it only runs when the user chose it themself.
+export function pickAutoTranslationEngine(engines) {
+  return findPreferredEngine(engines) || (engines || []).find((e) => e.tier <= 2) || null;
+}
+
+// ==========================================
 // PROMPT
 // ==========================================
 const SYSTEM_PROMPT = [
@@ -163,7 +215,7 @@ const SYSTEM_PROMPT = [
 ].join('\n');
 
 export function cleanSentenceText(en) {
-  return String(en || '').replace(/^\d+[\.\)、\-\s]+/, '').trim();
+  return stripLineNumber(en);
 }
 
 export function buildUserPrompt(packName, contextRows, targetRows) {
@@ -255,7 +307,7 @@ function makeApiError(message, status, retryAfterSec) {
 
 // OpenAI and Groq share the chat-completions shape. Newer models refuse some classic parameters
 // (a fixed temperature, max_tokens), so a parameter the API names in a 400 reply is dropped and the call repeated.
-async function callChatCompletions(endpoint, apiKey, model, systemText, userText) {
+async function callChatCompletions(endpoint, apiKey, model, systemText, userText, addUsage) {
   const body = {
     model,
     messages: [
@@ -274,6 +326,8 @@ async function callChatCompletions(endpoint, apiKey, model, systemText, userText
     });
     const data = await res.json().catch(() => ({}));
     if (res.ok) {
+      // completion_tokens already includes the reasoning tokens
+      addUsage(data?.usage ? { inputTokens: data.usage.prompt_tokens, outputTokens: data.usage.completion_tokens } : null);
       const choice = data?.choices?.[0];
       if (choice?.finish_reason === 'length') throw makeApiError(`${model} 回覆被截斷（輸出長度達上限）`, 0);
       return String(choice?.message?.content || '');
@@ -293,7 +347,7 @@ async function callChatCompletions(endpoint, apiKey, model, systemText, userText
   throw makeApiError(`${model} 不接受這個請求的參數`, 400);
 }
 
-async function callGemini(apiKey, model, systemText, userText) {
+async function callGemini(apiKey, model, systemText, userText, addUsage) {
   const parts = [{ text: `${systemText}\n\n${userText}` }];
   let maxOutputTokens = 32768;
   let responseMimeType = 'application/json';
@@ -303,6 +357,7 @@ async function callGemini(apiKey, model, systemText, userText) {
         keepDefaultThinking: true,
         responseMimeType
       });
+      addUsage(out.usage);
       if (out.truncated) throw makeApiError(`${model} 回覆被截斷（輸出長度達上限）`, 0);
       if (!out.text) throw makeApiError(`${model} 回覆內容為空${out.finishReason ? `（${out.finishReason}）` : ''}`, 0);
       return out.text;
@@ -329,15 +384,17 @@ async function callGemini(apiKey, model, systemText, userText) {
   throw makeApiError(`${model} 不接受這個請求的參數`, 400);
 }
 
-async function callEngine(engine, systemText, userText) {
+// addUsage({ inputTokens, outputTokens } | null) is called once for every reply that was actually generated,
+// including one that is then rejected as cut off: it was billed all the same.
+async function callEngine(engine, systemText, userText, addUsage) {
   const cfg = state.aiConfig || {};
   if (engine.provider === 'openai') {
-    return callChatCompletions('https://api.openai.com/v1/chat/completions', String(cfg.openaiKey || '').trim(), engine.model, systemText, userText);
+    return callChatCompletions('https://api.openai.com/v1/chat/completions', String(cfg.openaiKey || '').trim(), engine.model, systemText, userText, addUsage);
   }
   if (engine.provider === 'groq') {
-    return callChatCompletions('https://api.groq.com/openai/v1/chat/completions', String(cfg.groqKey || '').trim(), engine.model, systemText, userText);
+    return callChatCompletions('https://api.groq.com/openai/v1/chat/completions', String(cfg.groqKey || '').trim(), engine.model, systemText, userText, addUsage);
   }
-  return callGemini(String(cfg.geminiKey || '').trim(), engine.model, systemText, userText);
+  return callGemini(String(cfg.geminiKey || '').trim(), engine.model, systemText, userText, addUsage);
 }
 
 // A key whose plan has no allowance for this model at all (or no credit left): waiting will not help.
@@ -346,6 +403,11 @@ function isZeroQuotaError(err, engine) {
   const msg = String(err?.message || '');
   if (engine?.provider === 'gemini') return /limit:\s*0\b/i.test(msg);
   return /insufficient_quota|exceeded your current quota/i.test(msg);
+}
+
+// True when this key cannot use this model at all, so retrying the same model later is pointless
+export function isEngineUnavailableError(err, engine) {
+  return err?.status === 404 || (err?.status === 429 && isZeroQuotaError(err, engine));
 }
 
 export function describeTranslateError(err, engine) {
@@ -363,13 +425,91 @@ export function describeTranslateError(err, engine) {
 }
 
 // ==========================================
+// USAGE & COST ESTIMATE
+// ==========================================
+// The token counts come from the provider and are exact. The amount is an estimate: the API never returns a
+// price, so it is worked out from this table. US dollars per 1M tokens (input, output), standard pay-as-you-go
+// text rates as published on the OpenAI and Google pricing pages on 2026-11-25. A model that is not listed
+// gets token counts only. Rows with several entries change price on the given date.
+// free: Google offers a free tier for the model, inside which nothing is charged.
+const USD_TO_TWD_ESTIMATE = 32.5; // same rough rate as the call-cost display in gpt-live.js
+const MODEL_PRICES = {
+  'gpt-6.2-astra': [{ in: 8, out: 40 }],
+  'gpt-6.2-sol': [{ in: 2, out: 10 }],
+  'gpt-6.1-sol': [{ in: 2, out: 10 }],
+  'gpt-6-astra': [{ in: 10, out: 50 }],
+  'gpt-6-sol': [{ in: 2, out: 10 }],
+  'gpt-5.5': [{ in: 5, out: 30 }],
+  'gpt-5.4': [{ in: 2.5, out: 15 }],
+  'gpt-5.4-mini': [{ in: 0.75, out: 4.5 }],
+  'gpt-5.2': [{ in: 1.75, out: 14 }],
+  'gpt-5.1': [{ in: 1.25, out: 10 }],
+  'gpt-5': [{ in: 1.25, out: 10 }],
+  'gpt-5-mini': [{ in: 0.25, out: 2 }],
+  'gpt-4.1': [{ in: 2, out: 8 }],
+  'gpt-4.1-mini': [{ in: 0.4, out: 1.6 }],
+  'gpt-4o': [{ in: 2.5, out: 10 }],
+  'gpt-4o-mini': [{ in: 0.15, out: 0.6 }],
+  'gemini-4-carbon': [{ in: 2, out: 10 }, { from: '2026-12-01', in: 4, out: 20 }],
+  'gemini-4-neon': [{ in: 3, out: 15 }],
+  'gemini-4-argon': [{ in: 2, out: 10 }, { from: '2026-12-01', in: 4, out: 20 }],
+  'gemini-4-hydrogen': [{ in: 1.5, out: 7.5, free: true }],
+  'gemini-3.8-flash': [{ in: 0.75, out: 3.75, free: true }, { from: '2027-01-01', in: 1.5, out: 7.5, free: true }],
+  'gemini-3.6-flash': [{ in: 0.75, out: 3.75, free: true }, { from: '2027-01-01', in: 1.5, out: 7.5, free: true }],
+  'gemini-3.1-pro-preview': [{ in: 2, out: 12 }],
+  'gemini-3-flash-preview': [{ in: 0.5, out: 3, free: true }]
+};
+
+function priceFor(model, now) {
+  const rows = MODEL_PRICES[model];
+  if (!rows) return null;
+  const today = now.toISOString().slice(0, 10);
+  let current = rows[0];
+  rows.forEach((row) => { if (row.from && row.from <= today) current = row; });
+  return current;
+}
+
+// Shown beside each model in the list; '' when the model has no price on file
+export function describeModelPrice(model, now = new Date()) {
+  const price = priceFor(model, now);
+  if (!price) return '';
+  return `每百萬 token：輸入 $${price.in}／輸出 $${price.out}${price.free ? '｜有免費額度' : ''}`;
+}
+
+const hasReportedUsage = (usage) => Boolean(usage) && usage.requests > usage.unreportedRequests;
+
+// Returns { usd, twd, free } or null when the model has no price on file or nothing was reported
+export function estimateCost(model, usage, now = new Date()) {
+  const price = priceFor(model, now);
+  if (!price || !hasReportedUsage(usage)) return null;
+  const usd = (usage.inputTokens * price.in + usage.outputTokens * price.out) / 1e6;
+  return { usd, twd: usd * USD_TO_TWD_ESTIMATE, free: Boolean(price.free) };
+}
+
+const formatUsd = (usd) => `US$${usd.toFixed(usd >= 1 ? 2 : usd >= 0.01 ? 3 : 4)}`;
+const formatTwd = (twd) => `NT$${twd.toFixed(twd >= 10 ? 0 : twd >= 0.1 ? 1 : 2)}`;
+
+// One line for the result display; '' when the provider reported nothing at all
+export function describeUsage(engine, usage, now = new Date()) {
+  if (!hasReportedUsage(usage)) return '';
+  const count = (n) => Math.round(n).toLocaleString('en-US');
+  let text = `用量：輸入 ${count(usage.inputTokens)}、輸出 ${count(usage.outputTokens)} token（輸出含模型思考）`;
+  const cost = estimateCost(engine.model, usage, now);
+  text += cost
+    ? `｜依公開定價估算約 ${formatUsd(cost.usd)}（約 ${formatTwd(cost.twd)}）${cost.free ? '；若用的是 Gemini 免費額度則不扣款' : ''}`
+    : '｜沒有這個模型的單價資料，無法估算金額';
+  if (usage.unreportedRequests > 0) text += `｜另有 ${usage.unreportedRequests} 次請求沒有回報用量，實際會再多一些`;
+  return text;
+}
+
+// ==========================================
 // THE RUN
 // ==========================================
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // hooks.onProgress({ done, total, note })   hooks.shouldCancel() -> boolean   hooks.onBatchApplied()
 // hooks.callEngine is for tests only.
-// Resolves { total, translated, failedIds, cancelled, saveFailed, error } and never rejects:
+// Resolves { total, translated, failedIds, cancelled, saveFailed, error, usage } and never rejects:
 // whatever was translated before a failure is already applied and saved.
 export async function translatePack(pack, engine, scope, hooks = {}) {
   const onProgress = hooks.onProgress || (() => {});
@@ -380,14 +520,27 @@ export async function translatePack(pack, engine, scope, hooks = {}) {
 
   const all = (pack?.items || []).map((item, idx) => ({ item, id: idx + 1, en: cleanSentenceText(item.en) }));
   const targets = all.filter((row) => row.en && (scope === 'all' || !(row.item.zh && row.item.zh.trim())));
-  const result = { total: targets.length, translated: 0, failedIds: [], cancelled: false, saveFailed: false, error: null };
+  const result = {
+    total: targets.length, translated: 0, failedIds: [], cancelled: false, saveFailed: false, error: null,
+    // Tokens the provider reported for this run; unreportedRequests counts replies that came without figures
+    usage: { inputTokens: 0, outputTokens: 0, requests: 0, unreportedRequests: 0 }
+  };
+  const addUsage = (u) => {
+    result.usage.requests += 1;
+    if (u && Number.isFinite(u.inputTokens) && Number.isFinite(u.outputTokens)) {
+      result.usage.inputTokens += u.inputTokens;
+      result.usage.outputTokens += u.outputTokens;
+    } else {
+      result.usage.unreportedRequests += 1;
+    }
+  };
   const zhSource = `${PACK_TRANSLATE_ZH_SOURCE_PREFIX}${engine.model}`;
 
   const requestRows = async (rows, contextRows, label) => {
     const userText = buildUserPrompt(pack.name, contextRows, rows);
     for (let retry = 0; ; retry++) {
       try {
-        return await send(engine, SYSTEM_PROMPT, userText);
+        return await send(engine, SYSTEM_PROMPT, userText, addUsage);
       } catch (err) {
         const canWait = err?.status === 429 && !isZeroQuotaError(err, engine) && retry < MAX_RATE_LIMIT_RETRIES;
         if (!canWait) throw err;
@@ -456,4 +609,64 @@ export async function translatePack(pack, engine, scope, hooks = {}) {
     onProgress({ done: result.translated, total: result.total, note: `${label}：完成` });
   }
   return result;
+}
+
+// ==========================================
+// TRANSLATION RIGHT AFTER TRANSCRIPTION
+// ==========================================
+// Translates freshly transcribed lines before they become a pack. Nobody is picking a model here, so:
+// the engine is the one the user ran last time, otherwise the best one available (never tier 3 unasked);
+// and when this key turns out to have no access to that model at all, the next model of tier 1-2 is
+// tried and the switch is reported. Any other failure stops the run, as in the pack translation window.
+//
+// lines: [{ en, zh }]; zh and zhSource are filled in place.
+// hooks.onNote(text)   hooks.shouldCancel() -> boolean   hooks.onLinesUpdated()
+// hooks.listEngines / hooks.callEngine / hooks.wait are for tests only.
+// Resolves { engine, skipped: [engine], result, noEngineReason } and never rejects.
+export async function translateTranscriptLines(lines, packName, hooks = {}) {
+  const onNote = hooks.onNote || (() => {});
+  const onLinesUpdated = hooks.onLinesUpdated || (() => {});
+  const out = { engine: null, skipped: [], result: null, noEngineReason: '' };
+
+  onNote('正在查詢你的金鑰可用的翻譯模型…');
+  const { engines, problems } = await (hooks.listEngines || listPackTranslationEngines)().catch((err) => ({
+    engines: [],
+    problems: [`查詢模型清單失敗：${err?.message || '未知錯誤'}`]
+  }));
+  const first = pickAutoTranslationEngine(engines);
+  if (!first) {
+    out.noEngineReason = engines.length > 0
+      ? '目前只有 Groq 的開源模型可用，中文品質較弱'
+      : (problems.length > 0 ? problems.join('；') : '需要 OpenAI 或 Google Gemini 的 API 金鑰');
+    return out;
+  }
+
+  // Numbered like a saved pack, so a sentence that itself starts with a number is not mistaken for a line number
+  const draft = { name: packName, items: lines.map((line, i) => ({ en: `${i + 1}. ${line.en}`, zh: '' })) };
+  const copyBack = () => {
+    draft.items.forEach((item, i) => {
+      if (!item.zhSource) return;
+      // "||" separates English from Chinese in the subtitle box
+      lines[i].zh = item.zh.replace(/\s*\|\|\s*/g, ' ');
+      lines[i].zhSource = item.zhSource;
+    });
+    onLinesUpdated();
+  };
+
+  const candidates = [first, ...engines.filter((e) => e !== first && e.tier <= 2)];
+  for (let i = 0; i < candidates.length; i++) {
+    const engine = candidates[i];
+    out.engine = engine;
+    out.result = await translatePack(draft, engine, 'all', {
+      shouldCancel: hooks.shouldCancel,
+      callEngine: hooks.callEngine,
+      wait: hooks.wait,
+      onProgress: ({ done, total, note }) => onNote(`${engine.model} 翻譯中：${done} / ${total} 句｜${note}`),
+      onBatchApplied: copyBack
+    });
+    const unusable = out.result.error && out.result.translated === 0 && isEngineUnavailableError(out.result.error, engine);
+    if (!unusable || !candidates[i + 1]) break;
+    out.skipped.push(engine);
+  }
+  return out;
 }

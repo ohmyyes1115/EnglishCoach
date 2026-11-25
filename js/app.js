@@ -31,7 +31,9 @@ import {
   loadAiConfigSync,
   saveAiConfigSync,
   loadKeymapSync,
-  saveKeymapSync
+  saveKeymapSync,
+  safeStorage,
+  PACK_TRANSLATE_ZH_SOURCE_PREFIX
 } from './state-storage.js';
 
 import {
@@ -71,7 +73,11 @@ import {
   listPackTranslationEngines,
   translatePack,
   describeTranslateError,
-  cleanSentenceText
+  describeUsage,
+  cleanSentenceText,
+  rememberPreferredEngine,
+  findPreferredEngine,
+  translateTranscriptLines
 } from './pack-translate.js';
 
 import {
@@ -918,14 +924,17 @@ function bindAllEvents() {
     packTranslateEngines = engines;
     const listEl = packTranslateEl('packTranslateEngineList');
     const problemsEl = packTranslateEl('packTranslateProblems');
+    // Starts on the model the user ran last time; the best one stays labelled as the suggestion
+    const preselected = findPreferredEngine(engines) || engines[0];
     if (listEl) {
       listEl.innerHTML = engines.length > 0
         ? engines.map((e, i) => `
           <label class="flex items-center gap-2 p-2.5 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer">
-            <input type="radio" name="packTranslateEngine" value="${escapeHtml(e.id)}" class="accent-violet-400" ${i === 0 ? 'checked' : ''} />
+            <input type="radio" name="packTranslateEngine" value="${escapeHtml(e.id)}" class="accent-violet-400" ${e === preselected ? 'checked' : ''} />
             <span class="min-w-0 flex-1">
               <span class="font-mono font-bold text-white break-all">${escapeHtml(e.model)}</span>
               <span class="text-slate-400">｜${escapeHtml(e.providerLabel)}</span>
+              ${e.priceText ? `<span class="block text-[10px] text-slate-500 font-mono">${escapeHtml(e.priceText)}</span>` : ''}
             </span>
             <span class="px-1.5 py-0.5 rounded-lg text-[10px] font-bold shrink-0 ${e.tier === 1 ? 'bg-emerald-500/20 text-emerald-300' : e.tier === 2 ? 'bg-sky-500/20 text-sky-300' : 'bg-slate-800 text-slate-400'}">${escapeHtml(e.tierLabel)}${i === 0 ? '・建議' : ''}</span>
           </label>`).join('')
@@ -1015,6 +1024,8 @@ function bindAllEvents() {
     }
     setScreenWakeLockHold('pack-translate', false);
     packTranslateRunning = false;
+    // A model that worked is what the next run (and the translation after transcription) starts from
+    if (result.translated > 0 && !result.error) rememberPreferredEngine(engine);
 
     const lines = [];
     if (result.total === 0 && !result.error) {
@@ -1038,6 +1049,11 @@ function bindAllEvents() {
     }
     if (result.saveFailed) {
       lines.push('<div class="text-rose-300">⚠️ 翻譯結果未能寫入裝置，重新整理後會遺失（詳見診斷紀錄）。</div>');
+    }
+    const usageText = describeUsage(engine, result.usage);
+    if (usageText) {
+      lines.push(`<div class="text-slate-400 font-mono text-[11px]">🧾 ${escapeHtml(usageText)}</div>`);
+      if (typeof window.logDiag === 'function') window.logDiag('INFO', `整包翻譯（${engine.model}）${usageText}`);
     }
     if (resultEl) {
       resultEl.innerHTML = lines.join('');
@@ -1540,6 +1556,17 @@ function bindAllEvents() {
   safeOn('textareaLongSubs', 'input', renderVadChunkListUI);
   safeOn('chkKeepLineNumbers', 'change', renderVadChunkListUI);
   safeOn('btnAutoFindDbThreshold', 'click', autoFindMatchingDbThreshold);
+  // Translate right after transcription: on unless the user switched it off
+  const AUTO_TRANSLATE_AFTER_TRANSCRIBE_LS_KEY = 'car_shadowing_auto_translate_after_transcribe_v1';
+  const chkAutoTranslateAfterTranscribe = document.getElementById('chkAutoTranslateAfterTranscribe');
+  if (chkAutoTranslateAfterTranscribe) {
+    chkAutoTranslateAfterTranscribe.checked = safeStorage.getItem(AUTO_TRANSLATE_AFTER_TRANSCRIBE_LS_KEY) !== '0';
+    chkAutoTranslateAfterTranscribe.addEventListener('change', () => {
+      safeStorage.setItem(AUTO_TRANSLATE_AFTER_TRANSCRIBE_LS_KEY, chkAutoTranslateAfterTranscribe.checked ? '1' : '0');
+    });
+  }
+  let transcribeTranslateCancelRequested = false;
+
   safeOn('btnAiTranscribeLongAudio', 'click', async () => {
     if (!state.vadAudioBuffer) {
       showGiantHud('⚠️', '請先選擇長音檔', '請先在左側載入 .mp3 / .wav / .m4a 後再點聽打', 'border-amber-400/90');
@@ -1548,6 +1575,7 @@ function bindAllEvents() {
     const btn = document.getElementById('btnAiTranscribeLongAudio');
     const statusEl = document.getElementById('aiTranscribeStatus');
     const textarea = document.getElementById('textareaLongSubs');
+    const cancelTranslateBtn = document.getElementById('btnCancelTranscribeTranslate');
     const keepNumbers = document.getElementById('chkKeepLineNumbers')?.checked;
 
     if (btn) btn.disabled = true;
@@ -1555,19 +1583,24 @@ function bindAllEvents() {
       statusEl.classList.remove('hidden');
       statusEl.textContent = '⏳ 準備開始 AI 自動聽打...';
     }
+    // A locked phone suspends the page, and the transcription or translation with it
+    setScreenWakeLockHold('transcribe', true);
 
     try {
       const result = await transcribeLongAudioWithAi(state.vadAudioBuffer, (msg) => {
         if (statusEl) statusEl.textContent = msg;
       });
 
-      const formattedText = result.lines.map((item, idx) => {
-        const cleanEn = String(item.en || '').replace(/^\d+[\.\)、\-\s]+/, '').trim();
-        const enPart = keepNumbers ? `${idx + 1}. ${cleanEn}` : cleanEn;
-        return item.zh ? `${enPart} || ${item.zh}` : enPart;
-      }).join('\n');
-
-      if (textarea) textarea.value = formattedText;
+      state.vadTranslatedZh = null;
+      const lines = result.lines.map((item) => ({ en: String(item.en || '').trim(), zh: String(item.zh || '').trim() }));
+      const writeLinesToTextarea = () => {
+        if (!textarea) return;
+        textarea.value = lines.map((item, idx) => {
+          const enPart = keepNumbers ? `${idx + 1}. ${item.en}` : item.en;
+          return item.zh ? `${enPart} || ${item.zh}` : enPart;
+        }).join('\n');
+      };
+      writeLinesToTextarea();
 
       const metaParts = [
         result.trimmedHeadSec > 0.2 ? `已裁切開頭 ${result.trimmedHeadSec.toFixed(1)}s 靜音` : '無開頭靜音',
@@ -1576,20 +1609,80 @@ function bindAllEvents() {
       ];
       const metaSummary = metaParts.join('｜');
 
+      const transcribeDoneText = `✅ ${result.modelUsed} 聽打完成：共 ${result.lines.length} 句（${metaSummary}）`;
+      if (statusEl) statusEl.textContent = transcribeDoneText;
       if (result.segments && result.segments.length > 0) {
         state.vadSegments = result.segments;
         renderVadChunkListUI();
         drawVadWaveformCanvas();
-        if (statusEl) {
-          statusEl.textContent = `✅ ${result.modelUsed} 聽打完成：共 ${result.lines.length} 句（${metaSummary}）`;
-        }
         showGiantHud('🎙️', `聽打完成 ${result.lines.length} 句`, `${result.modelUsed}｜已套用精準時間軸`, 'border-emerald-400/90');
       } else {
         autoFindMatchingDbThreshold();
-        if (statusEl) {
-          statusEl.textContent = `✅ ${result.modelUsed} 雙語聽打完成：共 ${result.lines.length} 句（${metaSummary}）`;
+        showGiantHud('🎙️', `聽打完成 ${result.lines.length} 句`, '已寫入英文字幕並對齊切點', 'border-emerald-400/90');
+      }
+
+      // Second pass: Chinese from the dedicated translation engine, on the finished English transcript
+      if (document.getElementById('chkAutoTranslateAfterTranscribe')?.checked) {
+        const setTranslateNote = (text) => {
+          if (statusEl) statusEl.textContent = `${transcribeDoneText}\n${text}`;
+        };
+        transcribeTranslateCancelRequested = false;
+        cancelTranslateBtn?.classList.remove('hidden');
+        // The box is rewritten batch by batch; typing into it meanwhile would be overwritten
+        if (textarea) textarea.readOnly = true;
+        let outcome;
+        try {
+          outcome = await translateTranscriptLines(lines, document.getElementById('inputLongPackName')?.value || '', {
+            onNote: (text) => setTranslateNote(`🌐 ${transcribeTranslateCancelRequested ? '中止中…（等目前這一批回來就停）' : text}`),
+            shouldCancel: () => transcribeTranslateCancelRequested,
+            onLinesUpdated: writeLinesToTextarea
+          });
+        } finally {
+          if (textarea) textarea.readOnly = false;
+          cancelTranslateBtn?.classList.add('hidden');
         }
-        showGiantHud('🎙️', `雙語聽打完成 ${result.lines.length} 句`, '已自動寫入英中字幕並對齊切點', 'border-emerald-400/90');
+
+        const translatedLines = lines.filter((line) => line.zh && line.zhSource);
+        if (translatedLines.length > 0) {
+          state.vadTranslatedZh = {
+            zhSource: `${PACK_TRANSLATE_ZH_SOURCE_PREFIX}${outcome.engine.model}`,
+            pairs: new Set(translatedLines.map((line) => `${line.en}\n${line.zh}`))
+          };
+        }
+        writeLinesToTextarea();
+        renderVadChunkListUI();
+
+        const laterHint = '存成教材後，可到「句子清單 → 整包翻譯」處理。';
+        if (!outcome.result) {
+          setTranslateNote(`🌐 沒有自動翻譯中文：${outcome.noEngineReason}。${laterHint}`);
+        } else {
+          const { engine, skipped, result: tr } = outcome;
+          const notes = [];
+          if (skipped.length > 0) {
+            notes.push(`ℹ️ 這把金鑰無法使用 ${skipped.map((e) => e.model).join('、')}，已改用 ${engine.model}（${engine.tierLabel}）`);
+          }
+          notes.push(`🌐 已用 ${engine.model} 翻譯 ${tr.translated} / ${tr.total} 句中文`);
+          if (tr.failedIds.length > 0) notes.push(`⚠️ 第 ${tr.failedIds.join('、')} 句沒有取得合格的翻譯`);
+          if (tr.cancelled) notes.push('已中止翻譯，完成的部分已保留');
+          if (tr.error) {
+            notes.push(`❌ 翻譯中斷：${describeTranslateError(tr.error, engine)}`);
+            notes.push(`英文字幕不受影響。${laterHint}`);
+            if (typeof window.logDiag === 'function') {
+              window.logDiag('WARN', `聽打後翻譯中斷（${engine.model}，完成 ${tr.translated}/${tr.total}）：${tr.error?.message || tr.error}`);
+            }
+          }
+          const usageText = describeUsage(engine, tr.usage);
+          if (usageText) {
+            notes.push(`🧾 ${usageText}`);
+            if (typeof window.logDiag === 'function') window.logDiag('INFO', `聽打後翻譯（${engine.model}）${usageText}`);
+          }
+          setTranslateNote(notes.join('\n'));
+          if (tr.error) {
+            showGiantHud('⚠️', '中文翻譯沒有完成', `已翻譯 ${tr.translated} / ${tr.total} 句，英文字幕已完成`, 'border-amber-400/90');
+          } else if (tr.translated > 0) {
+            showGiantHud('🌐', `中文翻譯完成 ${tr.translated} 句`, engine.model, 'border-emerald-400/90');
+          }
+        }
       }
     } catch (err) {
       if (err && err.code === 'NO_API_KEY') {
@@ -1603,8 +1696,12 @@ function bindAllEvents() {
         showGiantHud('❌', '自動聽打失敗', err?.message || '請確認網路或金鑰額度', 'border-rose-400/90');
       }
     } finally {
+      setScreenWakeLockHold('transcribe', false);
       if (btn) btn.disabled = false;
     }
+  });
+  safeOn('btnCancelTranscribeTranslate', 'click', () => {
+    transcribeTranslateCancelRequested = true;
   });
   safeOn('btnLoadSimulatedGptAudio', 'click', generateSimulatedGpt10SentenceLongAudio);
 
