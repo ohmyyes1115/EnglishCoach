@@ -81,7 +81,8 @@ import {
 
 import {
   initGptLiveModule,
-  openGptLiveModal
+  openGptLiveModal,
+  openGptLiveAndExplainCurrentSentence
 } from './gpt-live.js';
 
 // ==========================================
@@ -224,9 +225,7 @@ function renderMainStage() {
   document.getElementById('statSpeedText').textContent = `${speed.toFixed(2)}x`;
   document.getElementById('btnSpeedLabel').textContent = `${speed.toFixed(2)}x 語速`;
 
-  document.getElementById('badgeAudioSource').textContent = state.currentPack.audioModeLabel || 'WAV 獨立音檔';
   const dur = Number(item.durationSec) || 2.8;
-  document.getElementById('badgeClipDuration').textContent = `${dur.toFixed(1)}s`;
   document.getElementById('timeTotal').textContent = formatTimeSec(dur);
 
   const demoBtn = document.getElementById('btnDemoVoiceMode');
@@ -1310,6 +1309,10 @@ function bindAllEvents() {
   safeOn('btnOpenGptLive', 'click', () => {
     blurBtKeyCatcher();
     openGptLiveModal();
+  });
+  safeOn('btnGptLiveExplainSentence', 'click', () => {
+    blurBtKeyCatcher();
+    openGptLiveAndExplainCurrentSentence();
   });
 
   // Modal: Import & Smart VAD Splitter Workbench (Tab A + Tab B)

@@ -186,8 +186,9 @@
       <!-- Non-Overlapping Top Toolbar -->
       <div class="w-full flex flex-wrap items-center justify-between gap-1.5 pb-2.5 border-b border-slate-800/80 text-xs font-mono text-slate-400 shrink-0">
         <div class="flex items-center gap-1.5 flex-wrap">
-          <span id="badgeAudioSource" class="px-2.5 py-1 rounded-full bg-slate-800 border border-slate-700 text-sky-300 font-sans font-semibold">WAV 獨立音檔</span>
-          <span id="badgeClipDuration" class="px-2 py-1 rounded-full bg-slate-800/70 text-slate-300">3.2s</span>
+          <button id="btnGptLiveExplainSentence" type="button" title="一鍵開啟 GPT-Live 並自動詢問目前句子「什麼意思」（立即語音講解，可直接開口追問）" class="px-2.5 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/60 text-cyan-200 font-sans font-extrabold transition flex items-center gap-1 shadow-sm">
+            <span>🗣️ Live 問這句</span>
+          </button>
           <button id="badgeAiParsed" type="button" title="此句已有 AI 解析快取，點擊直接展開 (0ms 免消耗額度)" class="hidden px-2.5 py-1 rounded-full bg-violet-500/20 hover:bg-violet-500/30 border border-violet-400/60 text-violet-200 font-sans font-bold transition">
             ✨ 已解析
           </button>

@@ -1,5 +1,6 @@
 // Layer 2: OpenAI GPT-Live Full-Duplex Voice Session (WebRTC + oai-events DataChannel)
-// Includes real-time Active/Standby cost tracking, call settlement summary & local balance ledger
+// Includes real-time Active/Standby cost tracking, call settlement summary, local balance ledger
+// & one-click sentence explanation auto-start
 
 import {
   state,
@@ -34,6 +35,11 @@ const liveState = {
   sessionId: '',
   startedAtMs: 0,
   timerId: null,
+  // Auto-prompt & wake policy state
+  usesSpeechWakePolicy: false,
+  pendingAutoPromptText: '',
+  pendingAutoCommentary: '',
+  pendingAutoPromptSent: false,
   // Real-time billing trackers
   hasEstablishedWebRtc: false,
   sessionSettled: false,
@@ -215,7 +221,6 @@ function computeLiveBillingSnapshot(nowMs = Date.now()) {
   let activeSec = Number.isFinite(liveState.serverActiveSec) ? liveState.serverActiveSec : localActiveSec;
   const standbySec = Number.isFinite(liveState.serverStandbySec) ? liveState.serverStandbySec : localStandbySec;
 
-  // If server reported total active seconds without breakdown and no standby occurred, calibrate to server
   if (
     Number.isFinite(liveState.reportedSeconds) &&
     !Number.isFinite(liveState.serverActiveSec) &&
@@ -224,7 +229,6 @@ function computeLiveBillingSnapshot(nowMs = Date.now()) {
     activeSec = Math.max(activeSec, liveState.reportedSeconds);
   }
 
-  // WebRTC sessions pre-bill 15s of active audio duration (credited against usage, not added on top)
   const billableActiveSec = liveState.hasEstablishedWebRtc
     ? Math.max(MIN_INITIAL_ACTIVE_SEC, activeSec)
     : activeSec;
@@ -287,11 +291,22 @@ function getCurrentSentenceSnapshot() {
   };
 }
 
-function buildEffectiveInstructions(cfg) {
+function buildExplainCommentary(snap, userPrompt = '什麼意思') {
+  if (snap && snap.en) {
+    return `The user asks "${userPrompt}" about this English sentence (${snap.idxLabel}): "${snap.en}". Please immediately explain aloud in concise, natural Traditional Chinese (Taiwan): what the sentence means, 1-2 key words/phrases, and its tone or workplace nuance. Then briefly ask if they have any follow-up questions.`;
+  }
+  return `User asks: "${userPrompt}". Please respond aloud concisely in Traditional Chinese (Taiwan).`;
+}
+
+function buildEffectiveInstructions(cfg, opts = {}) {
   let text = cfg.instructions || DEFAULT_LIVE_INSTRUCTIONS;
-  if (cfg.useCurrentSentence) {
-    const snap = getCurrentSentenceSnapshot();
-    if (snap && snap.en) {
+  const includeSentence = Boolean(opts.forceIncludeSentence || cfg.useCurrentSentence);
+  const snap = includeSentence ? getCurrentSentenceSnapshot() : null;
+
+  if (snap && snap.en) {
+    if (opts.autoPrompt) {
+      text += `\nThe learner just tapped a quick-explain button asking "${opts.autoPrompt}" for sentence (${snap.idxLabel}): "${snap.en}"${snap.zh ? ` (Reference translation: ${snap.zh})` : ''}. Speak immediately in natural, concise Traditional Chinese (Taiwan) to explain its meaning, 1-2 key phrases, and usage tone, then invite follow-up questions.`;
+    } else {
       text += `\nCurrent practice sentence (${snap.idxLabel}): "${snap.en}"${snap.zh ? ` (Meaning: ${snap.zh})` : ''}. Start by greeting briefly and inviting the learner to practice or discuss this sentence.`;
     }
   }
@@ -338,7 +353,6 @@ function renderBalanceLedgerUI() {
       balEl.textContent = '未設定（可點設餘額）';
       balEl.className = 'font-mono text-xs font-bold text-slate-400';
     } else {
-      // Subtract current in-flight call cost for live preview without mutating saved ledger yet
       const liveDelta = (liveState.hasEstablishedWebRtc && !liveState.sessionSettled)
         ? computeLiveBillingSnapshot().costUsd
         : 0;
@@ -445,7 +459,6 @@ function updateLiveStatusUI() {
     }
   }
 
-  // Lock session startup settings while connected
   ['selectGptLiveModel', 'selectGptLiveVoice', 'selectGptLiveStandby', 'inputGptLiveEndpoint'].forEach((id) => {
     const el = document.getElementById(id);
     if (el) el.disabled = liveState.status !== 'idle';
@@ -644,6 +657,19 @@ function setAudioSessionTypeSafe(type) {
   } catch (e) {}
 }
 
+function flushPendingAutoPrompt() {
+  if (!liveState.pendingAutoPromptText || liveState.pendingAutoPromptSent) return;
+  if (!liveState.dc || liveState.dc.readyState !== 'open') return;
+  if (liveState.status === 'idle' || liveState.status === 'closing') return;
+
+  liveState.pendingAutoPromptSent = true;
+  const displayText = liveState.pendingAutoPromptText;
+  const commentary = liveState.pendingAutoCommentary;
+  liveState.pendingAutoPromptText = '';
+  liveState.pendingAutoCommentary = '';
+  sendMidCallTextPrompt(displayText, commentary);
+}
+
 function cleanupLiveResources(settleReason = '') {
   if (settleReason && liveState.hasEstablishedWebRtc && !liveState.sessionSettled) {
     finalizeLiveSessionBilling(settleReason);
@@ -653,6 +679,7 @@ function cleanupLiveResources(settleReason = '') {
     liveState.timerId = null;
   }
   if (liveState.dc) {
+    try { liveState.dc.onopen = null; } catch (e) {}
     try { liveState.dc.onmessage = null; } catch (e) {}
     try { liveState.dc.onclose = null; } catch (e) {}
     try { liveState.dc.close(); } catch (e) {}
@@ -679,6 +706,10 @@ function cleanupLiveResources(settleReason = '') {
   liveState.isMuted = false;
   liveState.sessionId = '';
   liveState.startedAtMs = 0;
+  liveState.usesSpeechWakePolicy = false;
+  liveState.pendingAutoPromptText = '';
+  liveState.pendingAutoCommentary = '';
+  liveState.pendingAutoPromptSent = false;
   resetBillingTrackers();
   liveState.status = 'idle';
   liveState.closeResolve = null;
@@ -694,7 +725,7 @@ function handleServerEvent(ev) {
     const cfg = readConfigFromUI();
     if (!liveState.startedAtMs) liveState.startedAtMs = Date.now();
     if (!liveState.currentPhase) {
-      const initialPhase = cfg.standbySec > 0 ? 'standby' : 'active';
+      const initialPhase = liveState.usesSpeechWakePolicy ? 'standby' : 'active';
       liveState.status = initialPhase;
       switchBillingPhase(initialPhase);
     }
@@ -702,9 +733,10 @@ function handleServerEvent(ev) {
     const modelLabel = ev.session?.model || cfg.model;
     const voiceLabel = ev.session?.audio?.output?.voice || cfg.voice;
     appendSystemTranscriptNote(
-      `✅ 已連上 ${modelLabel}（語音：${voiceLabel}）${cfg.standbySec > 0 ? `｜已開啟 ${cfg.standbySec} 秒靜音 Standby` : ''}，直接開口說話即可`,
+      `✅ 已連上 ${modelLabel}（語音：${voiceLabel}）${liveState.usesSpeechWakePolicy ? `｜已開啟 ${cfg.standbySec} 秒靜音 Standby` : ''}，直接開口說話即可`,
       'emerald'
     );
+    flushPendingAutoPrompt();
     return;
   }
 
@@ -776,9 +808,13 @@ function handleServerEvent(ev) {
   }
 }
 
-export async function startGptLiveSession() {
+export async function startGptLiveSession(options = {}) {
   if (liveState.status !== 'idle') return;
   showLiveAlert('');
+
+  const autoPrompt = String(options.autoPrompt || '').trim();
+  const forceIncludeSentence = Boolean(options.forceIncludeSentence);
+  const immediateStart = Boolean(options.immediateStart);
 
   const cfg = saveGptLiveConfigFromUI();
   const apiKey = String(state.aiConfig?.openaiKey || '').trim();
@@ -799,6 +835,11 @@ export async function startGptLiveSession() {
   }
 
   resetBillingTrackers();
+  liveState.usesSpeechWakePolicy = !immediateStart && cfg.standbySec >= 5 && cfg.standbySec <= 60;
+  liveState.pendingAutoPromptText = autoPrompt;
+  liveState.pendingAutoCommentary = autoPrompt ? buildExplainCommentary(getCurrentSentenceSnapshot(), autoPrompt) : '';
+  liveState.pendingAutoPromptSent = false;
+
   liveState.status = 'connecting';
   liveState.isMuted = false;
   updateLiveStatusUI();
@@ -842,6 +883,14 @@ export async function startGptLiveSession() {
 
     const dc = pc.createDataChannel('oai-events');
     liveState.dc = dc;
+    dc.onopen = () => {
+      if (liveState.pendingAutoPromptText && !liveState.pendingAutoPromptSent) {
+        // Give session.started a brief window to arrive first; send right after if WebRTC skips it
+        setTimeout(() => {
+          flushPendingAutoPrompt();
+        }, 250);
+      }
+    };
     dc.onmessage = (event) => {
       try {
         const parsed = JSON.parse(event.data);
@@ -859,39 +908,62 @@ export async function startGptLiveSession() {
     await pc.setLocalDescription(offer);
     await waitForIceGatheringComplete(pc, 2000);
 
-    const sessionConfig = {
-      model: cfg.model,
-      instructions: buildEffectiveInstructions(cfg),
-      audio: {
-        output: {
-          voice: cfg.voice
+    const buildSessionConfig = (includeIdleTimeout) => {
+      const sc = {
+        model: cfg.model,
+        instructions: buildEffectiveInstructions(cfg, { forceIncludeSentence, autoPrompt }),
+        audio: {
+          output: {
+            voice: cfg.voice
+          }
+        }
+      };
+      if (cfg.standbySec >= 5 && cfg.standbySec <= 60) {
+        if (!immediateStart) {
+          sc.wake_policy = { type: 'speech', vad_threshold: 0.5 };
+          sc.idle_timeout_s = cfg.standbySec;
+        } else if (includeIdleTimeout) {
+          // One-click explain starts active immediately without waiting for caller speech,
+          // while still letting idle_timeout_s drop into standby after the conversation pauses
+          sc.idle_timeout_s = cfg.standbySec;
         }
       }
+      return sc;
     };
-    if (cfg.standbySec >= 5 && cfg.standbySec <= 60) {
-      sessionConfig.wake_policy = { type: 'speech', vad_threshold: 0.5 };
-      sessionConfig.idle_timeout_s = cfg.standbySec;
-    }
 
     const headers = { 'Content-Type': 'application/json' };
     if (apiKey) {
       headers.Authorization = `Bearer ${apiKey}`;
     }
 
-    // 4. Exchange SDP offer for SDP answer via POST /v1/live/sessions (or custom proxy URL)
-    const res = await fetch(cfg.endpoint, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        session: sessionConfig,
-        transport: {
-          type: 'webrtc',
-          sdp: pc.localDescription.sdp
-        }
-      })
-    });
+    const postOffer = async (includeIdleTimeout) => {
+      const res = await fetch(cfg.endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          session: buildSessionConfig(includeIdleTimeout),
+          transport: {
+            type: 'webrtc',
+            sdp: pc.localDescription.sdp
+          }
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      return { res, data };
+    };
 
-    const data = await res.json().catch(() => ({}));
+    // 4. Exchange SDP offer for SDP answer via POST /v1/live/sessions (or custom proxy URL)
+    let { res, data } = await postOffer(true);
+    if (
+      !res.ok &&
+      res.status === 400 &&
+      immediateStart &&
+      cfg.standbySec >= 5 &&
+      /idle_timeout|wake_policy/i.test(String(data?.error?.message || data?.message || ''))
+    ) {
+      ({ res, data } = await postOffer(false));
+    }
+
     if (!res.ok) {
       const apiMsg = data?.error?.message || data?.message || `HTTP ${res.status}`;
       throw new Error(apiMsg);
@@ -906,7 +978,7 @@ export async function startGptLiveSession() {
     await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
 
     const nowMs = Date.now();
-    const initialPhase = cfg.standbySec > 0 ? 'standby' : 'active';
+    const initialPhase = liveState.usesSpeechWakePolicy ? 'standby' : 'active';
     liveState.hasEstablishedWebRtc = true;
     liveState.startedAtMs = nowMs;
     liveState.status = initialPhase;
@@ -970,23 +1042,25 @@ function toggleGptLiveMute() {
   updateLiveStatusUI();
 }
 
-function sendMidCallTextPrompt(rawText) {
+function sendMidCallTextPrompt(rawText, customCommentary = '') {
   const text = String(rawText || '').trim();
-  if (!text) return;
-  if (liveState.status !== 'active' && liveState.status !== 'standby') return;
+  if (!text) return false;
+  if (liveState.status === 'idle' || liveState.status === 'closing') return false;
 
+  const content = customCommentary || `User text input during conversation: ${text}. Please respond naturally in voice.`;
   const ok = sendDataChannelEvent({
     type: 'session.commentary.append',
     delegation_id: null,
-    content: `User text input during conversation: ${text}. Please respond naturally in voice.`
+    content
   });
   if (ok) {
     appendTranscriptDelta('user', `[文字] ${text}`);
     liveState.lastSpeaker = '';
     liveState.lastBubbleEl = null;
-  } else {
-    showLiveAlert('⚠️ 事件通道尚未就緒，請稍候再送出文字。');
+    return true;
   }
+  showLiveAlert('⚠️ 事件通道尚未就緒，請稍候再送出文字。');
+  return false;
 }
 
 // ==========================================
@@ -1050,6 +1124,26 @@ export function openGptLiveModal() {
   modal.classList.remove('hidden');
 }
 
+export function openGptLiveAndExplainCurrentSentence() {
+  const snap = getCurrentSentenceSnapshot();
+  openGptLiveModal();
+  if (!snap || !snap.en) {
+    showLiveAlert('⚠️ 目前沒有可解說的句子，請先載入教材。');
+    return;
+  }
+  if (liveState.status === 'active' || liveState.status === 'standby') {
+    sendMidCallTextPrompt('什麼意思', buildExplainCommentary(snap, '什麼意思'));
+    return;
+  }
+  if (liveState.status === 'idle') {
+    startGptLiveSession({
+      autoPrompt: '什麼意思',
+      forceIncludeSentence: true,
+      immediateStart: true
+    });
+  }
+}
+
 export async function closeGptLiveModal() {
   const modal = document.getElementById('modalGptLive');
   if (liveState.status !== 'idle') {
@@ -1088,7 +1182,6 @@ export function initGptLiveModule(cbs = {}) {
   safeOn('btnGptLiveMute', 'click', toggleGptLiveMute);
   safeOn('btnGptLiveClearTranscript', 'click', clearTranscriptUI);
 
-  // Balance ledger editor bindings
   safeOn('btnGptLiveToggleBalanceEditor', 'click', () => {
     const editor = document.getElementById('gptLiveBalanceEditor');
     if (editor && !editor.classList.contains('hidden')) closeBalanceEditor();
@@ -1142,7 +1235,6 @@ export function initGptLiveModule(cbs = {}) {
     }
   });
 
-  // Persist setting changes automatically
   [
     'selectGptLiveModel',
     'selectGptLiveVoice',
@@ -1154,7 +1246,6 @@ export function initGptLiveModule(cbs = {}) {
     safeOn(id, 'change', saveGptLiveConfigFromUI);
   });
 
-  // Ensure active WebRTC session is closed & settled cleanly if page/PWA is closed
   window.addEventListener('beforeunload', () => {
     if (liveState.hasEstablishedWebRtc && !liveState.sessionSettled) {
       finalizeLiveSessionBilling('page_unload');
