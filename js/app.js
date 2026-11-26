@@ -84,6 +84,8 @@ import {
   askChosenTextModel
 } from './pack-translate.js';
 
+import { describeMonthSpendLine, describeMonthSpendDetail } from './cost.js';
+
 import {
   registerAiCallbacks,
   updateAiHeaderBadgeUI,
@@ -301,6 +303,12 @@ function openAiSettingsModal() {
   const keylessBox = document.getElementById('chkAiLookupKeyless');
   if (keylessBox) keylessBox.checked = Boolean(cfg.lookupKeyless);
   refreshAiModelPickers();
+  const spendBox = document.getElementById('aiMonthSpendBox');
+  if (spendBox) {
+    spendBox.innerHTML = describeMonthSpendDetail()
+      .map((line, i) => `<div class="${i === 0 ? 'font-bold text-white' : ''}">${escapeHtml(line)}</div>`)
+      .join('');
+  }
   document.getElementById('inputGeminiApiKey').value = cfg.geminiKey || '';
   document.getElementById('inputGroqApiKey').value = cfg.groqKey || '';
   document.getElementById('inputOpenAiApiKey').value = cfg.openaiKey || '';
@@ -469,6 +477,7 @@ function buildDiagReportText() {
     `瀏覽器：${navigator.userAgent}`,
     `開啟方式：${standalone ? '主畫面 App (standalone)' : '瀏覽器分頁'}`,
     `AI 金鑰：${['gemini', 'groq', 'openai'].filter((p) => state.aiConfig?.[`${p}Key`]).join('、') || '無'}｜翻譯與查詢模型：${getRememberedModelName() || '未選（自動）'}${state.aiConfig?.lookupKeyless ? '｜查詢不使用金鑰' : ''}`,
+    `AI 花費：${describeMonthSpendLine() || '本月沒有記錄'}`,
     `目前教材：${pack ? `${pack.items?.length || 0} 句，第 ${state.currentIndex + 1} 句` : '無'}`,
     `儲存：${describeStorageProtection()}`,
     `螢幕恆亮：${describeScreenWakeLock()}`,
@@ -1194,6 +1203,8 @@ function bindAllEvents() {
     if (usageText) {
       lines.push(`<div class="text-slate-400 font-mono text-[11px]">🧾 ${escapeHtml(usageText)}</div>`);
       if (typeof window.logDiag === 'function') window.logDiag('INFO', `整包翻譯（${engine.model}）${usageText}`);
+      const monthText = describeMonthSpendLine();
+      if (monthText) lines.push(`<div class="text-slate-400 font-mono text-[11px]">📊 ${escapeHtml(monthText)}</div>`);
     }
     if (resultEl) {
       resultEl.innerHTML = lines.join('');
@@ -1752,8 +1763,14 @@ function bindAllEvents() {
       ];
       const metaSummary = metaParts.join('｜');
 
-      const transcribeDoneText = `✅ ${result.modelUsed} 聽打完成：共 ${result.lines.length} 句（${metaSummary}）`;
-      if (statusEl) statusEl.textContent = transcribeDoneText;
+      const transcribeDoneText = `✅ ${result.modelUsed} 聽打完成：共 ${result.lines.length} 句（${metaSummary}）${result.usageText ? `\n🧾 ${result.usageText}` : ''}`;
+      if (result.usageText && typeof window.logDiag === 'function') window.logDiag('INFO', `聽打（${result.modelUsed}）${result.usageText}`);
+      // Read when shown, so a translation pass that follows is already counted
+      const monthSpendLine = () => {
+        const text = describeMonthSpendLine();
+        return text ? `\n📊 ${text}` : '';
+      };
+      if (statusEl) statusEl.textContent = transcribeDoneText + monthSpendLine();
       if (result.segments && result.segments.length > 0) {
         state.vadSegments = result.segments;
         renderVadChunkListUI();
@@ -1766,8 +1783,8 @@ function bindAllEvents() {
 
       // Second pass: Chinese from the dedicated translation engine, on the finished English transcript
       if (document.getElementById('chkAutoTranslateAfterTranscribe')?.checked) {
-        const setTranslateNote = (text) => {
-          if (statusEl) statusEl.textContent = `${transcribeDoneText}\n${text}`;
+        const setTranslateNote = (text, isFinal = false) => {
+          if (statusEl) statusEl.textContent = `${transcribeDoneText}\n${text}${isFinal ? monthSpendLine() : ''}`;
         };
         transcribeTranslateCancelRequested = false;
         cancelTranslateBtn?.classList.remove('hidden');
@@ -1797,7 +1814,7 @@ function bindAllEvents() {
 
         const laterHint = '存成教材後，可到「句子清單 → 整包翻譯」處理。';
         if (!outcome.result) {
-          setTranslateNote(`🌐 沒有自動翻譯中文：${outcome.noEngineReason}。${laterHint}`);
+          setTranslateNote(`🌐 沒有自動翻譯中文：${outcome.noEngineReason}。${laterHint}`, true);
         } else {
           const { engine, skipped, result: tr } = outcome;
           const notes = [];
@@ -1819,7 +1836,7 @@ function bindAllEvents() {
             notes.push(`🧾 ${usageText}`);
             if (typeof window.logDiag === 'function') window.logDiag('INFO', `聽打後翻譯（${engine.model}）${usageText}`);
           }
-          setTranslateNote(notes.join('\n'));
+          setTranslateNote(notes.join('\n'), true);
           if (tr.error) {
             showGiantHud('⚠️', '中文翻譯沒有完成', `已翻譯 ${tr.translated} / ${tr.total} 句，英文字幕已完成`, 'border-amber-400/90');
           } else if (tr.translated > 0) {

@@ -18,6 +18,17 @@ import {
   rankGroqChatModels
 } from './ai-lookup.js';
 
+import {
+  describeModelPrice,
+  estimateCost,
+  describeUsage,
+  describeSmallCost,
+  recordSpend
+} from './cost.js';
+
+// Prices and the usage line live in cost.js; re-exported for the callers that already import them from here
+export { describeModelPrice, estimateCost, describeUsage };
+
 const BATCH_SIZE = 30;
 const CONTEXT_SENTENCES = 4;
 const MAX_RATE_LIMIT_RETRIES = 2;
@@ -447,11 +458,21 @@ function isModelGoneError(err) {
   return err?.status === 404 || /model_not_found|does not exist|is not found|not found for api version/i.test(String(err?.message || ''));
 }
 
-// Resolves { text, modelUsed }. A failure carries err.engineLabel (the provider that was asked).
+// Resolves { text, modelUsed, costNote }. A failure carries err.engineLabel (the provider that was asked).
 export async function askChosenTextModel(systemText, userText) {
   const cfg = state.aiConfig || {};
   const options = { plainText: true, maxOutputTokens: 8000 };
-  const ask = (engine) => callEngine(engine, systemText, userText, () => {}, options);
+  const usage = { inputTokens: 0, outputTokens: 0, requests: 0, unreportedRequests: 0 };
+  const addUsage = (u) => {
+    usage.requests += 1;
+    if (u && Number.isFinite(u.inputTokens) && Number.isFinite(u.outputTokens)) {
+      usage.inputTokens += u.inputTokens;
+      usage.outputTokens += u.outputTokens;
+    } else {
+      usage.unreportedRequests += 1;
+    }
+  };
+  const ask = (engine) => callEngine(engine, systemText, userText, addUsage, options);
   const pref = readRememberedEngine();
   const direct = pref && typeof pref.model === 'string' && pref.model && String(cfg[`${pref.provider}Key`] || '').trim()
     ? { id: `${pref.provider}:${pref.model}`, provider: pref.provider, model: pref.model, tier: pref.tier }
@@ -475,10 +496,14 @@ export async function askChosenTextModel(systemText, userText) {
       text = await ask(engine);
     }
     if (!String(text || '').trim()) throw new Error(`${engine.model} 回覆內容為空`);
-    return { text, modelUsed: engine.model };
+    // costNote: "約 NT$0.12" for the badge beside the model name; '' when there is no price on file
+    return { text, modelUsed: engine.model, costNote: describeSmallCost(estimateCost(engine.model, usage)) };
   } catch (err) {
     if (err && typeof err === 'object') err.engineLabel = PROVIDER_LABELS[engine?.provider] || 'AI';
     throw err;
+  } finally {
+    // A reply that was generated is billed even when it is then rejected, so failures are recorded too
+    if (usage.requests > 0 && engine) recordSpend('lookup', estimateCost(engine.model, usage));
   }
 }
 
@@ -507,84 +532,6 @@ export function describeTranslateError(err, engine) {
   if (err?.status === 429) return `${engine.model} 的速率或額度已達上限，請稍後再試（${msg}）`;
   if (err?.status === 404) return `${engine.model} 目前無法使用（${msg}）`;
   return `${engine.model} 呼叫失敗：${msg}`;
-}
-
-// ==========================================
-// USAGE & COST ESTIMATE
-// ==========================================
-// The token counts come from the provider and are exact. The amount is an estimate: the API never returns a
-// price, so it is worked out from this table. US dollars per 1M tokens (input, output), standard pay-as-you-go
-// text rates as published on the OpenAI and Google pricing pages on 2026-11-25. A model that is not listed
-// gets token counts only. Rows with several entries change price on the given date.
-// free: Google offers a free tier for the model, inside which nothing is charged.
-const USD_TO_TWD_ESTIMATE = 32.5; // same rough rate as the call-cost display in gpt-live.js
-const MODEL_PRICES = {
-  'gpt-6.2-astra': [{ in: 8, out: 40 }],
-  'gpt-6.2-sol': [{ in: 2, out: 10 }],
-  'gpt-6.1-sol': [{ in: 2, out: 10 }],
-  'gpt-6-astra': [{ in: 10, out: 50 }],
-  'gpt-6-sol': [{ in: 2, out: 10 }],
-  'gpt-5.5': [{ in: 5, out: 30 }],
-  'gpt-5.4': [{ in: 2.5, out: 15 }],
-  'gpt-5.4-mini': [{ in: 0.75, out: 4.5 }],
-  'gpt-5.2': [{ in: 1.75, out: 14 }],
-  'gpt-5.1': [{ in: 1.25, out: 10 }],
-  'gpt-5': [{ in: 1.25, out: 10 }],
-  'gpt-5-mini': [{ in: 0.25, out: 2 }],
-  'gpt-4.1': [{ in: 2, out: 8 }],
-  'gpt-4.1-mini': [{ in: 0.4, out: 1.6 }],
-  'gpt-4o': [{ in: 2.5, out: 10 }],
-  'gpt-4o-mini': [{ in: 0.15, out: 0.6 }],
-  'gemini-4-carbon': [{ in: 2, out: 10 }, { from: '2026-12-01', in: 4, out: 20 }],
-  'gemini-4-neon': [{ in: 3, out: 15 }],
-  'gemini-4-argon': [{ in: 2, out: 10 }, { from: '2026-12-01', in: 4, out: 20 }],
-  'gemini-4-hydrogen': [{ in: 1.5, out: 7.5, free: true }],
-  'gemini-3.8-flash': [{ in: 0.75, out: 3.75, free: true }, { from: '2027-01-01', in: 1.5, out: 7.5, free: true }],
-  'gemini-3.6-flash': [{ in: 0.75, out: 3.75, free: true }, { from: '2027-01-01', in: 1.5, out: 7.5, free: true }],
-  'gemini-3.1-pro-preview': [{ in: 2, out: 12 }],
-  'gemini-3-flash-preview': [{ in: 0.5, out: 3, free: true }]
-};
-
-function priceFor(model, now) {
-  const rows = MODEL_PRICES[model];
-  if (!rows) return null;
-  const today = now.toISOString().slice(0, 10);
-  let current = rows[0];
-  rows.forEach((row) => { if (row.from && row.from <= today) current = row; });
-  return current;
-}
-
-// Shown beside each model in the list; '' when the model has no price on file
-export function describeModelPrice(model, now = new Date()) {
-  const price = priceFor(model, now);
-  if (!price) return '';
-  return `每百萬 token：輸入 $${price.in}／輸出 $${price.out}${price.free ? '｜有免費額度' : ''}`;
-}
-
-const hasReportedUsage = (usage) => Boolean(usage) && usage.requests > usage.unreportedRequests;
-
-// Returns { usd, twd, free } or null when the model has no price on file or nothing was reported
-export function estimateCost(model, usage, now = new Date()) {
-  const price = priceFor(model, now);
-  if (!price || !hasReportedUsage(usage)) return null;
-  const usd = (usage.inputTokens * price.in + usage.outputTokens * price.out) / 1e6;
-  return { usd, twd: usd * USD_TO_TWD_ESTIMATE, free: Boolean(price.free) };
-}
-
-const formatUsd = (usd) => `US$${usd.toFixed(usd >= 1 ? 2 : usd >= 0.01 ? 3 : 4)}`;
-const formatTwd = (twd) => `NT$${twd.toFixed(twd >= 10 ? 0 : twd >= 0.1 ? 1 : 2)}`;
-
-// One line for the result display; '' when the provider reported nothing at all
-export function describeUsage(engine, usage, now = new Date()) {
-  if (!hasReportedUsage(usage)) return '';
-  const count = (n) => Math.round(n).toLocaleString('en-US');
-  let text = `用量：輸入 ${count(usage.inputTokens)}、輸出 ${count(usage.outputTokens)} token（輸出含模型思考）`;
-  const cost = estimateCost(engine.model, usage, now);
-  text += cost
-    ? `｜依公開定價估算約 ${formatUsd(cost.usd)}（約 ${formatTwd(cost.twd)}）${cost.free ? '；若用的是 Gemini 免費額度則不扣款' : ''}`
-    : '｜沒有這個模型的單價資料，無法估算金額';
-  if (usage.unreportedRequests > 0) text += `｜另有 ${usage.unreportedRequests} 次請求沒有回報用量，實際會再多一些`;
-  return text;
 }
 
 // ==========================================
@@ -693,6 +640,8 @@ export async function translatePack(pack, engine, scope, hooks = {}) {
     onBatchApplied();
     onProgress({ done: result.translated, total: result.total, note: `${label}：完成` });
   }
+  // Monthly ledger: whatever this run asked for, finished or not
+  if (result.usage.requests > 0) recordSpend('translate', estimateCost(engine.model, result.usage));
   return result;
 }
 

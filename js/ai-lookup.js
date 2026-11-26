@@ -17,6 +17,7 @@ import {
   buildTranscribeAudioChunks
 } from './audio-processor.js';
 import { pausePlaybackInPlace } from './player-engine.js';
+import { estimateAudioCost, describeAudioUsage, recordSpend } from './cost.js';
 
 // ==========================================
 // CALLBACK BRIDGE & HEADER BADGE
@@ -630,7 +631,7 @@ export async function handleTapEnglishWordLookup(word, tokenEl) {
     const res = await queryConfiguredAiEngine(prompt);
     const parsed = parseAiStructuredResponse(res.text);
     if (!parsed.zh && !parsed.notes) throw new Error('AI 回覆內容為空');
-    badge.textContent = `🤖 ${res.modelUsed}`;
+    badge.textContent = `🤖 ${res.modelUsed}${res.costNote ? `｜${res.costNote}` : ''}`;
     await saveWordLookupResult(
       pack,
       item,
@@ -704,7 +705,7 @@ export async function actionAiExplainCurrentSentence(forceRefresh = false) {
     const res = await queryConfiguredAiEngine(prompt);
     const parsed = parseAiStructuredResponse(res.text);
     if (!parsed.zh && !parsed.notes) throw new Error('AI 回覆內容為空');
-    badge.textContent = `🤖 ${res.modelUsed}`;
+    badge.textContent = `🤖 ${res.modelUsed}${res.costNote ? `｜${res.costNote}` : ''}`;
     // A whole-pack translation (strongest model, whole lesson as context) outranks this quick one-sentence reply
     const keepPackZh = isPackTranslatedZh(item);
     if (parsed.zh && !keepPackZh) item.zh = parsed.zh;
@@ -1033,41 +1034,66 @@ export async function transcribeLongAudioWithAi(audioBuffer, onProgress = () => 
   let allLines = [];
   let allSegments = [];
   let modelUsed = '';
-
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
-    const label = isWhisper
-      ? (engine.type === 'groq' ? 'Groq Whisper' : 'OpenAI Whisper')
-      : 'Gemini 聽打';
-    const trimNote = trimmedHeadSec > 0.2 ? `｜已裁去開頭 ${trimmedHeadSec.toFixed(1)}s 靜音` : '';
-    onProgress(`🎙️ ${label} 辨識中 (${i + 1}/${chunks.length} 段${trimNote})...`);
-
-    if (isWhisper) {
-      const res = await transcribeChunkViaWhisper(chunk, engine.type, engine.key);
-      modelUsed = res.modelUsed;
-      for (const entry of res.entries) {
-        const pad = 0.06;
-        let startSec = Math.max(0, entry.startSec - pad);
-        let endSec = Math.min(totalDur, Math.max(startSec + 0.2, entry.endSec + pad));
-        if (allSegments.length > 0) {
-          const prev = allSegments[allSegments.length - 1];
-          if (startSec < prev.endSec) {
-            const mid = (prev.endSec + startSec) / 2;
-            prev.endSec = Math.max(prev.startSec + 0.15, mid);
-            startSec = prev.endSec;
-            endSec = Math.max(startSec + 0.15, endSec);
-          }
-        }
-        allLines.push({ en: entry.en, zh: '' });
-        allSegments.push({ startSec, endSec });
-      }
+  // What the requests that came back cost; Gemini transcription has no audio price on file and counts as unpriced
+  const spend = { audioSec: 0, usd: 0, pricedRequests: 0, unpricedRequests: 0, free: false };
+  const addChunkSpend = (chunk, model) => {
+    const seconds = Math.max(0, chunk.endSec - chunk.startSec);
+    const cost = isWhisper ? estimateAudioCost(engine.type, model, seconds) : null;
+    spend.audioSec += seconds;
+    if (cost) {
+      spend.usd += cost.usd;
+      spend.pricedRequests += 1;
+      spend.free = spend.free || cost.free;
     } else {
-      const res = await transcribeChunkViaGemini(chunk, engine.key);
-      modelUsed = res.modelUsed;
-      for (const entry of res.entries) {
-        allLines.push({ en: entry.en, zh: entry.zh });
+      spend.unpricedRequests += 1;
+    }
+  };
+  const recordTranscribeSpend = () => {
+    if (spend.pricedRequests + spend.unpricedRequests === 0) return;
+    recordSpend('transcribe', spend.pricedRequests > 0 ? { usd: spend.usd, free: spend.free } : null);
+  };
+
+  try {
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      const label = isWhisper
+        ? (engine.type === 'groq' ? 'Groq Whisper' : 'OpenAI Whisper')
+        : 'Gemini 聽打';
+      const trimNote = trimmedHeadSec > 0.2 ? `｜已裁去開頭 ${trimmedHeadSec.toFixed(1)}s 靜音` : '';
+      onProgress(`🎙️ ${label} 辨識中 (${i + 1}/${chunks.length} 段${trimNote})...`);
+
+      if (isWhisper) {
+        const res = await transcribeChunkViaWhisper(chunk, engine.type, engine.key);
+        modelUsed = res.modelUsed;
+        addChunkSpend(chunk, res.modelUsed);
+        for (const entry of res.entries) {
+          const pad = 0.06;
+          let startSec = Math.max(0, entry.startSec - pad);
+          let endSec = Math.min(totalDur, Math.max(startSec + 0.2, entry.endSec + pad));
+          if (allSegments.length > 0) {
+            const prev = allSegments[allSegments.length - 1];
+            if (startSec < prev.endSec) {
+              const mid = (prev.endSec + startSec) / 2;
+              prev.endSec = Math.max(prev.startSec + 0.15, mid);
+              startSec = prev.endSec;
+              endSec = Math.max(startSec + 0.15, endSec);
+            }
+          }
+          allLines.push({ en: entry.en, zh: '' });
+          allSegments.push({ startSec, endSec });
+        }
+      } else {
+        const res = await transcribeChunkViaGemini(chunk, engine.key);
+        modelUsed = res.modelUsed;
+        addChunkSpend(chunk, res.modelUsed);
+        for (const entry of res.entries) {
+          allLines.push({ en: entry.en, zh: entry.zh });
+        }
       }
     }
+  } finally {
+    // Segments already transcribed were billed even when a later one fails
+    recordTranscribeSpend();
   }
 
   if (isWhisper && allSegments.length === allLines.length) {
@@ -1087,7 +1113,9 @@ export async function transcribeLongAudioWithAi(audioBuffer, onProgress = () => 
     segments: isWhisper && allSegments.length === allLines.length ? allSegments : null,
     trimmedHeadSec,
     chunkCount: chunks.length,
-    resamplerUsed
+    resamplerUsed,
+    // One line about what this transcription cost, for the result display
+    usageText: describeAudioUsage(spend)
   };
 }
 

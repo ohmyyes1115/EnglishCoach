@@ -10,6 +10,7 @@ import {
   showGiantHud
 } from './state-storage.js';
 import { pausePlaybackInPlace, setScreenWakeLockHold } from './player-engine.js';
+import { recordSpend } from './cost.js';
 
 const GPT_LIVE_CONFIG_LS_KEY = 'car_shadow_gpt_live_config_v1';
 const GPT_LIVE_LEDGER_LS_KEY = 'car_shadow_gpt_live_ledger_v1';
@@ -292,6 +293,8 @@ function finalizeLiveSessionBilling(reason = 'closed') {
   }
   saveBillingLedger(ledger);
   renderBalanceLedgerUI();
+  // Also counted in the monthly total shown in AI settings
+  recordSpend('gptLive', { usd: snap.costUsd });
 
   appendSettlementCard(snap, ledger, reason);
   if (typeof window.logDiag === 'function') {
