@@ -66,7 +66,8 @@ import {
   actionResetToFirstSentence,
   triggerCopyCurrentSentence,
   describeScreenWakeLock,
-  setScreenWakeLockHold
+  setScreenWakeLockHold,
+  primeGapSpeech
 } from './player-engine.js';
 
 import {
@@ -183,6 +184,13 @@ function renderRepeatAndGapButtons() {
     btn.className = isActive
       ? 'gap-btn px-2.5 py-1 rounded-lg bg-sky-500 text-slate-950 font-black transition shadow'
       : 'gap-btn px-2.5 py-1 rounded-lg bg-slate-800 text-slate-300 font-bold transition';
+  });
+
+  document.querySelectorAll('.zh-speak-btn').forEach((btn) => {
+    const isActive = btn.getAttribute('data-zh-speak') === state.zhSpeakMode;
+    btn.className = isActive
+      ? 'zh-speak-btn px-2.5 py-1 rounded-lg bg-violet-400 text-slate-950 font-black transition shadow'
+      : 'zh-speak-btn px-2.5 py-1 rounded-lg bg-slate-800 text-slate-300 font-bold transition';
   });
 }
 
@@ -498,6 +506,7 @@ async function initApplication() {
     state.repeatTarget = Number(prefs.repeatTarget) || 2;
     state.previousFiniteRepeatTarget = Number(prefs.previousFiniteRepeatTarget) || 2;
     state.gapMode = prefs.gapMode || '1';
+    state.zhSpeakMode = ['first', 'every'].includes(prefs.zhSpeakMode) ? prefs.zhSpeakMode : 'off';
     state.speedIndex = Number(prefs.speedIndex) || 0;
     state.subMode = prefs.subMode || 'both';
     state.demoVoiceMode = prefs.demoVoiceMode || 'tts_and_pad';
@@ -606,6 +615,28 @@ function bindAllEvents() {
       state.gapMode = btn.getAttribute('data-gap');
       savePrefsSync();
       renderMainStage();
+    });
+  });
+
+  document.querySelectorAll('.zh-speak-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const mode = btn.getAttribute('data-zh-speak');
+      state.zhSpeakMode = ['first', 'every'].includes(mode) ? mode : 'off';
+      savePrefsSync();
+      renderMainStage();
+      if (state.zhSpeakMode === 'off') return;
+      if (!('speechSynthesis' in window) || !window.speechSynthesis) {
+        showGiantHud('🔇', '這個瀏覽器沒有內建語音', '無法唸中文，其餘播放不受影響', 'border-amber-400/90');
+        return;
+      }
+      // This tap is the user gesture iOS needs before the page may speak on its own later
+      primeGapSpeech();
+      showGiantHud(
+        '🗣️',
+        state.zhSpeakMode === 'first' ? '每句第一遍唸中文' : '每一遍都唸中文',
+        '英文 → 留白跟讀 → 中文；沒有中譯的句子會略過',
+        'border-violet-400/90'
+      );
     });
   });
 

@@ -265,9 +265,141 @@ function stopGapKeepAlive() {
 }
 
 // ==========================================
+// CHINESE TRANSLATION READ ALOUD AFTER THE SHADOWING GAP (PHONE'S BUILT-IN VOICE)
+// ==========================================
+// Order within one repetition: English clip -> silent gap for shadowing -> Chinese -> next clip.
+// The whole stretch after the clip counts as "in gap" (state.isInGap), so pause, next/previous and
+// the watchdog treat it exactly like the silent gap.
+const ZH_SPEAK_POLL_MS = 200;
+const ZH_SPEAK_START_TIMEOUT_MS = 2500;
+const ZH_SPEAK_PAUSE_AFTER_MS = 250;
+let gapSpeech = null; // { pollId, utter } while the built-in voice is reading a translation
+let gapSpeechPrimed = false;
+let gapSpeechFailureLogged = false;
+
+function getSpeechSynth() {
+  try {
+    if ('speechSynthesis' in window && window.speechSynthesis && typeof SpeechSynthesisUtterance !== 'undefined') {
+      return window.speechSynthesis;
+    }
+  } catch (e) {}
+  return null;
+}
+
+// iOS Safari ignores speak() calls made from a timer until the page has spoken once inside a user
+// gesture, so a silent utterance is spoken on the first tap or key press after the feature is on.
+export function primeGapSpeech() {
+  if (gapSpeechPrimed || state.zhSpeakMode === 'off') return;
+  const synth = getSpeechSynth();
+  if (!synth) return;
+  try {
+    if (synth.speaking || synth.pending) return;
+    const utter = new SpeechSynthesisUtterance(' ');
+    utter.volume = 0;
+    utter.lang = 'zh-TW';
+    synth.speak(utter);
+    gapSpeechPrimed = true;
+  } catch (e) {}
+}
+
+function pickChineseVoice(synth) {
+  let voices = [];
+  try { voices = synth.getVoices() || []; } catch (e) {}
+  const taiwan = voices.filter((v) => String(v?.lang || '').replace('_', '-').toLowerCase() === 'zh-tw');
+  // Higher-quality voices downloaded in the phone's settings carry a quality word in their name
+  return taiwan.find((v) => /premium|enhanced|優化|高音質/i.test(v.name || '')) || taiwan[0] || null;
+}
+
+function chineseToSpeakAfterGap(item) {
+  if (state.zhSpeakMode !== 'first' && state.zhSpeakMode !== 'every') return '';
+  if (state.zhSpeakMode === 'first' && state.repeatCountCurrent !== 1) return '';
+  // The built-in voice cannot be relied on while the page is hidden (screen off, another app in
+  // front); skipping keeps the rhythm instead of waiting for a voice that may never start
+  if (document.visibilityState !== 'visible') return '';
+  return String(item?.zh || '').trim();
+}
+
+function stopGapSpeech() {
+  const session = gapSpeech;
+  if (!session) return;
+  gapSpeech = null;
+  clearInterval(session.pollId);
+  try { getSpeechSynth()?.cancel(); } catch (e) {}
+}
+
+// Calls onDone exactly once: when the voice finishes, fails, or never starts. Not called when the
+// speech is stopped from outside through stopGapSpeech() (pause, next sentence...).
+function speakChineseThen(text, onDone) {
+  const synth = getSpeechSynth();
+  if (!synth) {
+    onDone();
+    return;
+  }
+  stopGapSpeech();
+
+  const session = { pollId: null, utter: null };
+  const startedAtMs = Date.now();
+  // Generous ceiling for a voice that reports neither an end nor an error
+  const maxMs = Math.min(30000, 4000 + text.length * 450);
+  let started = false;
+
+  const finish = (failureNote = '') => {
+    if (gapSpeech !== session) return;
+    gapSpeech = null;
+    clearInterval(session.pollId);
+    if (failureNote) {
+      try { synth.cancel(); } catch (e) {}
+      if (!gapSpeechFailureLogged && typeof window.logDiag === 'function') {
+        gapSpeechFailureLogged = true;
+        window.logDiag('WARN', `留白後唸中文：${failureNote}`);
+      }
+    }
+    onDone();
+  };
+
+  gapSpeech = session;
+  try {
+    synth.cancel();
+    const utter = new SpeechSynthesisUtterance(text);
+    const voice = pickChineseVoice(synth);
+    if (voice) utter.voice = voice;
+    utter.lang = 'zh-TW';
+    utter.rate = 1.0;
+    utter.onstart = () => { started = true; };
+    utter.onend = () => finish();
+    utter.onerror = (ev) => {
+      // Cut short by another speech request (word pronunciation, read-aloud button): not a failure
+      const reason = String(ev?.error || '');
+      finish(reason === 'interrupted' || reason === 'canceled' ? '' : `內建語音回報錯誤（${reason || '未知'}），已略過這一句的中文`);
+    };
+    session.utter = utter; // Safari can drop the end event of an utterance nothing else refers to
+    synth.speak(utter);
+  } catch (e) {
+    finish(`內建語音無法啟動（${e?.name || 'error'}），已略過這一句的中文`);
+    return;
+  }
+
+  // The end event is not always delivered on iOS, so the voice's own state is watched as well
+  session.pollId = setInterval(() => {
+    if (gapSpeech !== session) {
+      clearInterval(session.pollId);
+      return;
+    }
+    const elapsedMs = Date.now() - startedAtMs;
+    let busy = false;
+    try { busy = Boolean(synth.speaking || synth.pending); } catch (e) {}
+    if (busy) started = true;
+    if (started && !busy) finish();
+    else if (!started && elapsedMs > ZH_SPEAK_START_TIMEOUT_MS) finish('內建語音沒有開始發聲，已略過這一句的中文（系統可能沒有中文語音，或需要先點一下畫面）');
+    else if (elapsedMs > maxMs) finish('內建語音唸太久沒有結束，已中止這一句的中文');
+  }, ZH_SPEAK_POLL_MS);
+}
+
+// ==========================================
 // CORE PLAYBACK ENGINE & WATCHDOG
 // ==========================================
 export function stopAllAudioTimers() {
+  stopGapSpeech();
   if (gapTimerId) {
     clearTimeout(gapTimerId);
     gapTimerId = null;
@@ -621,14 +753,31 @@ export function handleClipEnded() {
     }
   };
 
+  // After the shadowing gap: read the Chinese translation aloud when that is switched on, then go on
+  const speakChineseThenProceed = () => {
+    if (!state.isPlaying || endedAttemptId !== playbackAttemptId) return;
+    const zhText = chineseToSpeakAfterGap(item);
+    if (!zhText) {
+      proceedNextStep();
+      return;
+    }
+    state.isInGap = true;
+    startGapKeepAlive();
+    playerCallbacks.onUpdatePlayPauseUI('唸中文翻譯...');
+    speakChineseThen(zhText, () => {
+      if (!state.isPlaying || endedAttemptId !== playbackAttemptId) return;
+      gapTimerId = setTimeout(proceedNextStep, ZH_SPEAK_PAUSE_AFTER_MS);
+    });
+  };
+
   if (gapSec > 0.05) {
     state.isInGap = true;
     // Play pure silent keep-alive ONLY during inter-sentence gap while masterAudio is idle
     startGapKeepAlive();
     playerCallbacks.onUpdatePlayPauseUI(`跟讀留白 (${gapSec.toFixed(0)}秒)...`);
-    gapTimerId = setTimeout(proceedNextStep, gapSec * 1000);
+    gapTimerId = setTimeout(speakChineseThenProceed, gapSec * 1000);
   } else {
-    proceedNextStep();
+    speakChineseThenProceed();
   }
 }
 
@@ -758,6 +907,7 @@ export function setupWatchdogTimer() {
 // ==========================================
 export function actionPrevSentence() {
   unlockiOSAudioAndSpeechSynchronously();
+  primeGapSpeech();
   if (!state.currentPack || !state.currentPack.items.length) return;
   const total = state.currentPack.items.length;
   state.currentIndex = (state.currentIndex - 1 + total) % total;
@@ -771,6 +921,7 @@ export function actionPrevSentence() {
 
 export function actionRestartCurrentSentence() {
   unlockiOSAudioAndSpeechSynchronously();
+  primeGapSpeech();
   if (!state.currentPack || !state.currentPack.items.length) return;
   state.repeatCountCurrent = 1;
   state.pausedOffsetSec = 0;
@@ -789,6 +940,7 @@ export function actionRestartCurrentSentence() {
 
 export function actionTogglePlayPause() {
   unlockiOSAudioAndSpeechSynchronously();
+  primeGapSpeech();
   if (state.isPlaying) {
     pausePlaybackInPlace('已暫停');
     showGiantHud('⏸️', '原地暫停', `停於 ${formatTimeSec(state.pausedOffsetSec)} (再按繼續播)`, 'border-amber-400/90');
@@ -801,6 +953,7 @@ export function actionTogglePlayPause() {
 
 export function actionNextSentence() {
   unlockiOSAudioAndSpeechSynchronously();
+  primeGapSpeech();
   if (!state.currentPack || !state.currentPack.items.length) return;
   const total = state.currentPack.items.length;
   state.currentIndex = (state.currentIndex + 1) % total;

@@ -276,7 +276,7 @@
     </section>
 
     <!-- REPEAT & GAP BAR -->
-    <section class="bg-slate-900/90 border border-slate-800 rounded-2xl p-2.5 sm:p-3 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2.5 text-xs shrink-0">
+    <section class="bg-slate-900/90 border border-slate-800 rounded-2xl p-2.5 sm:p-3 flex flex-col sm:flex-row sm:flex-wrap items-start sm:items-center justify-between gap-2.5 text-xs shrink-0">
       <div class="flex items-center gap-1.5 flex-wrap">
         <span class="text-slate-400 font-bold mr-1">🔁 每句重複：</span>
         <button type="button" data-repeat="1" class="repeat-btn px-2.5 py-1 rounded-lg bg-slate-800 text-slate-300 font-bold transition">1次</button>
@@ -292,6 +292,13 @@
         <button type="button" data-gap="1" class="gap-btn px-2.5 py-1 rounded-lg bg-sky-500 text-slate-950 font-black transition">+1秒</button>
         <button type="button" data-gap="2" class="gap-btn px-2.5 py-1 rounded-lg bg-slate-800 text-slate-300 font-bold transition">+2秒</button>
         <button type="button" data-gap="auto" class="gap-btn px-2.5 py-1 rounded-lg bg-slate-800 text-slate-300 font-bold transition">+等長</button>
+      </div>
+
+      <div class="flex items-center gap-1.5 flex-wrap">
+        <span class="text-slate-400 font-bold mr-1">🗣️ 留白後唸中文：</span>
+        <button type="button" data-zh-speak="off" class="zh-speak-btn px-2.5 py-1 rounded-lg bg-violet-400 text-slate-950 font-black transition shadow">關</button>
+        <button type="button" data-zh-speak="first" class="zh-speak-btn px-2.5 py-1 rounded-lg bg-slate-800 text-slate-300 font-bold transition">第一遍</button>
+        <button type="button" data-zh-speak="every" class="zh-speak-btn px-2.5 py-1 rounded-lg bg-slate-800 text-slate-300 font-bold transition">每一遍</button>
       </div>
     </section>
 

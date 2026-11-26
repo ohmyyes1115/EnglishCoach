@@ -71,6 +71,9 @@ export const state = {
   repeatTarget: 2,
   previousFiniteRepeatTarget: 2,
   gapMode: '1',
+  // Chinese translation read aloud by the phone's built-in voice after the shadowing gap:
+  // 'off' | 'first' (first repetition of each sentence) | 'every'
+  zhSpeakMode: 'off',
   speedIndex: 0,
   subMode: 'both', // 'both' | 'en' | 'hide'
   demoVoiceMode: 'tts_and_pad', // 'tts_and_pad' | 'tts_only'
@@ -418,6 +421,7 @@ export function savePrefsSync() {
       repeatTarget: state.repeatTarget,
       previousFiniteRepeatTarget: state.previousFiniteRepeatTarget,
       gapMode: state.gapMode,
+      zhSpeakMode: state.zhSpeakMode,
       speedIndex: state.speedIndex,
       subMode: state.subMode,
       demoVoiceMode: state.demoVoiceMode
