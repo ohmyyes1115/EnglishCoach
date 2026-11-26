@@ -80,7 +80,8 @@ import {
   findPreferredEngine,
   getRememberedModelName,
   pickAutoTranslationEngine,
-  translateTranscriptLines
+  translateTranscriptLines,
+  askChosenTextModel
 } from './pack-translate.js';
 
 import {
@@ -90,7 +91,6 @@ import {
   fetchFreeGoogleTranslateZhTW,
   callGeminiFlashConciseApi,
   callGroqConciseApi,
-  callOpenAiMiniConciseApi,
   handleTapEnglishWordLookup,
   actionAiExplainCurrentSentence,
   actionCopySentenceWithAiPrompt,
@@ -292,11 +292,15 @@ function renderMainStage() {
   updatePlayPauseUI();
 }
 
+// Set once the event handlers exist: lists the models of the saved keys in the settings window
+let refreshAiModelPickers = () => {};
+
 function openAiSettingsModal() {
   const modalAi = document.getElementById('modalAiSettings');
   const cfg = state.aiConfig || loadAiConfigSync();
-  const radio = document.querySelector(`input[name="aiProviderSelect"][value="${cfg.provider}"]`);
-  if (radio) radio.checked = true;
+  const keylessBox = document.getElementById('chkAiLookupKeyless');
+  if (keylessBox) keylessBox.checked = Boolean(cfg.lookupKeyless);
+  refreshAiModelPickers();
   document.getElementById('inputGeminiApiKey').value = cfg.geminiKey || '';
   document.getElementById('inputGroqApiKey').value = cfg.groqKey || '';
   document.getElementById('inputOpenAiApiKey').value = cfg.openaiKey || '';
@@ -464,7 +468,7 @@ function buildDiagReportText() {
     `時間：${new Date().toLocaleString()}`,
     `瀏覽器：${navigator.userAgent}`,
     `開啟方式：${standalone ? '主畫面 App (standalone)' : '瀏覽器分頁'}`,
-    `AI 引擎：${state.aiConfig?.provider || '未設定'}`,
+    `AI 金鑰：${['gemini', 'groq', 'openai'].filter((p) => state.aiConfig?.[`${p}Key`]).join('、') || '無'}｜翻譯與查詢模型：${getRememberedModelName() || '未選（自動）'}${state.aiConfig?.lookupKeyless ? '｜查詢不使用金鑰' : ''}`,
     `目前教材：${pack ? `${pack.items?.length || 0} 句，第 ${state.currentIndex + 1} 句` : '無'}`,
     `儲存：${describeStorageProtection()}`,
     `螢幕恆亮：${describeScreenWakeLock()}`,
@@ -487,7 +491,8 @@ async function initApplication() {
   });
   registerAiCallbacks({
     onRenderMainStage: renderMainStage,
-    onOpenAiSettings: openAiSettingsModal
+    onOpenAiSettings: openAiSettingsModal,
+    askTextModel: askChosenTextModel
   });
 
   state.aiConfig = loadAiConfigSync();
@@ -835,11 +840,11 @@ function bindAllEvents() {
     document.getElementById('inputOpenAiApiKey').type = next;
   });
   safeOn('btnSaveAiSettings', 'click', () => {
-    const provider = document.querySelector('input[name="aiProviderSelect"]:checked')?.value || 'gemini';
     const geminiKey = document.getElementById('inputGeminiApiKey').value;
     const groqKey = document.getElementById('inputGroqApiKey').value;
     const openaiKey = document.getElementById('inputOpenAiApiKey').value;
-    saveAiConfigSync({ provider, geminiKey, groqKey, openaiKey });
+    const lookupKeyless = Boolean(document.getElementById('chkAiLookupKeyless')?.checked);
+    saveAiConfigSync({ geminiKey, groqKey, openaiKey, lookupKeyless });
     updateAiHeaderBadgeUI();
     // The import workbench may be open underneath (the transcribe button sends the user here for a key)
     if (!document.getElementById('modalImport')?.classList.contains('hidden')) loadAutoTranslateEngines();
@@ -850,35 +855,38 @@ function bindAllEvents() {
     document.getElementById('inputGeminiApiKey').value = '';
     document.getElementById('inputGroqApiKey').value = '';
     document.getElementById('inputOpenAiApiKey').value = '';
-    saveAiConfigSync({ provider: 'free_builtin', geminiKey: '', groqKey: '', openaiKey: '' });
+    const keylessBox = document.getElementById('chkAiLookupKeyless');
+    if (keylessBox) keylessBox.checked = false;
+    saveAiConfigSync({ geminiKey: '', groqKey: '', openaiKey: '', lookupKeyless: false });
     updateAiHeaderBadgeUI();
-    if (!document.getElementById('modalImport')?.classList.contains('hidden')) loadAutoTranslateEngines();
+    loadAutoTranslateEngines();
     document.getElementById('aiTestStatusText').textContent = '已清除金鑰，切換為免金鑰模式';
   });
   safeOn('btnTestAiConnection', 'click', async () => {
     const st = document.getElementById('aiTestStatusText');
-    const provider = document.querySelector('input[name="aiProviderSelect"]:checked')?.value || 'gemini';
     const geminiKey = document.getElementById('inputGeminiApiKey').value.trim();
     const groqKey = document.getElementById('inputGroqApiKey').value.trim();
     const openaiKey = document.getElementById('inputOpenAiApiKey').value.trim();
     st.textContent = '⏳ 測試連線中...';
-    try {
-      if (provider === 'gemini' && geminiKey) {
-        const r = await callGeminiFlashConciseApi('請回答「連線成功」四個字。', geminiKey);
-        st.textContent = `✅ Gemini (${r.modelUsed}) 連線成功！`;
-      } else if (provider === 'groq' && groqKey) {
-        const r = await callGroqConciseApi('請回答「連線成功」四個字。', groqKey);
-        st.textContent = `✅ Groq (${r.modelUsed}) 連線成功！`;
-      } else if (provider === 'openai' && openaiKey) {
-        const r = await callOpenAiMiniConciseApi('請回答「連線成功」四個字。', openaiKey);
-        st.textContent = `✅ OpenAI (${r.modelUsed}) 連線成功！`;
-      } else {
-        const zh = await fetchFreeGoogleTranslateZhTW('Keep me posted.');
-        st.textContent = `✅ 免金鑰翻譯連線成功 (${zh})`;
-      }
-    } catch (err) {
-      st.textContent = `❌ 失敗：${err.message}`;
+    // Every filled key is tested (the values in the fields, saved or not); with none, the key-less translation
+    const jobs = [];
+    const test = (label, run) => jobs.push(run().then(
+      (detail) => `✅ ${label}${detail ? ` (${detail})` : ''}`,
+      (err) => `❌ ${label}：${String(err?.message || '失敗').slice(0, 90)}`
+    ));
+    if (geminiKey) test('Gemini', async () => (await callGeminiFlashConciseApi('請回答「連線成功」四個字。', geminiKey)).modelUsed);
+    if (groqKey) test('Groq', async () => (await callGroqConciseApi('請回答「連線成功」四個字。', groqKey)).modelUsed);
+    if (openaiKey) {
+      // Reading the model list checks the key without spending anything
+      test('OpenAI', async () => {
+        const res = await fetch('https://api.openai.com/v1/models', { headers: { Authorization: `Bearer ${openaiKey}` } });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+        return '金鑰有效';
+      });
     }
+    if (jobs.length === 0) test('免金鑰翻譯', () => fetchFreeGoogleTranslateZhTW('Keep me posted.'));
+    st.textContent = (await Promise.all(jobs)).join('｜');
   });
 
   // Modal: Sentence List
@@ -940,21 +948,41 @@ function bindAllEvents() {
     }
     // The model the translation pass would use right now: the remembered one, otherwise the strongest
     const chosen = pickAutoTranslationEngine(engines);
+    // Nothing is picked on the user's behalf when only an open-source model is available
+    selectEl.innerHTML = (chosen ? '' : '<option value="" selected>不自動翻譯（只有開源模型可用，中文較弱；要用請自己選）</option>') + engineOptionGroupsHtml(engines, chosen);
+    selectEl.disabled = !document.getElementById('chkAutoTranslateAfterTranscribe')?.checked;
+  }
+
+  // One block per provider, each strongest first
+  function engineOptionGroupsHtml(engines, chosen) {
     const providers = [...new Set(engines.map((e) => e.provider))];
-    const groups = providers.map((provider) => {
+    return providers.map((provider) => {
       const group = engines.filter((e) => e.provider === provider);
       const options = group.map((e) => `<option value="${escapeHtml(e.id)}" ${e === chosen ? 'selected' : ''}>${escapeHtml(`${e.model}｜${e.tierLabel}${e === engines[0] ? '・建議' : ''}`)}</option>`).join('');
       return `<optgroup label="${escapeHtml(group[0].providerLabel)}">${options}</optgroup>`;
     }).join('');
-    // Nothing is picked on the user's behalf when only an open-source model is available
-    selectEl.innerHTML = (chosen ? '' : '<option value="" selected>不自動翻譯（只有開源模型可用，中文較弱；要用請自己選）</option>') + groups;
-    selectEl.disabled = !document.getElementById('chkAutoTranslateAfterTranscribe')?.checked;
+  }
+
+  // The same choice, shown in the AI settings window. It lists the models of the saved keys.
+  function renderAiSettingsModelSelect(emptyText) {
+    const selectEl = document.getElementById('selectAiChatModel');
+    if (!selectEl) return;
+    const engines = autoTranslateEngines;
+    if (engines.length === 0) {
+      selectEl.innerHTML = `<option value="">${escapeHtml(emptyText || '填入金鑰並儲存後，這裡會列出可用的模型')}</option>`;
+      selectEl.disabled = true;
+      return;
+    }
+    const chosen = findPreferredEngine(engines);
+    selectEl.innerHTML = (chosen ? '' : '<option value="" selected>還沒選過（翻譯用最強的模型，查詢用「品質好、速度快」的模型）</option>') + engineOptionGroupsHtml(engines, chosen);
+    selectEl.disabled = false;
   }
 
   async function loadAutoTranslateEngines() {
     const token = ++autoTranslateLoadToken;
     if (autoTranslateEngines.length === 0) {
       renderAutoTranslateModelSelect(`${getRememberedModelName() || '最強的模型'}（正在查詢可用的模型…）`);
+      renderAiSettingsModelSelect(`${getRememberedModelName() || ''}（正在查詢可用的模型…）`);
     }
     const { engines, problems } = await listPackTranslationEngines().catch((err) => ({
       engines: [],
@@ -963,12 +991,23 @@ function bindAllEvents() {
     if (token !== autoTranslateLoadToken) return;
     autoTranslateEngines = engines;
     renderAutoTranslateModelSelect(problems[0] || '');
+    renderAiSettingsModelSelect(problems[0] || '');
   }
 
   safeOn('selectAutoTranslateModel', 'change', (e) => {
     const engine = autoTranslateEngines.find((x) => x.id === e.target.value);
-    if (engine) rememberPreferredEngine(engine);
+    if (!engine) return;
+    rememberPreferredEngine(engine);
+    renderAiSettingsModelSelect();
   });
+  safeOn('selectAiChatModel', 'change', (e) => {
+    const engine = autoTranslateEngines.find((x) => x.id === e.target.value);
+    if (!engine) return;
+    rememberPreferredEngine(engine);
+    renderAutoTranslateModelSelect();
+    renderAiSettingsModelSelect();
+  });
+  refreshAiModelPickers = loadAutoTranslateEngines;
   const selectedPackTranslateEngine = () => {
     const id = document.querySelector('input[name="packTranslateEngine"]:checked')?.value;
     return packTranslateEngines.find((e) => e.id === id) || null;

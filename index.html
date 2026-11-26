@@ -679,7 +679,7 @@
             <i class="fa-solid fa-robot"></i>
           </span>
           <div>
-            <h2 class="text-sm sm:text-base font-black text-white">🤖 AI 簡答與免費 API 金鑰設定</h2>
+            <h2 class="text-sm sm:text-base font-black text-white">🤖 AI 模型與 API 金鑰設定</h2>
             <p class="text-[11px] text-slate-400">金鑰僅儲存於你手機本機的 localStorage，且解析結果會永久快取於 IndexedDB 不重複扣額度</p>
           </div>
         </div>
@@ -689,36 +689,22 @@
       </div>
 
       <div class="p-3.5 sm:p-4 overflow-y-auto space-y-3.5 flex-1 text-xs">
-        <!-- Engine Selector -->
+        <!-- One model for translation and lookups -->
         <div class="bg-slate-950/90 border border-slate-800 rounded-2xl p-3.5 space-y-2">
-          <div class="font-extrabold text-violet-300">1. 選擇查詢引擎模式</div>
-          <label class="flex items-start gap-2.5 p-2 rounded-xl bg-slate-900 border border-slate-800 cursor-pointer">
-            <input type="radio" name="aiProviderSelect" value="gemini" checked class="mt-1 accent-violet-400" />
-            <div>
-              <div class="font-bold text-white">Google Gemini API（首推・免費額度免綁卡）</div>
-              <div class="text-slate-400 text-[11px]">自動選用此金鑰目前可用的最新 <code class="text-emerald-300">Gemini Flash</code> 模型，有免費額度，自動翻譯並拆解片語跟語氣。</div>
-            </div>
-          </label>
-          <label class="flex items-start gap-2.5 p-2 rounded-xl bg-slate-900 border border-slate-800 cursor-pointer">
-            <input type="radio" name="aiProviderSelect" value="groq" class="mt-1 accent-violet-400" />
-            <div>
-              <div class="font-bold text-amber-300">Groq API（Llama-3.3-70B・免費極速 0.2 秒回應）</div>
-              <div class="text-slate-400 text-[11px]">於 <code class="text-amber-300">console.groq.com</code> 免費申請 <code class="text-amber-300">gsk_...</code> 金鑰，速度極快且免費。</div>
-            </div>
-          </label>
-          <label class="flex items-start gap-2.5 p-2 rounded-xl bg-slate-900 border border-slate-800 cursor-pointer">
-            <input type="radio" name="aiProviderSelect" value="openai" class="mt-1 accent-violet-400" />
-            <div>
-              <div class="font-bold text-white">OpenAI GPT API（gpt-4o-mini・超低價精準）</div>
-              <div class="text-slate-400 text-[11px]">若你已有 OpenAI 金鑰（<code class="text-sky-300">sk-...</code> 開頭）可直接填入使用。</div>
-            </div>
-          </label>
-          <label class="flex items-start gap-2.5 p-2 rounded-xl bg-slate-900 border border-slate-800 cursor-pointer">
-            <input type="radio" name="aiProviderSelect" value="free_builtin" class="mt-1 accent-violet-400" />
-            <div>
-              <div class="font-bold text-emerald-300">免金鑰免費翻譯＋字典引擎（未填 Key 時自動啟用）</div>
-              <div class="text-slate-400 text-[11px]">不需申請任何 API Key！直接串接免費翻譯與英漢字典端點，立即提供整句中譯、單字音標與字義。</div>
-            </div>
+          <div class="font-extrabold text-violet-300">1. 翻譯與查詢用的模型</div>
+          <select id="selectAiChatModel" disabled class="w-full bg-slate-900 border border-slate-700 rounded-xl px-2.5 py-2 text-xs text-emerald-200 font-bold disabled:opacity-60">
+            <option value="">填入金鑰並儲存後，這裡會列出可用的模型</option>
+          </select>
+          <div class="text-slate-400 text-[11px] leading-relaxed">
+            整包翻譯、聽打後自動翻譯、「💡 AI 簡答」和點單字查詢都用這一個模型。在這裡換，或在翻譯的地方換，都是同一個設定。<br />
+            聽打：有 Groq 金鑰就用 Groq，否則用 OpenAI，再來是 Gemini。GPT-Live：用 OpenAI 金鑰。
+          </div>
+          <label class="flex items-start gap-2 p-2 rounded-xl bg-slate-900 border border-slate-800 cursor-pointer">
+            <input id="chkAiLookupKeyless" type="checkbox" class="mt-0.5 accent-violet-400" />
+            <span>
+              <span class="font-bold text-emerald-300">AI 簡答與查單字不使用金鑰</span>
+              <span class="block text-slate-400 text-[11px]">改用免費的機器翻譯和字典（沒有句型說明）。沒填任何金鑰時本來就是這樣。翻譯和聽打不受影響。</span>
+            </span>
           </label>
         </div>
 
@@ -750,12 +736,12 @@
           </div>
 
           <div>
-            <label class="block font-bold text-slate-200 mb-1">Groq API Key（選填，免費極速 Llama-3.3）：</label>
+            <label class="block font-bold text-slate-200 mb-1">Groq API Key（選填，免費；聽打優先用它）：</label>
             <input id="inputGroqApiKey" type="password" placeholder="貼上 gsk_... 開頭的金鑰 (選填)" class="w-full bg-slate-900 border border-slate-700 focus:border-amber-400 rounded-xl px-3 py-2 text-xs text-white font-mono focus:outline-none" />
           </div>
 
           <div>
-            <label class="block font-bold text-slate-200 mb-1">OpenAI API Key（選填，gpt-4o-mini）：</label>
+            <label class="block font-bold text-slate-200 mb-1">OpenAI API Key（選填；GPT 模型與 GPT-Live）：</label>
             <input id="inputOpenAiApiKey" type="password" placeholder="貼上 sk-... 開頭的金鑰 (選填)" class="w-full bg-slate-900 border border-slate-700 focus:border-sky-400 rounded-xl px-3 py-2 text-xs text-white font-mono focus:outline-none" />
           </div>
 

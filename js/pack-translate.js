@@ -156,9 +156,9 @@ export async function listPackTranslationEngines() {
   }
   await Promise.all(jobs);
 
-  // Best tier first; inside a tier the provider the user picked in AI settings goes first, then OpenAI, Gemini, Groq
+  // Best tier first; inside a tier OpenAI, Gemini, Groq
   const providerOrder = ['openai', 'gemini', 'groq'];
-  const rank = (e) => (e.provider === cfg.provider ? -1 : providerOrder.indexOf(e.provider));
+  const rank = (e) => providerOrder.indexOf(e.provider);
   engines.sort((a, b) => (a.tier - b.tier) || (rank(a) - rank(b)));
   return { engines, problems };
 }
@@ -322,17 +322,17 @@ function makeApiError(message, status, retryAfterSec) {
 
 // OpenAI and Groq share the chat-completions shape. Newer models refuse some classic parameters
 // (a fixed temperature, max_tokens), so a parameter the API names in a 400 reply is dropped and the call repeated.
-async function callChatCompletions(endpoint, apiKey, model, systemText, userText, addUsage) {
+async function callChatCompletions(endpoint, apiKey, model, systemText, userText, addUsage, options = {}) {
   const body = {
     model,
     messages: [
       { role: 'system', content: systemText },
       { role: 'user', content: userText }
     ],
-    response_format: { type: 'json_object' },
     temperature: 0.3,
-    max_completion_tokens: 16000
+    max_completion_tokens: options.maxOutputTokens || 16000
   };
+  if (!options.plainText) body.response_format = { type: 'json_object' };
   for (let attempt = 0; attempt < 4; attempt++) {
     const res = await fetch(endpoint, {
       method: 'POST',
@@ -352,7 +352,7 @@ async function callChatCompletions(endpoint, apiKey, model, systemText, userText
       const refused = ['temperature', 'response_format', 'max_completion_tokens'].find((p) => p in body && msg.includes(p));
       if (refused) {
         delete body[refused];
-        if (refused === 'max_completion_tokens') body.max_tokens = 8000;
+        if (refused === 'max_completion_tokens') body.max_tokens = Math.min(8000, options.maxOutputTokens || 8000);
         continue;
       }
     }
@@ -362,14 +362,15 @@ async function callChatCompletions(endpoint, apiKey, model, systemText, userText
   throw makeApiError(`${model} 不接受這個請求的參數`, 400);
 }
 
-async function callGemini(apiKey, model, systemText, userText, addUsage) {
+async function callGemini(apiKey, model, systemText, userText, addUsage, options = {}) {
   const parts = [{ text: `${systemText}\n\n${userText}` }];
-  let maxOutputTokens = 32768;
-  let responseMimeType = 'application/json';
+  let maxOutputTokens = options.maxOutputTokens || 32768;
+  let responseMimeType = options.plainText ? '' : 'application/json';
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const out = await requestGeminiGenerateContent(model, apiKey, parts, 0.3, maxOutputTokens, {
-        keepDefaultThinking: true,
+        // A short question needs no long reasoning; a translation run keeps the model's own setting
+        keepDefaultThinking: !options.plainText,
         responseMimeType
       });
       addUsage(out.usage);
@@ -401,15 +402,84 @@ async function callGemini(apiKey, model, systemText, userText, addUsage) {
 
 // addUsage({ inputTokens, outputTokens } | null) is called once for every reply that was actually generated,
 // including one that is then rejected as cut off: it was billed all the same.
-async function callEngine(engine, systemText, userText, addUsage) {
+// options.plainText: free-form short answer instead of the JSON a translation batch returns
+// options.maxOutputTokens: ceiling for the reply (reasoning included)
+async function callEngine(engine, systemText, userText, addUsage, options = {}) {
   const cfg = state.aiConfig || {};
   if (engine.provider === 'openai') {
-    return callChatCompletions('https://api.openai.com/v1/chat/completions', String(cfg.openaiKey || '').trim(), engine.model, systemText, userText, addUsage);
+    return callChatCompletions('https://api.openai.com/v1/chat/completions', String(cfg.openaiKey || '').trim(), engine.model, systemText, userText, addUsage, options);
   }
   if (engine.provider === 'groq') {
-    return callChatCompletions('https://api.groq.com/openai/v1/chat/completions', String(cfg.groqKey || '').trim(), engine.model, systemText, userText, addUsage);
+    return callChatCompletions('https://api.groq.com/openai/v1/chat/completions', String(cfg.groqKey || '').trim(), engine.model, systemText, userText, addUsage, options);
   }
-  return callGemini(String(cfg.geminiKey || '').trim(), engine.model, systemText, userText, addUsage);
+  return callGemini(String(cfg.geminiKey || '').trim(), engine.model, systemText, userText, addUsage, options);
+}
+
+// ==========================================
+// SHORT QUESTIONS (SENTENCE ANALYSIS, WORD LOOKUP) ON THE SAME MODEL
+// ==========================================
+// The model chosen for translation also answers the short questions, so there is one choice to make.
+// The remembered model is called directly (no model-list request per question). When nothing was chosen
+// yet, the "good and fast" tier is used: the user waits for these answers on the spot.
+const PROVIDER_LABELS = { openai: 'OpenAI', gemini: 'Gemini', groq: 'Groq' };
+let cachedListedChatEngine = null; // { cacheKey, engine }
+
+function readRememberedEngine() {
+  try {
+    return JSON.parse(safeStorage.getItem(PREFERRED_ENGINE_LS_KEY) || 'null');
+  } catch (e) {
+    return null;
+  }
+}
+
+async function pickChatEngineFromList() {
+  const cfg = state.aiConfig || {};
+  const cacheKey = [cfg.openaiKey, cfg.geminiKey, cfg.groqKey, safeStorage.getItem(PREFERRED_ENGINE_LS_KEY)].join('|');
+  if (cachedListedChatEngine && cachedListedChatEngine.cacheKey === cacheKey) return cachedListedChatEngine.engine;
+  const { engines, problems } = await listPackTranslationEngines();
+  const engine = findPreferredEngine(engines) || engines.find((e) => e.tier === 2) || engines[0] || null;
+  if (!engine) throw new Error(problems.join('；') || '金鑰裡找不到可用的文字模型');
+  cachedListedChatEngine = { cacheKey, engine };
+  return engine;
+}
+
+function isModelGoneError(err) {
+  return err?.status === 404 || /model_not_found|does not exist|is not found|not found for api version/i.test(String(err?.message || ''));
+}
+
+// Resolves { text, modelUsed }. A failure carries err.engineLabel (the provider that was asked).
+export async function askChosenTextModel(systemText, userText) {
+  const cfg = state.aiConfig || {};
+  const options = { plainText: true, maxOutputTokens: 8000 };
+  const ask = (engine) => callEngine(engine, systemText, userText, () => {}, options);
+  const pref = readRememberedEngine();
+  const direct = pref && typeof pref.model === 'string' && pref.model && String(cfg[`${pref.provider}Key`] || '').trim()
+    ? { id: `${pref.provider}:${pref.model}`, provider: pref.provider, model: pref.model, tier: pref.tier }
+    : null;
+  let engine = direct;
+  try {
+    let text;
+    if (direct) {
+      try {
+        text = await ask(direct);
+      } catch (err) {
+        // Model ids are retired every few months: ask the provider once for the remembered model's successor
+        if (!isModelGoneError(err)) throw err;
+        cachedListedChatEngine = null;
+        engine = await pickChatEngineFromList();
+        if (engine.id === direct.id) throw err;
+        text = await ask(engine);
+      }
+    } else {
+      engine = await pickChatEngineFromList();
+      text = await ask(engine);
+    }
+    if (!String(text || '').trim()) throw new Error(`${engine.model} 回覆內容為空`);
+    return { text, modelUsed: engine.model };
+  } catch (err) {
+    if (err && typeof err === 'object') err.engineLabel = PROVIDER_LABELS[engine?.provider] || 'AI';
+    throw err;
+  }
 }
 
 // A key whose plan has no allowance for this model at all (or no credit left): waiting will not help.

@@ -1,4 +1,4 @@
-// Layer 2: AI Concise Explanation (Gemini / Groq / OpenAI / Free Fallback),
+// Layer 2: AI Concise Explanation (on the model chosen for translation, or the key-less fallback),
 // Tap-to-Lookup Word Dictionary, TTS Read Aloud, IndexedDB Note Caching & Audio Transcription
 
 import {
@@ -23,7 +23,10 @@ import { pausePlaybackInPlace } from './player-engine.js';
 // ==========================================
 let aiCallbacks = {
   onRenderMainStage: () => {},
-  onOpenAiSettings: () => {}
+  onOpenAiSettings: () => {},
+  // (systemText, userText) => Promise<{ text, modelUsed }>: asks the model chosen for translation.
+  // Lives in pack-translate.js, which imports this module, so it is handed in instead of imported.
+  askTextModel: async () => { throw new Error('AI 查詢尚未初始化'); }
 };
 
 // Lower-cased word the drawer is currently showing ('' when it shows the whole-sentence analysis)
@@ -36,15 +39,26 @@ export function registerAiCallbacks(cbs = {}) {
   if (typeof cbs.onOpenAiSettings === 'function') {
     aiCallbacks.onOpenAiSettings = cbs.onOpenAiSettings;
   }
+  if (typeof cbs.askTextModel === 'function') {
+    aiCallbacks.askTextModel = cbs.askTextModel;
+  }
+}
+
+function hasAnyAiKey() {
+  const cfg = state.aiConfig || {};
+  return Boolean(cfg.geminiKey || cfg.groqKey || cfg.openaiKey);
+}
+
+// True when sentence analysis and word lookup go to a keyed model; false when they run on the key-less
+// translation + dictionary (no key filled, or the user switched the keys off for lookups).
+function isKeyedLookupActive() {
+  return hasAnyAiKey() && !state.aiConfig?.lookupKeyless;
 }
 
 export function updateAiHeaderBadgeUI() {
   const el = document.getElementById('aiHeaderBadgeText');
   if (!el || !state.aiConfig) return;
-  if (state.aiConfig.provider === 'gemini' && state.aiConfig.geminiKey) el.textContent = 'Gemini就緒';
-  else if (state.aiConfig.provider === 'groq' && state.aiConfig.groqKey) el.textContent = 'Groq就緒';
-  else if (state.aiConfig.provider === 'openai' && state.aiConfig.openaiKey) el.textContent = 'GPT就緒';
-  else el.textContent = 'AI設定';
+  el.textContent = hasAnyAiKey() ? 'AI就緒' : 'AI設定';
 }
 
 // ==========================================
@@ -456,36 +470,13 @@ export async function callGroqConciseApi(promptText, apiKey) {
   throw lastErr || new Error('Groq 找不到此金鑰可用的對話模型，請檢查 Groq Console 的模型權限設定');
 }
 
-export async function callOpenAiMiniConciseApi(promptText, apiKey) {
-  const res = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${String(apiKey || '').trim()}`
-    },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      temperature: 0.25,
-      max_tokens: 700,
-      messages: [
-        { role: 'system', content: '你是一位專精台灣繁體中文的車用英文口說教練，回答務必極度精簡扼要。' },
-        { role: 'user', content: promptText }
-      ]
-    })
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data?.error?.message || `OpenAI HTTP ${res.status}`);
-  const choice = data?.choices?.[0];
-  if (choice?.finish_reason === 'length') throw new Error('gpt-4o-mini 回覆被截斷（輸出長度達上限）');
-  return { text: choice?.message?.content || '', modelUsed: 'gpt-4o-mini' };
-}
+const LOOKUP_SYSTEM_TEXT = '你是一位專精台灣繁體中文的車用英文口說教練，回答務必極度精簡扼要。';
 
+// Sentence analysis and word lookup run on the model the user chose for translation.
+// Throws without a network request when lookups are key-less; the callers then use the free stand-in.
 export async function queryConfiguredAiEngine(promptText) {
-  const cfg = state.aiConfig || { provider: 'gemini', geminiKey: '', groqKey: '', openaiKey: '' };
-  if (cfg.provider === 'free_builtin') throw new Error('UserSelectedFreeBuiltin');
-  if (cfg.provider === 'groq' && cfg.groqKey) return await callGroqConciseApi(promptText, cfg.groqKey);
-  if (cfg.provider === 'openai' && cfg.openaiKey) return await callOpenAiMiniConciseApi(promptText, cfg.openaiKey);
-  return await callGeminiFlashConciseApi(promptText, cfg.geminiKey || '');
+  if (!isKeyedLookupActive()) throw new Error('KeylessLookup');
+  return await aiCallbacks.askTextModel(LOOKUP_SYSTEM_TEXT, promptText);
 }
 
 export function parseAiStructuredResponse(rawText) {
@@ -560,15 +551,10 @@ function isSentenceNotesFromWordLookup(item) {
   return Object.values(item.wordNotes).some(w => w && String(w.notes || '').trim() === notes);
 }
 
-// Name of the keyed engine queryConfiguredAiEngine() will call, or '' when running key-less by choice.
+// Name to show for a failed lookup: the provider that was asked, or '' when lookups run key-less by choice.
 // A failure only counts as an error worth showing when this is non-empty.
-function getActiveAiEngineLabel() {
-  const cfg = state.aiConfig || {};
-  if (cfg.provider === 'free_builtin') return '';
-  if (cfg.provider === 'groq' && cfg.groqKey) return 'Groq';
-  if (cfg.provider === 'openai' && cfg.openaiKey) return 'OpenAI';
-  if (cfg.geminiKey) return 'Gemini';
-  return '';
+function getFailedAiEngineLabel(err) {
+  return isKeyedLookupActive() ? (err?.engineLabel || 'AI') : '';
 }
 
 // Grammar placeholder stored alongside key-less fallback notes; doubles as the marker for such notes
@@ -578,7 +564,7 @@ function hasCachedSentenceAnalysis(item) {
   if (!item?.aiNotes || !item.aiNotes.trim()) return false;
   if (isSentenceNotesFromWordLookup(item)) return false;
   // Key-less fallback notes are only a stand-in: once a keyed engine is configured, analyse for real
-  if (getActiveAiEngineLabel() && item.aiGrammarNote === FREE_FALLBACK_GRAMMAR_HINT) return false;
+  if (isKeyedLookupActive() && item.aiGrammarNote === FREE_FALLBACK_GRAMMAR_HINT) return false;
   return true;
 }
 
@@ -660,7 +646,7 @@ export async function handleTapEnglishWordLookup(word, tokenEl) {
 
   // A keyed engine failing (bad key, quota, network) is shown to the user and its stand-in result is not cached,
   // so the next lookup retries. Running key-less by choice keeps the original silent, cached behaviour.
-  const failedEngine = getActiveAiEngineLabel();
+  const failedEngine = getFailedAiEngineLabel(aiError);
   reportAiEngineFailure(failedEngine, aiError);
 
   badge.textContent = failedEngine ? `⚠️ ${failedEngine} 失敗・暫用免金鑰字典` : '⚡ 免金鑰即時字典';
@@ -679,7 +665,7 @@ export async function handleTapEnglishWordLookup(word, tokenEl) {
     failedEngine ? null : { zh: sentenceZh || item?.zh, notes: noteBlock, grammar: '' },
     sentenceZh
   );
-  const hasKey = Boolean(state.aiConfig?.geminiKey || state.aiConfig?.groqKey || state.aiConfig?.openaiKey);
+  const hasKey = hasAnyAiKey();
   const errorBanner = failedEngine
     ? formatAiErrorBannerHtml(failedEngine, aiError, '本次暫用免金鑰字典，不會存入快取，下次點擊會重試')
     : '';
@@ -733,7 +719,7 @@ export async function actionAiExplainCurrentSentence(forceRefresh = false) {
 
   // A keyed engine failing (bad key, quota, network) is shown to the user and nothing is cached as "已解析",
   // so the next press retries. Running key-less by choice keeps the original silent, cached behaviour.
-  const failedEngine = getActiveAiEngineLabel();
+  const failedEngine = getFailedAiEngineLabel(aiError);
   reportAiEngineFailure(failedEngine, aiError);
 
   if (failedEngine && hasCachedSentenceAnalysis(item)) {
@@ -775,7 +761,7 @@ export async function actionAiExplainCurrentSentence(forceRefresh = false) {
 
   if (translatedZh) item.zh = translatedZh;
   await persistZhAndNotesToCurrentItem(translatedZh, finalNotes, FREE_FALLBACK_GRAMMAR_HINT);
-  const hasKey = Boolean(state.aiConfig?.geminiKey || state.aiConfig?.groqKey || state.aiConfig?.openaiKey);
+  const hasKey = hasAnyAiKey();
   renderAiDrawerBodyHtml(bodyEl, formatSavedAiNotesHtml(translatedZh || item.zh, finalNotes, item.aiGrammarNote, !hasKey));
 }
 
@@ -792,17 +778,9 @@ export function actionCopySentenceWithAiPrompt() {
 // AI AUDIO TRANSCRIPTION (WHISPER / GEMINI)
 // ==========================================
 function pickTranscriptionEngine() {
-  const cfg = state.aiConfig || { provider: 'gemini', geminiKey: '', groqKey: '', openaiKey: '' };
-  if (cfg.provider === 'groq' && cfg.groqKey) {
-    return { type: 'groq', key: cfg.groqKey };
-  }
-  if (cfg.provider === 'openai' && cfg.openaiKey) {
-    return { type: 'openai', key: cfg.openaiKey };
-  }
-  if (cfg.provider === 'gemini' && cfg.geminiKey) {
-    return { type: 'gemini', key: cfg.geminiKey };
-  }
-  // Fallback to whichever API key is already filled (prefer Whisper for exact timestamps)
+  const cfg = state.aiConfig || {};
+  // Groq first whenever its key is filled: its Whisper gives exact timestamps, and OpenAI's only
+  // timestamp model (whisper-1) shuts down on 2027-02-26. Then OpenAI (timestamps), then Gemini (none).
   if (cfg.groqKey) return { type: 'groq', key: cfg.groqKey };
   if (cfg.openaiKey) return { type: 'openai', key: cfg.openaiKey };
   if (cfg.geminiKey) return { type: 'gemini', key: cfg.geminiKey };

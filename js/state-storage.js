@@ -83,7 +83,8 @@ export const state = {
   packProgressMap: {},
   keymap: cloneDefaultKeymap(),
   listeningKeyAction: null,
-  aiConfig: { provider: 'gemini', geminiKey: '', groqKey: '', openaiKey: '' },
+  // lookupKeyless: sentence analysis and word lookup use the free translation + dictionary although keys are filled
+  aiConfig: { geminiKey: '', groqKey: '', openaiKey: '', lookupKeyless: false },
   activeLookupWord: '',
   // VAD Workbench state
   vadAudioBuffer: null,
@@ -445,23 +446,29 @@ export function loadAiConfigSync() {
     const raw = safeStorage.getItem(AI_CONFIG_LS_KEY);
     if (raw) {
       const p = JSON.parse(raw);
-      return {
-        provider: p.provider || 'gemini',
+      const cfg = {
         geminiKey: (p.geminiKey || '').trim(),
         groqKey: (p.groqKey || '').trim(),
         openaiKey: (p.openaiKey || '').trim()
       };
+      // Settings saved before the provider choice was removed: "free built-in engine" chosen while keys were
+      // filled meant "do not use my keys for lookups". With no key filled it says nothing, so it is dropped.
+      const hasKey = Boolean(cfg.geminiKey || cfg.groqKey || cfg.openaiKey);
+      cfg.lookupKeyless = typeof p.lookupKeyless === 'boolean'
+        ? p.lookupKeyless
+        : (p.provider === 'free_builtin' && hasKey);
+      return cfg;
     }
   } catch (e) {}
-  return { provider: 'gemini', geminiKey: '', groqKey: '', openaiKey: '' };
+  return { geminiKey: '', groqKey: '', openaiKey: '', lookupKeyless: false };
 }
 
 export function saveAiConfigSync(cfg) {
   state.aiConfig = {
-    provider: cfg.provider || 'gemini',
     geminiKey: (cfg.geminiKey || '').trim(),
     groqKey: (cfg.groqKey || '').trim(),
-    openaiKey: (cfg.openaiKey || '').trim()
+    openaiKey: (cfg.openaiKey || '').trim(),
+    lookupKeyless: Boolean(cfg.lookupKeyless)
   };
   try {
     safeStorage.setItem(AI_CONFIG_LS_KEY, JSON.stringify(state.aiConfig));
